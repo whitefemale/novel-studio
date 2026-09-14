@@ -1,0 +1,35 @@
+# ---- 依赖与构建产物 ----
+node_modules/
+dist/
+release/
+
+# ---- 日志与临时文件 ----
+*.log
+npm-debug.log*
+yarn-error.log*
+*.local
+
+# ---- 编辑器 / 操作系统 ----
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# Claude Code 的本机权限配置（CLAUDE.md 本身要提交，这个文件不要）
+.claude/settings.local.json
+
+# ---- 环境变量与密钥（本项目的 API Key 存在 IndexedDB，不存在于仓库；
+#      这几条是防御性的，避免以后误提交）----
+.env
+.env.*
+*.pem
+*.key
+*.jks
+*.keystore
+
+# ---- 用户自己的作品与导出 ----
+# 这是本项目的头号误提交风险：导出格式是 .txt、备份目录叫「备份」，
+# 一旦有人把「保存地址」设成仓库目录，整本小说就会被 git add 进去。
+*.txt
+备份/

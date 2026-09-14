@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Novel Studio</string>
+    <string name="title_activity_main">Novel Studio</string>
+    <string name="package_name">com.novelstudio.app</string>
+    <string name="custom_url_scheme">com.novelstudio.app</string>
+</resources>

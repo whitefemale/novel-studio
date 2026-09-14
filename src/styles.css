@@ -1,0 +1,401 @@
+/* ============================================================
+   Novel Studio · 白色简洁主题设计系统
+   ============================================================ */
+:root {
+  --bg: #ffffff;
+  --bg-muted: #f5f6f8;
+  --bg-hover: #eef0f4;
+  --border: #e7e9ee;
+  --border-strong: #d5d9e0;
+  --text: #1f2329;
+  --text-2: #5a6472;
+  --text-3: #9aa1ad;
+  --accent: #4f6ef2;
+  --accent-hover: #3d5ce5;
+  --accent-soft: #eef1fe;
+  --danger: #e5484d;
+  --danger-soft: #fdeeec;
+  --success: #30a46c;
+  --radius: 12px;
+  --radius-sm: 8px;
+  --shadow-sm: 0 1px 2px rgba(16, 24, 40, 0.04);
+  --shadow: 0 4px 16px rgba(16, 24, 40, 0.08);
+  --shadow-lg: 0 12px 32px rgba(16, 24, 40, 0.14);
+  --font: system-ui, "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC",
+    "Helvetica Neue", Arial, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: var(--font);
+  background: var(--bg);
+  color: var(--text);
+  font-size: 14px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+  /* 触屏上点按会闪一层灰底，和白色主题不搭 */
+  -webkit-tap-highlight-color: transparent;
+}
+
+button {
+  font-family: inherit;
+  cursor: pointer;
+  border: none;
+  background: none;
+  color: inherit;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* ---------- 触屏适配 ----------
+   Android 建议可点区域约 44px；桌面紧凑尺寸在手指下太小。
+   只在真有触摸输入的设备上放大，键鼠体验保持不变。 */
+@media (pointer: coarse) {
+  .btn {
+    padding: 10px 16px;
+    min-height: 44px;
+  }
+  .btn.sm {
+    padding: 8px 14px;
+    font-size: 13px;
+    min-height: 40px;
+  }
+  .btn.ghost.sm {
+    min-width: 40px;
+  }
+  .btn:active {
+    background: var(--bg-hover);
+  }
+  .input,
+  .textarea,
+  .select {
+    padding: 11px 12px;
+    /* ≥16px 可避免部分 WebView 在聚焦时自动放大页面 */
+    font-size: 16px;
+  }
+  .modal-footer .btn {
+    flex: 1;
+  }
+}
+
+input,
+textarea,
+select {
+  font-family: inherit;
+  font-size: inherit;
+  color: var(--text);
+  outline: none;
+}
+
+/* ---------- 按钮 ---------- */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 7px 14px;
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  font-weight: 500;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text-2);
+  transition: all 0.15s ease;
+  white-space: nowrap;
+}
+.btn:hover {
+  border-color: var(--border-strong);
+  background: var(--bg-hover);
+  color: var(--text);
+}
+.btn:active {
+  transform: scale(0.98);
+}
+.btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.btn.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+.btn.primary:hover {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+}
+.btn.danger {
+  color: var(--danger);
+}
+.btn.danger:hover {
+  background: var(--danger-soft);
+  border-color: #f4c7c3;
+}
+.btn.sm {
+  padding: 4px 10px;
+  font-size: 12px;
+}
+.btn.lg {
+  padding: 10px 22px;
+  font-size: 14px;
+}
+.btn.ghost {
+  border-color: transparent;
+  background: transparent;
+}
+.btn.ghost:hover {
+  background: var(--bg-hover);
+}
+.btn.block {
+  width: 100%;
+}
+
+/* ---------- 输入控件 ---------- */
+.input,
+.textarea,
+.select {
+  width: 100%;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+.input:focus,
+.textarea:focus,
+.select:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(79, 110, 242, 0.12);
+}
+.textarea {
+  resize: vertical;
+  line-height: 1.6;
+}
+.select {
+  cursor: pointer;
+  appearance: auto;
+}
+.label {
+  display: block;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-2);
+  margin-bottom: 6px;
+}
+.hint {
+  font-size: 12px;
+  color: var(--text-3);
+  margin-top: 4px;
+  line-height: 1.5;
+}
+
+/* ---------- 卡片 ---------- */
+.card {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-sm);
+}
+
+/* ---------- 通用布局 ---------- */
+.page {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+.muted {
+  color: var(--text-3);
+}
+.small {
+  font-size: 12px;
+}
+
+/* ---------- 滚动条（桌面白底风格） ---------- */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-thumb {
+  background: #d8dbe2;
+  border-radius: 8px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #c6cad3;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* ---------- 顶栏 ---------- */
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  /* 用 min-height 而非 height：安全区高度要能加上去而不是把内容压扁 */
+  min-height: calc(54px + env(safe-area-inset-top, 0px));
+  padding: 0 18px;
+  padding-top: env(safe-area-inset-top, 0px);
+  padding-left: calc(18px + env(safe-area-inset-left, 0px));
+  padding-right: calc(18px + env(safe-area-inset-right, 0px));
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.topbar .logo {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 700;
+  font-size: 15px;
+  color: var(--text);
+}
+.topbar .logo .dot {
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  background: linear-gradient(135deg, #6d8bff, #4f6ef2);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: #fff;
+  font-size: 12px;
+}
+.topbar .spacer {
+  flex: 1;
+}
+.topbar .book-title {
+  font-size: 13px;
+  color: var(--text-2);
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ---------- 模态框 ---------- */
+.modal-mask {
+  position: fixed;
+  inset: 0;
+  background: rgba(15, 20, 32, 0.35);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+  /* 四边都留出安全区，避免弹窗被刘海或手势条遮住 */
+  padding: 20px;
+  padding-top: calc(20px + env(safe-area-inset-top, 0px));
+  padding-bottom: calc(20px + env(safe-area-inset-bottom, 0px));
+  padding-left: calc(20px + env(safe-area-inset-left, 0px));
+  padding-right: calc(20px + env(safe-area-inset-right, 0px));
+  animation: fadeIn 0.15s ease;
+}
+.modal {
+  background: var(--bg);
+  border-radius: 16px;
+  box-shadow: var(--shadow-lg);
+  width: 100%;
+  max-width: 460px;
+  max-height: 90vh;
+  /* dvh 跟着可视区走：软键盘弹出时 vh 不更新，弹窗会被顶出屏幕 */
+  max-height: 90dvh;
+  overflow: auto;
+  animation: popIn 0.16s ease;
+}
+.modal.wide {
+  max-width: 680px;
+}
+.modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--border);
+}
+.modal-header h3 {
+  margin: 0;
+  font-size: 15px;
+}
+.modal-body {
+  padding: 20px;
+}
+.modal-footer {
+  padding: 14px 20px;
+  border-top: 1px solid var(--border);
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@keyframes popIn {
+  from { opacity: 0; transform: translateY(8px) scale(0.98); }
+  to { opacity: 1; transform: none; }
+}
+
+/* ---------- Toast ---------- */
+.toast-wrap {
+  position: fixed;
+  top: calc(64px + env(safe-area-inset-top, 0px));
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 200;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: center;
+}
+.toast {
+  background: #20242e;
+  color: #fff;
+  padding: 9px 18px;
+  border-radius: 999px;
+  font-size: 13px;
+  box-shadow: var(--shadow-lg);
+  animation: toastIn 0.2s ease;
+}
+.toast.success { background: var(--success); }
+.toast.error { background: var(--danger); }
+@keyframes toastIn {
+  from { opacity: 0; transform: translateY(-6px); }
+  to { opacity: 1; transform: none; }
+}
+
+/* ---------- 空状态 ---------- */
+.empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 60px 20px;
+  color: var(--text-3);
+  text-align: center;
+}
+.empty .icon {
+  font-size: 40px;
+  opacity: 0.6;
+}
+.empty h3 {
+  margin: 0;
+  font-size: 15px;
+  color: var(--text-2);
+}
+.empty p {
+  margin: 0;
+  font-size: 13px;
+  max-width: 320px;
+}

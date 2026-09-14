@@ -1,0 +1,56 @@
+{
+  "name": "novel-studio",
+  "version": "1.0.0",
+  "description": "自动写小说软件：连接大模型 API 自动续写/生成小说，支持保存、编辑、导出",
+  "author": "Novel Studio",
+  "license": "MIT",
+  "keywords": [
+    "novel",
+    "writing",
+    "ai",
+    "llm",
+    "vue3",
+    "electron",
+    "capacitor",
+    "indexeddb",
+    "小说",
+    "写作"
+  ],
+  "main": "electron/main.js",
+  "private": true,
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "electron": "npm run build && electron .",
+    "electron:dir": "npm run build && electron . --dir",
+    "dist:win": "npm run build && electron-builder --win",
+    "dist:win:dir": "npm run build && electron-builder --win --dir"
+  },
+  "dependencies": {
+    "idb-keyval": "^6.2.1",
+    "marked": "^12.0.2",
+    "vue": "^3.4.31"
+  },
+  "devDependencies": {
+    "@capacitor/android": "^8.5.1",
+    "@capacitor/app": "^8.1.1",
+    "@capacitor/cli": "^8.5.1",
+    "@capacitor/clipboard": "^8.0.1",
+    "@capacitor/core": "^8.5.1",
+    "@capacitor/filesystem": "^8.1.3",
+    "@capacitor/share": "^8.0.1",
+    "@capacitor/status-bar": "^8.0.3",
+    "@vitejs/plugin-vue": "^5.0.5",
+    "electron": "^31.3.0",
+    "electron-builder": "^24.13.3",
+    "vite": "^5.3.4"
+  },
+  "allowScripts": {
+    "electron@31.7.7": true,
+    "esbuild@0.21.5": true
+  }
+}

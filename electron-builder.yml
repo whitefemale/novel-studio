@@ -1,0 +1,28 @@
+appId: com.novelstudio.app
+productName: Novel Studio
+directories:
+  output: release
+# 注意：electron-builder 会**隐式**把 dependencies 里的 node_modules 一并打进 asar，
+# 光写 dist/** 与 electron/** 是拦不住的（曾经因此把 @capacitor/android 的 499 个
+# Java/Gradle 源文件和一整套 CLI 依赖塞进了安装包，exe 从 80MB 涨到 87MB）。
+# 这里显式排除：渲染层已由 Vite 全量打包进 dist/，主进程只用 electron 与 node 内置模块，
+# 两者都不需要运行时的 node_modules。
+files:
+  - dist/**
+  - electron/**
+  - '!node_modules/**'
+win:
+  target:
+    - target: nsis
+      arch: [x64]
+    - target: portable
+      arch: [x64]
+  icon: build/icon.ico
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: Novel Studio
+portable:
+  artifactName: Novel-Studio-便携版.exe
