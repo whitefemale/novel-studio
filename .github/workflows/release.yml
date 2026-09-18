@@ -15,6 +15,12 @@ name: Release
 # 下面这些是各自「最低支持 node24」的大版本，注意中间版本仍是 node20：
 #   upload-artifact  v5 还是 node20，必须 ≥ v6
 #   download-artifact v6 还是 node20，必须 ≥ v7
+#
+# ── Node 版本不得降到 22 以下 ──────────────────────────────────────────
+# @capacitor/cli 的 engines 声明是 ">=22.0.0"，版本不够时它会在启动时直接
+# [fatal] 退出（不是警告）。android job 的 `npx cap sync android` 会因此失败，
+# 而 windows job 不跑 cap，所以不会暴露——曾用 node 20 踩过这个坑。
+# 这里用 24，与本机开发环境（v24.19.0）保持一致。
 on:
   push:
     tags:
@@ -34,7 +40,7 @@ jobs:
 
       - uses: actions/setup-node@v5
         with:
-          node-version: '20'
+          node-version: '24'
           cache: npm
 
       # .npmrc 里的 npmmirror 镜像随仓库一起走，换机/上 CI 都能装上 Electron
@@ -75,7 +81,7 @@ jobs:
   #    steps:
   #      - uses: actions/checkout@v5
   #      - uses: actions/setup-node@v5
-  #        with: { node-version: '20', cache: npm }
+  #        with: { node-version: '24', cache: npm }
   #      - run: npm ci
   #      - run: npm run build
   #      - run: npx electron .
@@ -89,7 +95,7 @@ jobs:
 
       - uses: actions/setup-node@v5
         with:
-          node-version: '20'
+          node-version: '24'
           cache: npm
 
       # JDK 21 是硬要求：Capacitor 8 的 build.gradle 写死 VERSION_21，
