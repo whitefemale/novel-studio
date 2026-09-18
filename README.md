@@ -20,8 +20,8 @@
 
 | 平台 | 文件 | 说明 |
 |---|---|---|
-| Windows | `Novel Studio Setup *.exe` | 安装版，可选安装目录、建桌面与开始菜单快捷方式 |
-| Windows | `Novel-Studio-便携版.exe` | 便携版，单文件双击即用、不写注册表，适合放 U 盘 |
+| Windows | `Novel-Studio-Setup-*.exe` | 安装版，可选安装目录、建桌面与开始菜单快捷方式 |
+| Windows | `Novel-Studio-Portable-*.exe` | 便携版，单文件双击即用、不写注册表，适合放 U 盘 |
 | Android | `Novel-Studio-Android-*.apk` | 手机安装包（debug 签名） |
 
 > ⚠️ 安装包**没有做代码签名**，Windows 首次运行会弹「Windows 已保护你的电脑」。

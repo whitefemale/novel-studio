@@ -67,11 +67,23 @@ jobs:
             exit 1
           fi
 
+      # 必须在上传前改成纯 ASCII 文件名：GitHub 的 artifact 上传→下载这一轮
+      # 会把文件名里的非 ASCII 字符直接丢掉。便携版原叫「Novel-Studio-便携版.exe」，
+      # 走完一轮变成了「Novel-Studio-.exe」——既看不出是便携版，也和 README 里
+      # 写的名字对不上。v1.0.0 实际踩过，故此处显式重命名。
+      # 本地 `npm run dist:win` 仍产出原来的中文名，仅发布链路上改。
+      - name: 重命名产物为 ASCII
+        shell: bash
+        run: |
+          set -e
+          mv release/"Novel Studio Setup "*.exe "Novel-Studio-Setup-${GITHUB_REF_NAME}.exe"
+          mv release/"Novel-Studio-"*.exe       "Novel-Studio-Portable-${GITHUB_REF_NAME}.exe"
+          ls -la Novel-Studio-*.exe
+
       - uses: actions/upload-artifact@v6
         with:
           name: windows
-          # 只取顶层的两个 exe；win-unpacked/ 里的免安装目录不递归进来
-          path: release/*.exe
+          path: Novel-Studio-*.exe
           if-no-files-found: error
 
   # 可选：冒烟测试（48 项断言）。CI 上跑 Electron 需要 GUI 会话，
@@ -154,6 +166,22 @@ jobs:
         with:
           path: artifacts
           merge-multiple: true
+
+      # 重跑同一个 tag 时，Release 上会残留上一次的产物（比如改名前的旧文件），
+      # 而 action-gh-release 只覆盖同名资产、不会删多余的。先清空再上传，
+      # 保证资产列表与本次构建严格一致。GitHub 托管的 runner 自带 gh CLI。
+      - name: 清空该 Release 上的既有产物
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[].name' \
+              | while IFS= read -r n; do
+                  [ -n "$n" ] && gh release delete-asset "$GITHUB_REF_NAME" "$n" --yes
+                done
+          else
+            echo "Release $GITHUB_REF_NAME 尚不存在，跳过清理"
+          fi
 
       - uses: softprops/action-gh-release@v3
         with:

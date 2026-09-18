@@ -17,8 +17,8 @@
 
 | 平台 | 文件 | 说明 |
 |---|---|---|
-| Windows | `Novel Studio Setup 1.0.0.exe` | 安装版（约 78 MB）。可选安装目录，建桌面和开始菜单快捷方式 |
-| Windows | `Novel-Studio-便携版.exe` | 便携版（约 78 MB）。单文件、双击即用、不写注册表，适合放 U 盘 |
+| Windows | `Novel-Studio-Setup-v1.0.0.exe` | 安装版（约 78 MB）。可选安装目录，建桌面和开始菜单快捷方式 |
+| Windows | `Novel-Studio-Portable-v1.0.0.exe` | 便携版（约 78 MB）。单文件、双击即用、不写注册表，适合放 U 盘 |
 | Android | `Novel-Studio-Android-*.apk` | 手机安装包（约 4 MB，debug 签名） |
 
 浏览器版本不需要下载：克隆仓库后 `npm install && npm run dev` 打开 http://localhost:5173 即可。
