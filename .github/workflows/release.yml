@@ -1,0 +1,149 @@
+name: Release
+
+# 推一个 v* 的 tag 就自动出 Windows 安装包 + Android APK 并发布 Release：
+#
+#   git tag -a v1.0.0 -m "Novel Studio v1.0.0"
+#   git push origin v1.0.0
+#
+# workflow_dispatch 只构建、不发布，产物可在 Actions 页面的 Artifacts 里下载，
+# 用来在不真正发版的情况下验证这套流程还能跑通。
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+# release job 需要 contents: write 才能创建 Release
+permissions:
+  contents: write
+
+jobs:
+  # ---------------------------------------------------------------- Windows
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      # .npmrc 里的 npmmirror 镜像随仓库一起走，换机/上 CI 都能装上 Electron
+      - name: 安装依赖
+        run: npm ci
+
+      # --publish never：发布统一交给最后的 release job。
+      # 不加这个时 electron-builder 在 CI + tag 环境下可能自己去发一次，
+      # 与 release job 抢同一个 Release。
+      - name: 构建 Windows 安装版 + 便携版
+        run: |
+          npm run build
+          npx electron-builder --win --publish never
+
+      # CLAUDE.md 约定 #4：asar 条目数应当在 20 上下，到几百就是打包配置漏了
+      # （曾经把 @capacitor/android 的 499 个源文件打进安装包）。
+      - name: 校验 asar 条目数
+        shell: bash
+        run: |
+          count=$(npx asar list release/win-unpacked/resources/app.asar | wc -l)
+          echo "asar 条目数：$count"
+          if [ "$count" -gt 80 ]; then
+            echo "::error::asar 条目数 $count 明显偏高，检查 electron-builder.yml 的 '!node_modules/**' 是否还在"
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          # 只取顶层的两个 exe；win-unpacked/ 里的免安装目录不递归进来
+          path: release/*.exe
+          if-no-files-found: error
+
+  # 可选：冒烟测试（48 项断言）。CI 上跑 Electron 需要 GUI 会话，
+  # 偶有 flaky，默认关闭；想开就把下面的 if 删掉。
+  #  smoke:
+  #    runs-on: windows-latest
+  #    steps:
+  #      - uses: actions/checkout@v4
+  #      - uses: actions/setup-node@v4
+  #        with: { node-version: '20', cache: npm }
+  #      - run: npm ci
+  #      - run: npm run build
+  #      - run: npx electron .
+  #        env: { SMOKE_TEST: '1' }
+
+  # ---------------------------------------------------------------- Android
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      # JDK 21 是硬要求：Capacitor 8 的 build.gradle 写死 VERSION_21，
+      # 而 Gradle 8.14.3 最高只支持 Java 24（见 CLAUDE.md）
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: android-actions/setup-android@v3
+
+      - name: 安装 Android SDK 组件
+        run: |
+          yes | sdkmanager --licenses > /dev/null
+          sdkmanager "platform-tools" "platforms;android-36" "build-tools;36.0.0"
+
+      - name: 安装依赖
+        run: npm ci
+
+      # 渲染层产物要先进 dist/，cap sync 再把它复制进原生工程
+      - name: 构建渲染层并同步进原生工程
+        run: |
+          npm run build
+          npx cap sync android
+
+      # gradle-wrapper.properties 里的腾讯镜像是给中国大陆本机用的，
+      # GitHub 的 runner 在境外，这里临时换回官方源（只改 CI 里的这一份副本）
+      - name: Gradle 发行包换回官方源
+        run: sed -i 's|mirrors.cloud.tencent.com/gradle/|services.gradle.org/distributions/|' android/gradle/wrapper/gradle-wrapper.properties
+
+      - name: 构建 debug APK
+        working-directory: android
+        run: ./gradlew assembleDebug --no-daemon
+
+      - name: 重命名 APK
+        run: mv android/app/build/outputs/apk/debug/app-debug.apk "Novel-Studio-Android-${GITHUB_REF_NAME}.apk"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android
+          path: Novel-Studio-Android-*.apk
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------- Release
+  release:
+    needs: [windows, android]
+    # workflow_dispatch 跑进来的没有 tag，只出 Artifacts、不发 Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: Novel Studio ${{ github.ref_name }}
+          body_path: RELEASE_NOTES.md
+          files: artifacts/*
+          fail_on_unmatched_files: true
+          draft: false
+          prerelease: false

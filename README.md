@@ -14,6 +14,22 @@
 
 所有数据存在本机 IndexedDB，**不上传任何服务器**；除了调用你自己配置的 LLM 接口，软件不会向外发送任何数据。
 
+## 下载
+
+到 [**Releases**](https://github.com/whitefemale/novel-studio/releases/latest) 页面下载：
+
+| 平台 | 文件 | 说明 |
+|---|---|---|
+| Windows | `Novel Studio Setup *.exe` | 安装版，可选安装目录、建桌面与开始菜单快捷方式 |
+| Windows | `Novel-Studio-便携版.exe` | 便携版，单文件双击即用、不写注册表，适合放 U 盘 |
+| Android | `Novel-Studio-Android-*.apk` | 手机安装包（debug 签名） |
+
+> ⚠️ 安装包**没有做代码签名**，Windows 首次运行会弹「Windows 已保护你的电脑」。
+> 这是 SmartScreen 对未知发布者的默认拦截，不是杀毒软件报毒——点「更多信息」→「仍要运行」即可。
+
+> 软件本身不带 API Key，第一次打开要先在「设置」里填 Base URL / API Key / 模型名。
+> 默认 `https://api.deepseek.com`，任何 OpenAI 兼容接口都能用。
+
 <!-- 截图（强烈建议补上，对 star 数影响很大）：把图片放进 docs/ 目录后取消下面的注释
 <p align="center">
   <img src="docs/shelf.png" width="32%" alt="书库">
