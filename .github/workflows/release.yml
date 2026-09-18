@@ -109,11 +109,13 @@ jobs:
       - name: 安装依赖
         run: npm ci
 
-      # 渲染层产物要先进 dist/，cap sync 再把它复制进原生工程
-      - name: 构建渲染层并同步进原生工程
-        run: |
-          npm run build
-          npx cap sync android
+      # 拆成两步而非一条 run：日志正文要仓库管理员权限才读得到，
+      # 但 step 级结论是公开可读的，分开才能定位是哪条命令挂的。
+      - name: 构建渲染层（vite build）
+        run: npm run build
+
+      - name: 同步进原生工程（cap sync）
+        run: npx cap sync android
 
       # gradle-wrapper.properties 里的腾讯镜像是给中国大陆本机用的，
       # GitHub 的 runner 在境外，这里临时换回官方源（只改 CI 里的这一份副本）
