@@ -18,9 +18,12 @@ npm run dist:win:dir # 仅产出 win-unpacked/（跳过安装包，排错更快�
 npm run dev                                               # 终端 1
 VITE_DEV_SERVER_URL=http://localhost:5173 npx electron .  # 终端 2
 
-# Android（详见「Android」章节）
+# Android（详见「Android」章节）——必须 Node ≥22，这是 @capacitor/cli 的硬性要求
 npx cap sync android && (cd android && JAVA_HOME="C:/Android/jdk21" ./gradlew assembleDebug)
 # 产物：android/app/build/outputs/apk/debug/app-debug.apk
+
+# 发版：推 v* tag 触发 GitHub Actions 自动构建并发布 Release（详见「发布与 CI」章节）
+git tag -a v1.0.1 -m "Novel Studio v1.0.1" && git push origin v1.0.1
 ```
 
 自动化测试（Electron 冒烟测试）：
@@ -113,6 +116,62 @@ npm run build && SMOKE_TEST=1 npx electron .
 - mock 服务器仅在 `SMOKE_TEST` 模式启动，生产代码不含测试痕迹。
 - **Android 侧无法用冒烟测试覆盖**：它是 Electron 专属机制，且 `tests/` 不在 electron-builder 的 `files` 里。Android 只能靠构建产物校验（见「Android」章节）。
 
+## 发布与 CI（GitHub Actions）
+
+`.github/workflows/release.yml`：推送 `v*` tag 时，`windows-latest` 与 `ubuntu-latest` 两个 job
+并行出产物（安装版/便携版 exe、Android debug APK），第三个 job 合并并发布 Release。
+`workflow_dispatch` **只构建、不发布**，产物在 Actions 页面的 Artifacts 里，用于上线前干跑。
+
+发版顺序：改 `package.json` 的 `version`（决定 exe 内部版本号）→ 改 `RELEASE_NOTES.md`
+（正文 + 下载表里的版本号）→ 提交推送 → 打 tag 推送。
+
+**跑的是 tag 指向的那个提交里的 workflow**——所以改了 `release.yml` 必须先推 main 再打 tag，
+否则新 tag 用的仍是旧流程。同理，**「重新运行」一个历史 run 不会采用新的 workflow**，
+那条路修不了配置问题（重写 v1.0.0 就是因为这个才必须删 tag 重推）。
+
+### 五条硬约束（每一条都真的挂过一次，别改回去）
+
+1. **Node ≥22，workflow 里固定 24**。`@capacitor/cli` 的 `engines` 是 `>=22.0.0`，
+   不够时它在启动时直接 `[fatal]` 退出。**只影响 android job**——`npm run dev` /
+   `npm run electron` / `npm run dist:win` 在 Node 18 上都能跑，所以低版本 Node 下
+   表现为「前端一切正常、只有 Android 构建突然失败」。本机是 v24，正是它掩盖了这个问题。
+2. **action 版本有下限**（GitHub 已于 2026-09-16 移除 Node 20 运行时）：
+   `upload-artifact` **≥v6**（v5 仍是 node20）、`download-artifact` **≥v7**（v5/v6 仍是 node20）、
+   `setup-android` **≥v4**（v3 会直接崩），其余取各自最低的 node24 大版本。
+   升级时查 `action.yml` 里的 `runs.using`，**别只看版本号大小**——中间版本可能仍是 node20。
+3. **产物文件名必须是纯 ASCII**。artifact「上传→下载」这一轮会**直接丢弃非 ASCII 字符**：
+   便携版原叫 `Novel-Studio-便携版.exe`，发出来变成 `Novel-Studio-.exe`，既看不出是便携版、
+   也和 README/Release notes 对不上。故 windows job 在上传前显式重命名为
+   `Novel-Studio-Setup/Portable-<tag>.exe`（**本地 `npm run dist:win` 仍产出中文名**，
+   只改发布链路）。新增产物一律走同样的路子。
+4. **`--publish never` 不能省**。不加时 electron-builder 在 CI + tag 环境下可能自己去发一次，
+   与 release job 抢同一个 Release。
+5. **改 Release 正文要改 `RELEASE_NOTES.md`**（release job 以 `body_path` 引用它），
+   不要在网页上直接改——下次发版会被覆盖。
+
+### 两个只在 CI 上成立的差异
+
+- android job 把 `gradle-wrapper.properties` 的腾讯镜像 `sed` 回官方源——那个镜像是给
+  中国大陆本机用的，GitHub runner 在境外。**只改 CI 里的那份副本，仓库文件不动**。
+- release job 会先**清空该 Release 上的既有产物**再上传：`action-gh-release` 只覆盖同名资产、
+  不删多余的，重跑同一个 tag 时旧文件会残留下来（重写 v1.0.0 时踩过）。
+
+### 排查 CI 失败的姿势
+
+**日志正文需要仓库管理员权限**（API 返回 403 "Must have admin rights to Repository."），
+但 **step 级结论是公开可读的**：
+
+```bash
+curl -s "https://api.github.com/repos/<owner>/<repo>/actions/runs/<run_id>/jobs"
+# 看每个 job 的 steps[].conclusion，能定位到具体是哪一步红的
+```
+
+所以 workflow 里的步骤要**尽量拆细**：「构建渲染层」与「同步进原生工程」本可以合成一条
+`run`，拆成两步就是为了失败时能定位到具体命令。新增多命令步骤时沿用这个做法。
+
+另有一个容易误判的点：**Annotations 里那几条 deprecation 警告不是失败原因**，
+真正的错误在日志正文里。别被它们带偏。
+
 ## 版本库约定（.gitignore / .gitattributes）
 
 本仓库按开源项目组织，附带 MIT 许可证（根目录 `LICENSE`）。几条刻意为之、**看起来像配置错误其实不是**的约定：
@@ -162,6 +221,7 @@ npm run build && SMOKE_TEST=1 npx electron .
 
 | 项 | 版本 | 位置 / 说明 |
 |---|---|---|
+| Node.js | **≥22**（CI 用 24） | `@capacitor/cli` 的 `engines` 要求。**只影响 `cap sync`**，浏览器与 Electron 流程 18 即可 |
 | JDK | **21**（21~24 均可） | `C:/Android/jdk21`（本机路径，**不写进仓库**） |
 | Gradle | **8.14.3** | `android/gradle/wrapper/gradle-wrapper.properties` |
 | Android Gradle Plugin | **8.13.0** | Capacitor 8 模板自带 |
@@ -180,7 +240,8 @@ npm run build && SMOKE_TEST=1 npx electron .
 
 ### 网络注意（换机/清缓存后需重做）
 
-- Gradle 发行包（约 200MB）**已改成腾讯镜像**：`android/gradle/wrapper/gradle-wrapper.properties` 的 `distributionUrl=https\://mirrors.cloud.tencent.com/gradle/gradle-8.14.3-all.zip`（实测 0.1s vs 官方 17s）。删掉这一行会退回龟速下载。
+- Gradle 发行包（约 200MB）**已改成腾讯镜像**：`android/gradle/wrapper/gradle-wrapper.properties` 的 `distributionUrl=https\://mirrors.cloud.tencent.com/gradle/gradle-8.14.3-all.zip`（实测 0.1s vs 官方 17s）。删掉这一行会退回龟速下载。**GitHub Actions 上会临时换回官方源**
+（runner 在境外），见「发布与 CI」章节。
 - Maven 仓库保持模板默认的 `google()` / `mavenCentral()`，直连实测够快，**不需要改**。
 - `android/local.properties` 里 `sdk.dir=C:/Android/Sdk`（此文件是本机路径，不入库）。
 
