@@ -7,6 +7,14 @@ name: Release
 #
 # workflow_dispatch 只构建、不发布，产物可在 Actions 页面的 Artifacts 里下载，
 # 用来在不真正发版的情况下验证这套流程还能跑通。
+#
+# ── action 版本不得下调 ────────────────────────────────────────────────
+# GitHub 已于 2026-09-16 从 runner 上移除 Node 20 运行时，仍按 Node 20 打包的
+# action 会被强制跑在 Node 24 上。多数能凑合跑，但 setup-android 的 v3 会直接崩
+# （2026-09-19 实测：卡在该 action 自身，后续 step 全部 skipped）。
+# 下面这些是各自「最低支持 node24」的大版本，注意中间版本仍是 node20：
+#   upload-artifact  v5 还是 node20，必须 ≥ v6
+#   download-artifact v6 还是 node20，必须 ≥ v7
 on:
   push:
     tags:
@@ -22,9 +30,9 @@ jobs:
   windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: '20'
           cache: npm
@@ -53,7 +61,7 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: windows
           # 只取顶层的两个 exe；win-unpacked/ 里的免安装目录不递归进来
@@ -65,8 +73,8 @@ jobs:
   #  smoke:
   #    runs-on: windows-latest
   #    steps:
-  #      - uses: actions/checkout@v4
-  #      - uses: actions/setup-node@v4
+  #      - uses: actions/checkout@v5
+  #      - uses: actions/setup-node@v5
   #        with: { node-version: '20', cache: npm }
   #      - run: npm ci
   #      - run: npm run build
@@ -77,21 +85,21 @@ jobs:
   android:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: '20'
           cache: npm
 
       # JDK 21 是硬要求：Capacitor 8 的 build.gradle 写死 VERSION_21，
       # 而 Gradle 8.14.3 最高只支持 Java 24（见 CLAUDE.md）
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '21'
 
-      - uses: android-actions/setup-android@v3
+      - uses: android-actions/setup-android@v4
 
       - name: 安装 Android SDK 组件
         run: |
@@ -119,7 +127,7 @@ jobs:
       - name: 重命名 APK
         run: mv android/app/build/outputs/apk/debug/app-debug.apk "Novel-Studio-Android-${GITHUB_REF_NAME}.apk"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: android
           path: Novel-Studio-Android-*.apk
@@ -132,14 +140,14 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           path: artifacts
           merge-multiple: true
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           name: Novel Studio ${{ github.ref_name }}
           body_path: RELEASE_NOTES.md
