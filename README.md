@@ -1,7 +1,7 @@
 # Novel Studio · 自动写小说
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Node](https://img.shields.io/badge/node-%3E%3D18-brightgreen.svg)](https://nodejs.org)
+[![Node](https://img.shields.io/badge/node-18%2B%20%7C%20Android%2022%2B-brightgreen.svg)](https://nodejs.org)
 [![Vue 3](https://img.shields.io/badge/Vue-3-42b883.svg)](https://vuejs.org)
 [![Electron](https://img.shields.io/badge/Electron-31-47848f.svg)](https://www.electronjs.org)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Browser%20%7C%20Android-lightgrey.svg)](#)
@@ -57,7 +57,8 @@
 
 ## 快速开始
 
-需要 **Node.js 18 或更高版本**。
+需要 **Node.js 18 或更高版本**。浏览器模式与 Electron 打包在 18 上即可；
+**Android 构建需要 22 或更高**（见下方 Android 章节）。
 
 ```bash
 git clone <你的仓库地址>
@@ -133,12 +134,25 @@ novel-studio/
 
 | 项 | 版本 |
 |---|---|
+| Node.js | **22+**（**必须**，见下方说明） |
 | JDK | 21（**必须**，见下方说明） |
 | Gradle | 8.14.3（发行包走腾讯镜像，无需手动下载） |
 | Android Gradle Plugin | 8.13.0 |
 | Android SDK | platform-tools + platforms;android-36 + build-tools;36.0.0 |
 | compileSdk / targetSdk | 36 |
 | minSdk | 24（Android 7.0） |
+
+**Node.js 必须是 22 或更高**：`@capacitor/cli` 的 `engines` 声明是 `>=22.0.0`，
+版本不够时它在启动时直接 `[fatal]` 退出，报错是：
+
+```
+[fatal] The Capacitor CLI requires NodeJS >=22.0.0
+Please install the latest LTS version.
+```
+
+注意这条**只影响 Android**：`npx cap sync android` 才会调 Capacitor CLI，
+`npm run dev` / `npm run electron` / `npm run dist:win` 在 Node 18 上都能正常跑。
+所以低版本 Node 下容易表现为「前端一切正常，只有 Android 构建突然失败」。
 
 **JDK 必须是 21~24**：Capacitor 8 硬编码 `sourceCompatibility = JavaVersion.VERSION_21`，
 而 Gradle 8.14.3 最高只支持到 Java 24。如果你机器上的默认 JDK 是 25 或更新，
