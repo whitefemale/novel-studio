@@ -4,6 +4,7 @@ import { useSettings } from '../store/settings'
 import { chatStream } from '../services/llm'
 import { isDesktop } from '../services/platform'
 import { toast } from '../store/toast'
+import SyncPanel from './SyncPanel.vue'
 
 const emit = defineEmits(['close'])
 const { settings, persist } = useSettings()
@@ -144,6 +145,28 @@ async function testConnection() {
             生成时携带世界观
           </label>
         </div>
+
+        <!--
+          下面两节都在 v-if="desktop" **之外**：
+          版本历史三个平台都有；局域网同步在电脑端配的是服务本身、手机端配的是「连哪台电脑」。
+        -->
+        <div class="divider"></div>
+        <h4 class="section-title">章节版本</h4>
+        <label class="label">每章最多保留：{{ settings.versionKeep }} 版</label>
+        <input
+          v-model.number="settings.versionKeep"
+          type="range"
+          min="1"
+          max="50"
+          step="1"
+          class="range"
+        />
+        <p class="hint">
+          AI 覆盖正文、手动存档、回滚前、删章前都会各留一版。超出的最旧版本会被清理，
+          <b>清理只在本机进行</b>，不会把另一台设备上保留的版本一起删掉。
+        </p>
+
+        <SyncPanel />
 
         <!-- 保存与导出（仅桌面端） -->
         <template v-if="desktop">

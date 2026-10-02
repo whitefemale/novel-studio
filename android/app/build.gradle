@@ -7,8 +7,10 @@ android {
         applicationId "com.novelstudio.app"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 1
-        versionName "1.0"
+        // 与 package.json 的 version 手工保持一致（Capacitor 不会自动同步它）。
+        // 改 package.json 发版时记得改这里，否则 APK 里显示的仍是旧版本号。
+        versionCode 3
+        versionName "2.1.0"
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         aaptOptions {
              // Files and dirs to omit from the packaged assets dir, modified to accommodate modern web apps.

@@ -4,12 +4,16 @@ import { marked } from 'marked'
 import { useBooks } from '../store/books'
 import { toast } from '../store/toast'
 import { createAutosaver } from '../services/autosave'
+import { countWords } from '../services/wordCount'
+import ChapterVersions from './ChapterVersions.vue'
 
 const emit = defineEmits(['selection-change'])
-const { store, currentChapter, setChapterContent, persistChapter } = useBooks()
+const { store, currentChapter, setChapterContent, persistChapter, captureChapterVersion } =
+  useBooks()
 
 const text = ref('')
 const preview = ref(false)
+const verOpen = ref(false)
 const ta = ref(null)
 const saved = ref(true)
 let lastSel = { start: 0, end: 0 }
@@ -55,12 +59,10 @@ watch(
   { immediate: true }
 )
 
-// 字数统计：中文字符 + 其它字符
-const wordCount = computed(() => {
-  const s = text.value.replace(/\s/g, '')
-  const cjk = (s.match(/[一-龥]/g) || []).length
-  return { cjk, other: s.length - cjk, total: s.length }
-})
+// 字数统计：中文字符 + 其它字符。
+// 算法在 services/wordCount.js 里，与落库的 chapters.wordCount 共用同一份——
+// 两处各写一份，用户早晚会看到两个不一样的数字。
+const wordCount = computed(() => countWords(text.value))
 
 // ---------------------------------------------------------------------------
 // 正文变更的统一入口：改内存 → 标脏 → 排队落盘
@@ -93,6 +95,25 @@ async function manualSave() {
   await persistChapter(id)
   saved.value = true
   toast('已保存', 'success')
+}
+
+/**
+ * 手动存档一版正文。
+ *
+ * 「保存」与「存档」是两件事，用户容易混：保存是让这一笔写进库里（自动保存本来
+ * 就会做，只是不等那 1.5 秒），存档是**留一个以后能退回来的点**——准备大改一段
+ * 之前先按一下，改坏了能回到这里。
+ *
+ * 先 flush 再存：不冲的话，防抖窗口里那几笔还没进 store 的正文会被存成一个
+ * 「比屏幕上少一段」的版本，而用户按存档时的预期恰恰是「存住我眼前这些字」。
+ */
+async function saveVersion() {
+  const id = currentChapter.value?.id
+  if (!id) return
+  await saver.flush()
+  const v = await captureChapterVersion(id, { source: 'manual' })
+  if (v) toast(`已存档一版（${v.wordCount} 字）`, 'success')
+  else toast('正文是空的，没有可存的版本', 'info')
 }
 
 function onKeydown(e) {
@@ -236,12 +257,34 @@ const previewHtml = computed(() => {
   }
 })
 
+/**
+ * 让屏幕上的正文重新对齐 store。
+ *
+ * 章切换的 watch 只在 chapterId 变化时同步正文，**同章内换掉正文它一概不理会**。
+ * 而回滚（以及第二阶段的同步合并）恰恰是「同一章、不同正文」，不重读的话
+ * 表现就是「点完恢复什么也没发生」——用户会再点一次，然后在版本列表里多出两条。
+ *
+ * 不先 flush：要的是丢掉编辑器里那份旧正文，冲上去反而会把刚恢复的内容顶掉。
+ * 挂起的那次自动保存也无害——persistChapter 读的是 store，此刻 store 已是新正文。
+ */
+function reloadFromStore() {
+  text.value = currentChapter.value?.content ?? ''
+  lastSel = { start: 0, end: 0 }
+  findCursor.value = -1
+  saved.value = true
+}
+
+function onVersionRestored() {
+  reloadFromStore()
+  verOpen.value = false
+}
+
 /** 把挂起的改动立即落盘；供 WritingView 在切章/返回书库前编排 */
 function flush() {
   return saver.flush()
 }
 
-defineExpose({ appendText, replaceSelection, flush })
+defineExpose({ appendText, replaceSelection, flush, reloadFromStore })
 
 onBeforeUnmount(() => {
   // 兜底：正常路径上 WritingView 已经先 flush 过了。
@@ -268,6 +311,16 @@ onBeforeUnmount(() => {
         </button>
         <button class="btn sm" :class="{ primary: preview }" @click="preview = !preview">
           {{ preview ? '编辑' : '预览' }}
+        </button>
+        <button class="btn sm" title="留一个以后能退回来的点" @click="saveVersion">存档</button>
+        <button
+          class="btn sm"
+          :class="{ primary: verOpen }"
+          :disabled="!currentChapter"
+          title="查看并恢复本章的历史版本"
+          @click="verOpen = !verOpen"
+        >
+          版本
         </button>
         <button class="btn sm" @click="manualSave">保存</button>
       </div>
@@ -318,6 +371,22 @@ onBeforeUnmount(() => {
     ></textarea>
 
     <div v-else-if="preview" class="preview" v-html="previewHtml"></div>
+
+    <!--
+      版本面板复用控制台那一份组件，只是把范围收到当前章。
+      真正要回滚的人正坐在编辑器里，不该逼他为了退一版而去开控制台。
+    -->
+    <div v-if="verOpen" class="modal-mask" @click.self="verOpen = false">
+      <div class="modal wide ver-modal">
+        <div class="modal-header">
+          <h3>本章版本 · {{ currentChapter?.title || '' }}</h3>
+          <button class="btn ghost sm" @click="verOpen = false">关闭</button>
+        </div>
+        <div class="modal-body">
+          <ChapterVersions :chapter-id="currentChapter?.id || ''" @restored="onVersionRestored" />
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -438,5 +507,12 @@ onBeforeUnmount(() => {
 .preview :deep(pre code) {
   background: none;
   padding: 0;
+}
+
+/* 版本弹窗用 .modal.wide 打底，只是要高一些：一屏能多看几版 */
+.ver-modal {
+  max-width: 720px;
+  max-height: 78vh;
+  max-height: 78dvh;
 }
 </style>

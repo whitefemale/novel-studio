@@ -33,3 +33,8 @@ Thumbs.db
 # 一旦有人把「保存地址」设成仓库目录，整本小说就会被 git add 进去。
 *.txt
 备份/
+
+# 全量备份（书库页「备份」按钮的产物，默认文件名见 snapshot.js 的 buildSnapshotName）。
+# 它和上面的 *.txt 是同一个风险：整库的 .json 里含所有正文与设定。
+# 只忽略这一个前缀，不用 *.json —— 那会把 package.json 之流也一起忽略掉。
+NovelStudio-全量备份-*.json

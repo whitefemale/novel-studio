@@ -23,5 +23,16 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // 删除目录内的指定文件
   deleteFiles: (payload) => ipcRenderer.invoke('fs:deleteFiles', payload),
   // 在资源管理器中打开目录 / 定位文件
-  openFolder: (payload) => ipcRenderer.invoke('shell:openFolder', payload)
+  openFolder: (payload) => ipcRenderer.invoke('shell:openFolder', payload),
+  // ---- 局域网同步 ----
+  // 电脑侧是 HTTP 服务端。配对码由主进程生成、只存在内存里，这里只是把它读出来
+  // 给界面显示；渲染层不会也不能把码持久化到 IndexedDB。
+  syncStart: (payload) => ipcRenderer.invoke('sync:start', payload),
+  syncStop: () => ipcRenderer.invoke('sync:stop'),
+  syncStatus: () => ipcRenderer.invoke('sync:status'),
+  syncRotateCode: () => ipcRenderer.invoke('sync:rotateCode'),
+  // 合并结果回传给主进程，唤醒那个挂起的 HTTP 请求
+  syncRespond: (payload) => ipcRenderer.invoke('sync:respond', payload),
+  // 主→渲染：有设备来同步了，把远端快照交下来处理
+  onSyncIncoming: (cb) => ipcRenderer.on('sync:incoming', (_e, payload) => cb(payload))
 })

@@ -14,7 +14,7 @@ function tail(text, max) {
  * 多条时按《标题》分段、每条截断到 4000 —— 人物/世界观本就无界拼接，
  * 十几条大纲若各带全文会直接撑爆上下文。
  */
-function collectOutlineText(outlines) {
+export function collectOutlineText(outlines) {
   const list = (outlines || []).filter((o) => o.type === 'outline' && o.content)
   if (!list.length) return ''
   if (list.length === 1) return tail(list[0].content, 8000)
@@ -115,4 +115,24 @@ export function buildMessages(action, { book, chapter, chapters, outlines, setti
 
   messages.push({ role: 'user', content: user })
   return messages
+}
+
+/**
+ * 把 Context Builder 的输出变成 messages。V2 编排器走这条路。
+ *
+ * **刻意不接受 action 参数**：动作已经烘焙进 ctx.task 了（`buildContext` 按 action
+ * 生成任务描述，且预算分配顺序也依赖它）。再让调用方传一遍，迟早会出现
+ * 「传的是 rewrite、ctx 是 continue」这种提示词与动作不一致的情况，
+ * 而且从消息里完全看不出来。
+ *
+ * context 为空时不留空段：空字符串拼进 user 会在提示词里留下一段空白标题，
+ * 模型有时会把它当成「设定为空」并据此自由发挥。
+ */
+export function messagesFromContext(ctx) {
+  if (!ctx) return []
+  const user = [ctx.context, ctx.task].filter((s) => s && s.trim()).join('\n\n')
+  return [
+    { role: 'system', content: ctx.system || '' },
+    { role: 'user', content: user }
+  ]
 }

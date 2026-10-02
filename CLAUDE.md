@@ -38,11 +38,11 @@ npm run build && SMOKE_TEST=1 npx electron .
 
 三层，各层解耦，浏览器与桌面共用同一渲染代码：
 
-- **渲染层** `src/`：Vue 3 单 SPA（`App.vue` 顶层切换 书库/写作 两个视图）。无路由、无 UI 框架，纯 `styles.css` 白底变量 + 组件内样式。
-  - `store/`（Composables）：`books.js` 持有全部领域状态（`store` 为模块级 `reactive` 单例：books/bookId/chapters/outlines），`settings.js` 持有全部持久化设置（AI 接口 + 保存与导出），`toast.js` 是全局轻提示队列。跨组件共享一律通过这三处，不另起本地副本。
-  - `services/`：纯函数/无状态模块，供 store 与组件调用。`storage.js` 封装 idb-keyval；`llm.js` 是 LLM 客户端（见下）；`prompts.js` 组装 `messages`；`export.js` 生成 TXT/MD 文本与落盘分发；`autosave.js` 是自动保存调度器；`backup.js` 定时备份；`platform.js` 统一平台判定；`native.js` 是 Capacitor 插件薄封装。
+- **渲染层** `src/`：Vue 3 单 SPA（`App.vue` 顶层切换 书库/写作 两个视图）。无路由、无 UI 框架，纯 `styles.css` 白底变量 + 组件内样式。弹窗（设置 / 导出 / **小说控制台** / 全量备份）都是 `v-if` 渲染的层，**不新增第三层视图**。
+  - `store/`（Composables）：`books.js` 持有全部领域状态（`store` 为模块级 `reactive` 单例：books/bookId/chapters/outlines），`settings.js` 持有全部持久化设置（AI 接口 + 保存与导出），`toast.js` 是全局轻提示队列。跨组件共享一律通过这三处，不另起本地副本。V2 又加了五个：`collectionSet.js`（一组按书隔离的集合的通用工厂）、`novelMemory.js` / `storyStructure.js`（记忆层与剧情骨架两族）、`novel.js`（按集合名路由到对应那族）、`generation.js`（生成记录与成本聚合）。它们同样是模块级 `reactive` 单例。
+  - `services/`：纯函数/无状态模块，供 store 与组件调用。`storage.js` 封装 idb-keyval；`llm.js` 是 LLM 客户端（见下）；`prompts.js` 组装 `messages`；`export.js` 生成 TXT/MD 文本与落盘分发；`autosave.js` 是自动保存调度器；`backup.js` 定时备份；`platform.js` 统一平台判定；`native.js` 是 Capacitor 插件薄封装。V2 新增两个子目录（规格书 02 要求，既有扁平文件**不移动**）：`services/ai/`（`orchestrator.js` 多阶段工作流、`tokenUsage.js` 计量与成本）、`services/novel/`（`schemas.js` 实体定义、`contextBuilder.js` 分层上下文、`snapshot.js` 全量快照，第二阶段又加了 `versioning.js` 章节版本、`timeline.js` 时间线与断链、`consistency.js` 一致性规则）。另有根级的 `services/migration.js`（V1→V2 迁移）、`services/sync.js`（局域网同步的渲染层一半，见「V2 第二阶段」）、`services/ids.js`、`services/wordCount.js`。
   - `main.js` 额外挂 `window.__ns` 测试钩子（db / store 工厂 / buildMessages / chatStream / 导出与自动保存的纯函数等），供冒烟测试注入脚本使用。
-- **Electron 壳** `electron/`：`main.js` 创建窗口 + IPC；`preload.js` 通过 `contextBridge` 暴露 `window.electronAPI`。`contextIsolation: true`、`nodeIntegration: false`、`webSecurity: true`（LLM 请求必须走主进程代理，规避 CORS）。**所有 `fs` / `shell` / `dialog` 调用只在主进程**，这三个安全开关不得放开。
+- **Electron 壳** `electron/`：`main.js` 创建窗口 + IPC + **局域网同步的 HTTP 服务**（见「V2 第二阶段」）；`preload.js` 通过 `contextBridge` 暴露 `window.electronAPI`。`contextIsolation: true`、`nodeIntegration: false`、`webSecurity: true`（LLM 请求必须走主进程代理，规避 CORS）。**所有 `fs` / `shell` / `dialog` 调用只在主进程**，这三个安全开关不得放开。
 
   **窗口加载哪一份前端，由 `VITE_DEV_SERVER_URL` 决定**（`main.js` 顶部二选一）：
 
@@ -65,10 +65,19 @@ npm run build && SMOKE_TEST=1 npx electron .
   | `export:writeToDir` | invoke | 直写保存地址。返回 `{ok, filePath, bytes}` 或 `{ok:false, code, message}` |
   | `fs:listFiles` / `fs:deleteFiles` | invoke | 列目录 / 删文件（自动备份淘汰用） |
   | `shell:openFolder` | invoke | 资源管理器中打开目录或定位文件 |
+  | `sync:start` / `sync:stop` / `sync:status` / `sync:rotateCode` | invoke | 局域网同步服务的开关、状态、换码 |
+  | `sync:respond` | invoke（渲染→主） | 唤醒一个挂起的 HTTP 请求（见下） |
+  | `sync:incoming` | 主→渲染 推送 | 有设备来同步，把远端快照交给渲染层 |
 
   `export:saveFile` 与 `export:writeToDir` **刻意不合并**：返回契约不同（前者是 UI 结果，后者是 I/O 结果）。
+
+  `sync:*` 是第二阶段新增的，**默认关闭**：`syncAutoStart` 为 false 时主进程不创建任何
+  server 对象，端到端零监听（`syncServerUpOk` 断言 `syncStatus().running === false && port === 0`）。
+  这是本项目第一个长驻监听端口的组件，改它时记住两条：`app.on('before-quit', stopSyncServer)`
+  已在位（否则进程会挂着一个没人在管的端口），以及 `SMOKE_TEST` 的退出前也要显式关一次
+  ——`app.exit(0)` **不走** `before-quit`。
 - **打包**：`electron-builder.yml`（win: nsis + portable，x64）。浏览器/Android 共用 `dist/` 产物；`android/` 不进 Electron 包（`files` 只含 `dist/**` 与 `electron/**`）。应用图标 `build/icon.ico` 由 `node scripts/gen-icon.mjs` 生成（纯 Node 手写 PNG + ICO 封装，无第三方依赖）——**换图标改这个脚本重跑即可，不要去装图标库**。
-- **CSP 写在 `index.html` 的 `<meta http-equiv>` 里**（`script-src 'self'`、`connect-src 'self' http: https:`）：渲染层不能加内联 `<script>`、也不能引 CDN 脚本；新增的任何 `fetch` 目标协议必须已在 `connect-src` 中。改 LLM 端点本身不用动它（`http:`/`https:` 已全放行）。
+- **CSP 写在 `index.html` 的 `<meta http-equiv>` 里**（`script-src 'self'`、`connect-src 'self' http: https:`）：渲染层不能加内联 `<script>`、也不能引 CDN 脚本；新增的任何 `fetch` 目标协议必须已在 `connect-src` 中。改 LLM 端点本身不用动它（`http:`/`https:` 已全放行）——**局域网同步的 `http://192.168.x.x:8787` 也因此不用动它**，这正是不把 `connect-src` 收窄到具体域名的原因。
 
 ### LLM 客户端双路径（llm.js）
 
@@ -104,8 +113,12 @@ npm run build && SMOKE_TEST=1 npx electron .
 - 触发：`SMOKE_TEST=1` 环境变量。`electron/main.js` 会：启动本地 SSE mock 服务器（端口 `18765`，含 `带CORS` / `不带CORS` / `HTTP 500` 三条路径）→ 监听 `did-finish-load` → 先打印挂载状态 `SMOKE_MOUNT` → 建好临时目录 `%TEMP%\novel-studio-smoke` 并 `executeJavaScript('window.__nsSmokeDir = …')` 注入给渲染层 → 读 `tests/smoke-inject.js`，`replaceAll('__PORT__', 18765)` 后 `executeJavaScript` 执行 → 打印 `SMOKE_DETAIL` → 清理临时目录并退出。
 - **渲染进程没有 `node:path`**，算不出临时目录，所以目录必须由主进程注入——这是 `window.__nsSmokeDir` 存在的唯一原因。
 - **`tests/smoke-inject.js` 是运行时从磁盘读的**（`electron/main.js` 的 `fs.readFileSync`），不是打包进 `dist/` 的。所以**只改断言时不需要 `npm run build`**——直接 `SMOKE_TEST=1 npx electron .` 即可，迭代一轮只要几秒；只有改了 `src/` 才必须重新 build。
-- `tests/smoke-inject.js` 共 48 项断言，沿用「扁平 `out` 对象 + `out.pass` 全部取 AND」的写法（**不要嵌套子对象**，`pass` 里漏掉一项就等于没有这项测试）。覆盖：设置默认值与旧记录回填、文件名净化、自动保存的防抖/冲刷/不串目标、多条大纲注入、目录直写的字节数与同名冲突、越界路径拒绝（含删除诱饵验证）、改名、关书守卫、**真实点击路径的组件挂载**，以及 3 条流式管线。
-- **没有「只跑某一项」的运行器——这是有意的，别去补**：48 项挤在一次 `executeJavaScript` 里，`SMOKE_TEST=1` 要么全跑要么不跑。要单独验证某一项时，两条更省事的路子：
+- `tests/smoke-inject.js` 共 140 项断言，沿用「扁平 `out` 对象 + `out.pass` 全部取 AND」的写法（**不要嵌套子对象**，`pass` 里漏掉一项就等于没有这项测试）。覆盖：设置默认值与旧记录回填、文件名净化、自动保存的防抖/冲刷/不串目标、多条大纲注入、目录直写的字节数与同名冲突、越界路径拒绝（含删除诱饵验证）、改名、关书守卫、**真实点击路径的组件挂载**、集合工厂的串行化与墓碑、迁移的幂等与非破坏、Context Builder 的预算与去重、usage 两种形状、编排器的提取/风险/中止/重试、快照合并与整库往返、章节版本的四类来源/裁剪无墓碑/回滚可撤销/删章可恢复、时间线两种排序与断链、七条一致性规则（**含「干净数据必须 0 条」这条反向断言**）、局域网同步的 HTTP 契约（预检/鉴权/冷却/体积/路由/停止）与一次真实的合并往返（含幂等、生成中 409、快照无 API Key），以及 3 条流式管线。
+- **同步相关的断言从渲染进程发真实 `fetch`**，不是直接调主进程的函数：手机端能不能连上全取决于 CORS 头与预检有没有发对，而那两样只有真发一次请求才验证得到。渲染层从 `file://`（不透明 origin）向 `http://127.0.0.1:<port>` 发请求是通的——本机回环豁免混合内容规则，加上服务端本来就发 `Access-Control-Allow-Origin: *`。所以计划里那条「退路」（主进程自己探 HTTP 再把结论注入渲染层）没有用到。
+- **同步段落的客户端与服务端是同一个渲染进程**，因此「本机应用远端返回的合并结果」必然报 `diff = {0,0,0}` —— 那是**收敛（幂等）**，不是测试没生效。有意义的差集在 `syncState.lastIncoming.diff`（主进程那一侧的合并结果，也就是「手机的对手」那一侧）。
+- `out.syncBigStatus` 是**诊断项，不进取 AND 链**：它记录客户端实际看到了什么（本机是 `'reset'` 而不是 `413`，见上面「V2 第二阶段」第 4 节第 1 条）。留着它是为了下一次有人问「413 到底有没有生效」时不必重新跑一遍才知道。
+- 组件挂载段里的 `syncPanelToggleOk` **真的把服务开关点了一次**：`.sync-code` 只在服务运行时才渲染，它出现就说明「面板 → sync.js → 主进程 → HTTP 监听」整条链路是通的。点完要**再点一次关掉**，否则会给整轮留下一台没人管的服务（后面的 M 段还会自己开一台）。
+- **没有「只跑某一项」的运行器——这是有意的，别去补**：102 项挤在一次 `executeJavaScript` 里，`SMOKE_TEST=1` 要么全跑要么不跑。要单独验证某一项时，两条更省事的路子：
   1. **在 DevTools 里手敲**（首选）：跑 `npm run dev` 或 `npm run electron`，控制台里用 `window.__ns`——它已挂好 db、store 工厂、`buildMessages`、`chatStream`、导出与自动保存的纯函数，绝大多数单项验证压根不需要碰测试脚本；
   2. 临时把其余断言短路（`if (false)` 掉），跑完**记得还原**——`out.pass` 是全体取 AND，忘了还原等于留了个永远不报错的口子。
 - **组件挂载那一节必须点真实的 `.book-card`**，不能只调 store：它是唯一能覆盖「组件 setup 期抛错」的手段（见「重要约定与坑」#14）。配套的 `uiNoSwallowedErrors` 会在脚本开头劫持 `console.error`，收集整轮的被吞错误，末尾断言没有 `ReferenceError`/`TypeError` 之类——**只断言元素存在是不够的，出错的组件照样渲染**。这条断言经过反向验证：把 `Editor.vue` 的 TDZ 缺陷还原后它会失败并打印出 `at watch.immediate ...`，修好后转绿。
@@ -122,8 +135,9 @@ npm run build && SMOKE_TEST=1 npx electron .
 并行出产物（安装版/便携版 exe、Android debug APK），第三个 job 合并并发布 Release。
 `workflow_dispatch` **只构建、不发布**，产物在 Actions 页面的 Artifacts 里，用于上线前干跑。
 
-发版顺序：改 `package.json` 的 `version`（决定 exe 内部版本号）→ 改 `RELEASE_NOTES.md`
-（正文 + 下载表里的版本号）→ 提交推送 → 打 tag 推送。
+发版顺序：改 `package.json` 的 `version`（决定 exe 内部版本号）→ 改 `android/app/build.gradle`
+的 `versionCode` / `versionName`（**Capacitor 不会自动同步它**，不改的话 APK 里显示的仍是旧版本号）
+→ 改 `RELEASE_NOTES.md`（正文 + 下载表里的版本号）→ 提交推送 → 打 tag 推送。
 
 **跑的是 tag 指向的那个提交里的 workflow**——所以改了 `release.yml` 必须先推 main 再打 tag，
 否则新 tag 用的仍是旧流程。同理，**「重新运行」一个历史 run 不会采用新的 workflow**，
@@ -178,6 +192,7 @@ curl -s "https://api.github.com/repos/<owner>/<repo>/actions/runs/<run_id>/jobs"
 
 1. **`.gitignore` 里的 `*.txt` 与 `备份/` 是刻意的，但有个坑**：本项目导出正文就是 `.txt`、自动备份目录就叫「备份」。若有人把设置里的「保存地址」指向仓库目录，整本小说会被 `git add` 进去——这是本仓库的头号误提交风险，故一律忽略。
    **代价**：以后往仓库里加任何 `.txt`（测试夹具、示例数据）都会**被静默忽略**，`git status` 不显示、没有警告，很容易以为是文件没保存。真需要提交 `.txt` 就用 `git add -f`，或在那条规则下加 `!` 例外。
+   **同一条风险的第二份**：全量备份是一个含全部正文与设定的 `.json`（默认名见 `snapshot.js` 的 `buildSnapshotName`），也能被「保存地址直写」写进仓库。故忽略 `NovelStudio-全量备份-*.json`——只忽略这一个前缀而**不是** `*.json`，后者会把 `package.json` 之流也一起忽略掉。改名时两处要同步。
 2. **`android/gradlew` 必须保持可执行位（mode `100755`）**，否则 Linux / macOS 克隆后 `./gradlew` 直接无法执行。**Windows 上这个位容易在重新 `git add` 或 checkout 时丢掉**，提交前用 `git ls-files -s android/gradlew` 复查，掉了就用 `git update-index --chmod=+x android/gradlew` 补回。
 3. **`.gitattributes` 固定了换行符**：`* text=auto`（仓库内存 LF）、`gradlew`/`*.sh` 强制 LF、`*.bat` 强制 CRLF。`gradlew` 那条是必需的——它带 CRLF 时在 Unix 上会报 `sh\r: No such file or directory`。新增二进制类型记得加进 `binary` 列表。
 4. **以下三类文件永远不要提交**（前两类已在 `.gitignore` 里，第三类只能靠自觉）：
@@ -189,8 +204,9 @@ curl -s "https://api.github.com/repos/<owner>/<repo>/actions/runs/<run_id>/jobs"
 ## 数据模型（IndexedDB）
 
 - `books`（键 `books`）：`{ id, title, intro, coverColor, createdAt, updatedAt }`
-- `chapters`（键 `chapters:{bookId}`）：`{ id, bookId, title, content, order, updatedAt }`，按 `order` 排序
-- `outlines`（键 `outlines:{bookId}`）：`{ id, bookId, type: 'outline'|'character'|'world', title, content, updatedAt }`
+- `chapters`（键 `chapters:{bookId}`）：`{ id, bookId, title, content, order, updatedAt }`，按 `order` 排序。V2 追加的字段**全部可选**：`arcId`、`summary`、`purpose`、`status`、`wordCount`、`timelineStart`、`timelineEnd`。
+- `outlines`（键 `outlines:{bookId}`）：`{ id, bookId, type: 'outline'|'character'|'world', title, content, updatedAt }`。迁移会在行上**追加** `migratedTo: [newId]`，其余字段一字不改。
+- `meta`（键 `meta`）：`{ schemaVersion, updatedAt }`。**刻意不放 settings**：`settings.load()` 会把缺失的键回填成默认值，被回填出来的 `schemaVersion` 恒假，而它恰恰用来判断要不要升级。
 - `settings`（键 `settings`）：单条，字段见 `src/store/settings.js` 的 `defaultSettings`。默认 `baseUrl: 'https://api.deepseek.com'`（不带 `/v1`，由 `buildChatUrl` 补路径）。
 
   「保存与导出」七个键（仅桌面端生效；Android 上设置面板整节隐藏）：
@@ -207,11 +223,233 @@ curl -s "https://api.github.com/repos/<owner>/<repo>/actions/runs/<run_id>/jobs"
 
   **无需迁移代码**：`load()` 走 `Object.assign(settings, defaultSettings, s)`，旧记录缺的键自动补成默认值——由冒烟测试的 `settingsBackfill` 断言钉死。`exportMode` 默认 `'direct'` 是安全的，因为 `saveDir` 默认为空时会自动回落到对话框，老用户零行为变化。
 
+  V2 追加的键（同样由 `settingsBackfill` 与测试里的 `NEW_KEYS` 复位清单覆盖）：
+
+  | 键 | 默认 | 含义 |
+  |---|---|---|
+  | `showUsage` | `true` | AI 面板显示本次 token 与金额 |
+  | `streamUsage` | `true` | 请求带 `stream_options.include_usage`（少数兼容端点不认，给用户关掉的开关） |
+  | `pricing` | `DEFAULT_PRICING`（数组） | 可编辑价目表 |
+  | `contextBudget` | `6000` | Context Builder 的 token 预算 |
+  | `autoExtractMemory` | `true` | 写完自动提取记忆（「写 + 提取」档） |
+  | `reviewHighRisk` | `true` | 高风险变更进审阅队列 |
+  | `versionKeep` | `10` | 每章最多保留多少个历史版本（裁剪不写墓碑，见「V2 第二阶段」） |
+  | `syncPort` | `8787` | 电脑端监听端口（被占用时主进程向后试，实际端口以界面显示的为准） |
+  | `syncAutoStart` | `false` | 下次启动自动开启同步服务。**默认 false 是安全默认**，且它是用户「我知道这会在局域网上开一个端口」的明确表示 |
+  | `syncUrl` | `''` | 手机端：电脑地址，如 `192.168.1.5:8787` |
+  | `syncCode` | `''` | 手机端：6 位配对码（**电脑端的码不在这里**，它只存在主进程内存里） |
+
+  **坑**：`load()` 是**浅合并**，而 `pricing` 是数组——存储里的旧数组会整体替换默认值，以后给默认条目加字段时老用户那里就缺字段。故 `load()` 之后必须跑一次 `normalizePricing(settings.pricing)` 补齐，由 `pricingNormalizeOk` 钉死。**给 `DEFAULT_PRICING` 的条目加字段时，必须同步改 `normalizePricing`。**
+
+### V2 领域集合（键 `{集合名}:{bookId}`）
+
+`storage.js` 的 `COLLECTIONS` 清单即唯一事实来源，`coll.xxx` 由 `makeCollection(name)` 工厂生成：`volumes`（卷）、`arcs`（篇）、`characters`、`locations`、`factions`、`worldRules`、`events`（时间线）、`foreshadowing`、`generationRuns`、`reviewQueue`、`chapterVersions`（章节历史版本）、`tombstones`。
+
+**加一条集合名就在这里加一行，别处都不用动**：`serialize` / `toPlain` / `!bookId` 守卫由工厂保证，`deleteBook` 的级联删键自动覆盖，`snapshot.js` 的 `DATA_COLLECTIONS` 由这份清单派生因而新集合**自动进全量备份与设备同步**。第二阶段加 `chapterVersions` 就是这一条的最好例子——数据层只写了一行。
+
+字段定义**只看 `src/services/novel/schemas.js` 的 `ENTITY_SCHEMAS`**——它同时驱动三件事：控制台的表单/表格渲染（`EntityTable.vue` 一个组件通吃八个实体）、Context Builder 的层文本（`renderEntity`）、记忆提取的 JSON 约束（`extractionSpec`）。加字段只改 schema，三处自动跟上；反过来，**在别处硬编码实体字段名一定会与它分叉**。
+
+`chapters` / `outlines` **刻意不迁进工厂**：它们的排序与重编号行为被断言钉着，重写只有风险没有收益。
+
 ## 提示词组装（prompts.js）
 
 `buildMessages(action, {...})` 生成 `[system, user]` 两轮消息：system 为作者身份 + 设定上下文（按设置开关 `includeOutline/includeCharacters/includeWorld` 决定是否携带大纲/人物/世界观）；user 按 `action` 分支——`continue`（尾随当前章+前 N 章上下文）/ `expand` / `rewrite`（作用于 `selection`）/ `outline`（分章大纲）/ `chapter`（按大纲生成一章）。改提示词注意让 AI「直接输出正文、不输出标题」的约束始终保留。
 
 `collectOutlineText(outlines)` 汇总**所有**「故事大纲」型设定（侧边栏允许建任意多条，旧实现用 `.find()` 只取第一条）。**只有一条时走与历史逐字一致的 `tail(content, 8000)` 分支**——这是刻意的，避免提示词回归、也保住既有的冒烟断言；多条时按 `《标题》\n内容` 拼接、每条 `tail(…, 4000)`（人物/世界观本就无界拼接，十几条大纲各带全文会撑爆上下文）。
+
+V2 起它被 `services/novel/contextBuilder.js` 复用（导出后导入，不复制），并由 `messagesFromContext(ctx)` 把 `{system, context, task}` 变成 `[system, user]`。`buildMessages` 原样保留供旧路径与断言使用，两者的分工见「V2 记忆层」第 3 条。
+
+## V2 记忆层（改领域功能前必读）
+
+规格书在 `docs/`（6 份，来自 `NovelStudio_V2_Spec`）。**05_CLAUDE_ADDENDUM_V2.md 自己要求「改领域功能前先读 docs/」**，本节省略了与既有约定重叠的部分（安全边界、`toPlain`、`serialize`、冒烟纪律都以本文件为准）。
+
+第一阶段已落地：存储地基 + 迁移 + Context Builder + token 计费 + 编排器 + 控制台 UI + 快照。第二阶段也已落地：章节版本历史、时间线可视化、一致性检查、局域网电脑 ↔ 手机同步——**见本文件末尾的「V2 第二阶段」一节**，那一节才是改这四块功能时的依据。
+
+`snapshot.js` 当初是给同步铺的路，现在两条路都在用它：`applySnapshot` 是「恢复全量备份」与「局域网同步」**共用的同一个落库入口**，合并规则只有那一份。改它等于同时改这两个功能，改完两条都要验。
+
+### 1. 删除只有一种表示：墓碑
+
+不给记录加 `deleted` 标记，而是统一记在 `tombstones:{bookId}` 里：`{ id, type, deletedAt }`。理由与两条硬约束：
+
+- 加标记的代价是**每个列表渲染都要记得过滤**，漏一处就把删掉的人物显示出来；独立一张表则让 `getAll` 天然只返回活记录，渲染层零改动。
+- `coll.remove` 的顺序是**先写墓碑、再摘记录**（跨键没有事务，`serialize` 是 per-key 的，必须选一个失败方向）：墓碑成功而删除失败只留下一条无害的多余墓碑；反过来的失败会让删掉的记录在另一台设备上复活。
+- `deleteChapter` / `deleteOutline` 在既有硬删除逻辑**之外追加**一次墓碑写入，数组语义与 UI 行为完全不变。这条不是锦上添花——章节恰恰是用户删得最多的东西。
+- `deleteBook` 走 `bookTombstones`（全局键，书都没了没有 bookId 可挂），并**级联删除全部 `COLLECTIONS` 键**。级联只覆盖新集合，`chapters` / `outlines` 的既有删除逻辑不动。
+
+### 2. 集合工厂 `coll`（`serialize` 的结构性保证）
+
+新增 per-book 集合一律用 `coll.xxx.upsert/saveAll/remove/getAll`，**不要自己 `set(key, …)`**：工厂把「`serialize(collKey)` + `toPlain()` + `!bookId` 守卫」三件事固化成结构性保证，而不是「记得加」的约定——漏掉 `serialize` 意味着并发写互相覆盖，这种缺陷不报错，只是静默丢数据。
+
+`upsert` 会补 `createdAt`（沿用原值，刷新就丢了「什么时候建的」）与 `updatedAt`（每次刷新，第二阶段的同步全靠它比较）。
+
+### 3. Context Builder（`services/novel/contextBuilder.js`）
+
+`buildContext({...})` → `{ system, context, task, metadata }`，**全部纯函数、无 I/O**。这是「由代码决定提示词装什么，不交给模型」的落点，也是预算算法能确定性验证的前提。
+
+- 层按 `priority` 排序，`required` 层**永不截断**（因此总量可能高于预算，`metadata.overBudget` 会如实置位）。
+- 降级方向按层类型分：正文/摘要类保留**尾部**（越近越重要），规则/设定类保留**头部**。**别把两者统一。**
+- `metadata.layers` 同时包含被丢弃的层（带 `label`），直接驱动 Context Preview —— 丢弃的层正是「AI 忘了这件事」的元凶，必须让用户看得见。
+- **两条路径并存且不许「统一」**：`buildMessages`（V1 旧路径）供 `expand` / `rewrite` / `outline` 与既有断言使用；编排器路径（`continue` / `chapter`）必经 Context Builder。规格书 04 本就规定扩写/改写不得改动人设、世界规则、时间线与伏笔，所以它们不进编排器是**符合**而非违背规格。
+- `collectOutlineText` 从 `prompts.js` 导出后由 contextBuilder 复用，只有一条大纲时走与历史**逐字一致**的 `tail(content, 8000)` 分支；多条时各 `tail(…, 4000)` 并加 `《标题》`。改这里等于改历史提示词。
+
+### 4. 编排器（`services/ai/orchestrator.js`）
+
+`runChapterWorkflow({ input, settings, stages, recordRun, callbacks })`，默认 `['write','extract']`。四条不许改回去的设计：
+
+1. **只有提交记忆会写库**（`commitChanges`），所以中途中止不会留下半提交状态。
+2. **只有第一阶段（写正文）失败才算整次运行失败**（`settleStatus()` 只看 `run.stages[0]`）。提取失败只把自己的阶段标成 error 并经 `wf.error` 传出去——正文已经拿到手了，把整次标成失败会让用户以为这一章白写了。
+3. **提取重试的每一次尝试都要各自记一条账**。重试是一次真实计费调用，只记最后一次会让用户看到的金额低于账单——而「这一章花了多少钱」正是记账功能存在的意义。
+4. **中止句柄必须同步交出去**（`callbacks.onControl({ abort })` 在 `await runFrom(0)` **之前**触发）。等 `runChapterWorkflow` 返回再拿，生成早就结束了，「停止」按钮等于摆设。已实测该时机是同步的，`workflowSyncAbortOk` 钉着它。
+
+提取出的 `summary` / `timelineEnd` 是**章节**字段而不是记忆实体，所以由 `runChapterWorkflow` 回传给调用方，**只在文字真正落进某一章的那一刻**才写库（`AiPanel` 的 `applyChapterMeta`）——提取发生时正文还没被插入任何章节，只有后续的插入动作知道它落到哪儿。
+
+### 5. usage 的两种形状（`parseSseUsage`）
+
+**必须独立于 `choices` 判断**：DeepSeek 把 usage 挂在**最后一个内容块**上（`choices` 非空、`delta` 为空、`finish_reason` 非空），而 OpenAI / vLLM / Kimi 那类是**单独的 usage 块**（`choices: []`）。只挑 `choices.length > 0` 的行解析是这一功能最常见的实现错误——usage 会永远是 0。mock 服务器（`electron/main.js`，`/usage` 路径）两种形状都发，`usageParseOk` 钉死。
+
+两条传输路径都要接（IPC 与浏览器直连），但**不需要新增 IPC 通道**：主进程早已把原始 SSE 行透传给渲染进程，`parseSseUsage` 在 `ipcHub` 的 `onDelta` 处理器里跑一遍即可。`onDone` 的契约（零参）保持不变。
+
+### 6. 价格表
+
+`DEFAULT_PRICING` 里的 DeepSeek 条目**只作种子，不是权威**：公开资料互相矛盾且历史上多次调整。因此任何价格都不得被当成硬编码事实——设置里提供可编辑价目表并标注「请以官方定价页为准」。
+
+`priced: false` 表示命中的是 `'*'` 兜底条目（单价 0），**必须与「花费 ¥0」区分开**：前者是「不知道多少钱」，后者会让用户以为这次调用免费。`describeRun` 与 `unpricedHonestOk` 都在守这条。
+
+### 7. 快照与第二阶段的同步
+
+`services/novel/snapshot.js` 是「整库备份」与将来「设备同步」**共用的一份协议**，合并规则只在 `mergeSnapshot` 里写一次：
+
+- 同 id 记录 `updatedAt` 大的赢，**相等时保留本地**（否则重复恢复同一个文件会让本机数据来回抖动）；
+- 删除靠墓碑判死：`deletedAt >= updatedAt` → 删；墓碑旧于记录 → 记录活着（说明删掉之后又被编辑过）；
+- 墓碑合并只保留**最早**的删除时刻（与 `addTombstone` 一致）；
+- 整书墓碑命中时，这本书的 per-book 数据一并丢弃——否则恢复后「书没了但人物还在」，而那些人永远没有入口可删。
+
+`applySnapshot` 写回**一律走 storage 的公开写函数**，于是 `toPlain` / `serialize` 自动生效；**不要自己 `set(key, obj)`**，那会绕过写队列，与正在进行的自动保存互相覆盖。恢复是**合并不是替换**，且落盘前必须由 `diffSnapshots` 先报出「新增 / 覆盖 / 删除」各多少条——删除也必须报，报喜不报忧的确认框是在骗人。
+
+### 8. 控制台 UI 的形态约束
+
+`NovelConsole.vue` 是**全屏弹窗**（`.modal.console` 修饰类覆盖既有 `.modal` 的 `max-width:460px` + 整框滚动），**不是** WritingView 的第四栏：三栏在窄屏上已经要靠底部标签切换，再加一栏会让移动端彻底不可用。`App.vue` 的 `handleBack()` 里控制台必须排在**最前**——它盖住了设置与导出，排在后面会先把看不见的弹窗关掉，表现为「返回键坏了」。
+
+窄屏（≤860px）整屏铺满、标签栏转横向滚动条；`WritingView` 的 `pane` 逻辑一行都不改。
+
+**新增标签时给 `badgeOf` 加显式分支**，这是第二阶段踩过的坑：它的默认分支是 `cols.list(key).length`，而标签键与集合名**并不总是一致**——`timeline` 对应的集合叫 `events`、`versions` 与 `consistency` 根本不是集合名。不显式映射的话徽标**恒为 0**，而且它会一直安静地错着，没人看得出（`versions` 那个若按条数报又是个四位数，对用户毫无意义，所以报的是章节组数）。
+
+### 9. 迁移
+
+`services/migration.js`：非破坏、幂等、只增不减、**不静默执行**。只有在控制台里点「一键升级」才会跑——静默改写用户的真实数据正是本项目一贯避免的；且不开控制台的 V1 用户因此保持 100% 旧行为。
+
+「故事大纲」**不自动转换**：一整段自由文本映射成卷/篇必然丢信息又猜错结构，由用户在控制台里手建。两道幂等护栏：源行上的 `migratedTo`，以及规范化标题比对（防「实体建好了但源行没标记」那一半失败）。Context Builder 同时读旧 `outlines` 与新实体，靠同样两道去重（`contextNoDupOk`）。
+
+### 10. 调试入口
+
+- 控制台「上下文与迁移」标签 = Context Preview：每层 token / 截断 / 丢弃 + 最终提示词全文。
+- `window.__ns` 已挂上全部 V2 纯函数（`buildContext` / `allocate` / `extractJson` / `classifyRisk` / `mergeSnapshot` / `planMigration` / `parseSseUsage` / `captureVersion` / `pruneVersions` / `buildTimeline` / `runRuleChecks` / `CONSISTENCY_RULES` / `normalizeSyncUrl` / `handleIncomingSnapshot` / `reloadAfterSync` / `pushSnapshot` / `syncStatus` …）。**新增纯函数不加进去等于没被测试。**
+- 局域网同步在 DevTools 里调：`await __ns.syncStatus()` 看开着没、`await __ns.testConnection('192.168.1.5:8787')` 打一发 `/hello`、`await __ns.pushSnapshot(url, code)` 走一次真实合并（在电脑上对自己发也能跑，两侧同库时 diff 恒为 0）。
+- 手工验收清单见 README「长篇写作怎么用」与「小说控制台」两节。
+
+## V2 第二阶段（版本 / 时间线 / 一致性 / 同步）
+
+四块功能，共同点是**全部建立在第一阶段的数据模型之上，没有一处改既有记录的形状**，所以安装后无需迁移、`SCHEMA_VERSION` 与 `SNAPSHOT_VERSION` 都没动。改这四块之前先读这一节。
+
+### 1. 章节版本（`services/novel/versioning.js`）
+
+```
+chapterVersions:{bookId}
+{ id, bookId, chapterId, chapterTitle, content, wordCount, source, generationRunId, createdAt }
+// source ∈ 'ai' | 'manual' | 'rollback' | 'delete'
+```
+
+**没有 `updatedAt`，这是刻意的**：版本是不可变的，改一个历史版本没有任何意义。同步靠 `mergeRecords` 的 `tstamp()` 回退到 `createdAt`（`snapshot.js`），所以不可变记录天然能正确合并——**别顺手给它补一个 `updatedAt`**，那会让「同一版在两端各自被刷过时间戳」变成一次无意义的覆盖。
+
+**捕获点只有四个，全是显式调用，绝不在 `persistChapter` 里挂钩子**——那是自动保存的落点，1.5 秒防抖一次，挂在那里等于每写一段存一版：
+
+| 触发点 | `source` | 位置 |
+|---|---|---|
+| AI 产出要覆盖某章已有的非空正文 | `'ai'` | `AiPanel.vue` 应用正文的动作（与 `applyChapterMeta` 同一处，那里同时拿得到 `chapterId` 与 `generationRunId`） |
+| 用户点编辑器工具栏的「存档」 | `'manual'` | `Editor.vue` |
+| 恢复某一版之前 | `'rollback'` | 版本面板的 `restore()`——**先存当前再覆盖**，回滚因此可撤销 |
+| 删章之前 | `'delete'` | `books.js` 的 `removeChapter`。章节走硬删除，版本留下来，按「已删除章节」分组可恢复成新章——这是误删唯一的救回入口 |
+
+**裁剪（`versionKeep`，默认 10）用 `saveAll` 整组回写，刻意不写墓碑**。裁剪是本地整理，不是用户删除：写墓碑会让它传播到另一台设备、把对方**故意**保留的更多版本也删掉，而且墓碑表会无限膨胀。代价是另一台设备下次同步可能把多出来的版本送回来——无害，版本不可变，多留几版不是数据丢失。
+
+### 2. 时间线（`services/novel/timeline.js`）
+
+`buildTimeline({chapters, events, foreshadowing, locations, characters, factions})` → `{ nodes, warnings }`，纯函数无 I/O。排序以 `chapters` 的 `order` 为主键（可切「按故事时间排」）；伏笔也在轴上：`firstChapterId` 是埋点、`expectedRevealChapterId` 是预期回收点，预期回收章已写完而状态仍是 `planted`/`developing` → 标「逾期未回收」（用 `ACTIVE_FORESHADOW_STATUS`，别再写一份状态枚举）。`orphan = true` 表示指向的章节已不存在。
+
+**`warnings` 同时是一致性规则 #1 的实现**，两个功能共用一份——这是本轮最省工作量的设计，别把断链检测再写一遍。
+
+`TimelineView.vue` 只是渲染层：竖轴用 CSS 竖线 + `::before` 圆点（不引入 SVG 依赖），表格视图原样保留供新增与编辑。点节点 → `store.selectChapter()`。
+
+### 3. 一致性（`services/novel/consistency.js`）
+
+`runRuleChecks({chapters, memory, structure, tombstones})` → `{ issues, stats }`，纯函数、**规则常开**（打开控制台即算）、零成本、零误报。七条：
+
+| # | 规则 | severity |
+|---|---|---|
+| 1 | 断链引用（复用 `timeline.js` 的 `warnings`） | high |
+| 2 | 时间线倒挂（章节 `timelineStart` 与 `order` 不同向） | medium |
+| 3 | 伏笔逾期未回收 | medium |
+| 4 | 已死角色仍在出场（其后的事件里仍出现在 `characterIds`） | high |
+| 5 | 重复事件（同章同标题） | low |
+| 6 | 章节缺摘要（正文非空但 `summary` 为空） | low |
+| 7 | 记忆陈旧（`characters.lastUpdatedChapterId` 距今超过 30 章） | low |
+
+**`consistencyCleanOk` 是这一节最重要的断言**：干净数据必须算出 **0 条**。误报比漏报更能毁掉这个功能——一个总是喊着「这里有问题」的检查，用户第三次就会忽略它。
+
+**AI 深检是编排器的 `review` 阶段**（`STAGE_LABELS.review = '一致性审校'`，runner 注册进 `RUNNERS`），输出契约逐字采用规格书 04 的 `{issues, styleIssues, continuityIssues, severity}`，用现成 `extractJson` 解析。三条不许改回去的设计：
+
+- **不加入 `DEFAULT_STAGES`**：它只在用户点按钮时按需跑，所以「每章写完自动检查」这类隐性花费不会发生。这是「规则常开 + AI 手动」这个组合能成立的前提。
+- **必经 Context Builder**，不自己拼 prompt。
+- **计费照常**（走 `record(..., 'review')` 写 `generationRuns`）：手动触发也必须是**可见花费**，否则「AI 深检」就成了唯一一处悄悄扣钱的地方。
+
+**报告不落库，这是有意为之，别当成漏做**：报告是针对**某一版正文**的意见，正文一改就过期，存下来只是过期噪音；它也不是规格书 05 意义上的「实体」（没有需要导入导出的持久对象）。要回看历史就去「生成历史」里找那条 review 记录。`consistencyReviewNoPersistOk` 钉着它。
+
+### 4. 局域网同步（`services/sync.js` + `electron/main.js`）
+
+**手机发起，一次往返收敛**。手机没有服务端，所以电脑不可能主动推：
+
+```
+POST /sync   X-Pair-Code: <6位>
+  体：手机的 collectSnapshot() JSON
+  电脑：applySnapshot(体) → 返回 after（合并结果）   → 200
+  手机：applySnapshot(响应) → 两侧一致
+```
+
+- **必须是单个 `POST` 而不是「先拉后推」**：两个请求之间任一侧写入都会丢更新，一次往返把窗口压到一个请求内。
+- `GET /hello` → `{app, version, protocol, snapshotVersion, schemaVersion}`。**无鉴权、无数据**，专供手机端「测试连接」区分「地址不通」与「码不对」。`protocol: 'novel-studio-sync'` 还负责区分「端口上蹲着别的软件」。
+- 错误码：`401` 码错/缺码/冷却中 · `400` bad-json/bad-snapshot · `413` 体过大 · `409` 电脑正在生成 · `503` 渲染层超时未应答 · 其余路径一律 `404`。
+- 服务器只认 **两条精确路径**（`new URL(req.url, …).pathname` 全等，不是 `includes`），**无路径参数，完全不认识文件系统**。
+
+**尺寸与配对的四道闸**，每一道都对应一个真实的攻击面：
+
+1. **体上限 64 MB**，`Content-Length` 预检 + 累积时再判一次，超限立刻 `req.pause()` 回 413 然后 `res.on('finish', () => req.destroy())`。**发超大体的客户端看不到那个 413**（连接已被重置，Chromium 报网络错误）——这是拿「拒绝得早、不占带宽」换来的，所以**客户端必须自己先量体积**（`sync.js` 的 `pushSnapshot` 用 `new Blob([text]).size`，**不是 `text.length`**：中文是 3 字节/字符，按 length 判会让 60 MB 的中文快照看起来只有 20 MB）。
+2. **6 位配对码**用 `crypto.randomInt` 生成，`crypto.timingSafeEqual` 比对，**每次开启服务重新生成，只存在主进程内存里**，不落盘、不进设置、不进日志。
+3. **连续 10 次错码锁定该 IP 一分钟**。这条是必需品而不是加固：`Access-Control-Allow-Origin: *` 意味着**用户访问的任意网页**都能对这个端口发请求并读到响应，6 位码只有百万种可能，没有冷却就是可穷举的。冷却期间**正确码也拒绝**——否则它就不是锁。用户唯一的自助出口是「换一个配对码」，它同时清掉锁。
+4. **CORS 与预检是必需的**：Android WebView 的 origin 是 `https://localhost`，与 `http://192.168.x.x` 跨源，且带自定义 `X-Pair-Code` 头 → 必然先发 `OPTIONS`（回 204，放行 `Content-Type, X-Pair-Code`）。少任何一个头，Android 上就一个字节都收不到。
+
+**渲染层的硬约束（`handleIncomingSnapshot` 的顺序，四步都不能换）**：
+
+1. **正在生成 → 直接回 busy**（主进程翻译成 409）。合并是 `saveChapters` 整组回写，与流式写入抢同一个键，撞上就是一次静默丢稿。「是否正在生成」的真相来源是 `generationStore.running`（不是 AiPanel 的局部 ref）——同步层读它，而 service 不能反向 import 组件。`AiPanel` 那个 `generating` 已改成带 getter/setter 的 `computed`，所以既有的 `generating.value = x` 一行没改。
+2. **`await ui.flush()`**：把编辑器防抖窗口里的正文先落库，否则用户刚敲的几百字会被随后的整组回写覆盖掉，且没有任何提示。
+3. **`applySnapshot(remote)`** — 只写库，**完全不碰 store**。
+4. **`reloadAfterSync()` + `ui.reloadEditor()`**。漏掉的表现是「同步完成了但界面还是旧的，重启才变」。`reloadAfterSync` 有两处刻意不走现成函数：**不用 `init()`**（它有 `loaded` 守卫，第二次直接返回，书库列表还是旧的）、**保留 `chapterId`**（`openBook()` 会把光标重置到第一章，用户正在写第 12 章时被同步打断、正文突然跳回第 1 章，比不刷新更糟）。
+
+**IPC 与事件中枢**：`sync:incoming`（主→渲染）＋ `sync:respond`（渲染→主）与既有 `llm:*` 同构；`ensureSyncHub()` **在模块加载时注册一次**，按 `requestId` 分发——CLAUDE.md 坑 #2 的铁律在同步通道上一模一样地成立，**不得**改回函数体内注册。主进程侧 `askRenderer` 有 20 秒超时，超时后迟到的应答拿到 `ESTALE`（不是错误，直接丢弃）。`handleSyncRequest` 之外的任何一处抛出都会让请求没有下文，所以那些回调里的 `try/catch` 是必需品，不是防御性冗余。
+
+**安全边界（README 与发版说明里写的口径，不要放松）**：
+
+- **快照里没有 `settings`** —— `collectSnapshot` 只读 books / chapters / outlines / 集合 / 墓碑，**API Key 永不出本机**。`snapshotNoApiKeyOk` 断言把它钉死。
+- 默认关闭；只在局域网可达（绑定本机网卡地址，不做端口映射）；每次开启换码；主进程不认识文件系统。
+- **措辞一律用「局域网同步」，不用「云同步」**：这是两台自己的设备直连，数据不经过任何第三方服务器，与「本地优先、不提供云端存储」一致。用「云同步」会让用户以为有中转服务，那是另一个东西。
+- 手机端明文 HTTP 目前**只在 debug APK 生效**（`capacitor.config.ts` 的 `cleartext: true` + `allowMixedContent: true`），release 需另配 `networkSecurityConfig` —— 沿用既有的限制说明，不许含糊。
+
+**地址列表刻意列出全部网卡**（`os.networkInterfaces()` 的 IPv4 非 internal，私网段排前面）：Windows 上 VPN / WSL / VirtualBox 的虚拟网卡很常见，**猜错比列出来更糟**——猜错的表现是「电脑上显示了一个手机永远连不上的地址」，而用户没有任何办法知道问题出在哪。同理，端口被占用时向后试 10 个并把**实际端口**回报给界面，比报「端口被占」友好得多。
+
+`normalizeSyncUrl` **先看有没有协议头再补**，两步不能合并成「先补 `http://` 再判协议」：那样 `file:///C:/Windows` 会被解析成主机名 `file`，得到一个语法完全合法、实则毫无意义的 `http://file:8787`，用户只会看到「连不上」，而他填的明明是一个「地址」。
+
+### 5. 设置面板的同步节
+
+`SyncPanel.vue` **一个组件两副面孔**（按 `isDesktop()` 分），放在 `SettingsPanel.vue` 的 `v-if="desktop"` **之外**——同步在电脑与手机两端都要能配：电脑端配的是服务本身，手机端配的是「连哪台电脑」。做成一个组件而不是两个，是因为两副面孔共享同一块设置区与同一个「上次结果」版式，拆开的结果是两边各写一份渲染然后慢慢分叉。
 
 ## Android
 

@@ -1,6 +1,6 @@
 {
   "name": "novel-studio",
-  "version": "1.0.0",
+  "version": "2.1.0",
   "description": "自动写小说软件：连接大模型 API 自动续写/生成小说，支持保存、编辑、导出",
   "author": "Novel Studio",
   "license": "MIT",

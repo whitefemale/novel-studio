@@ -2,10 +2,12 @@
 import { ref, computed } from 'vue'
 import { useBooks, BOOK_COLORS } from '../store/books'
 import { toast } from '../store/toast'
+import BackupModal from './BackupModal.vue'
 
 const emit = defineEmits(['open'])
 const { store, createBook, removeBook, updateBookById } = useBooks()
 
+const showBackup = ref(false)
 const showCreate = ref(false)
 const newTitle = ref('')
 const newIntro = ref('')
@@ -122,6 +124,7 @@ async function saveEdit() {
           <option value="created">创建时间</option>
           <option value="title">书名</option>
         </select>
+        <button class="btn" @click="showBackup = true">备份</button>
         <button class="btn primary" @click="openCreate">＋ 新建小说</button>
       </div>
     </div>
@@ -177,6 +180,9 @@ async function saveEdit() {
       <p>点击「新建小说」，然后让 AI 帮你生成大纲、续写章节，开始创作之旅。</p>
       <button class="btn primary" @click="openCreate">＋ 新建第一本小说</button>
     </div>
+
+    <!-- 全量备份 / 恢复 -->
+    <BackupModal v-if="showBackup" @close="showBackup = false" />
 
     <!-- 新建弹窗 -->
     <div v-if="showCreate" class="modal-mask" @click.self="showCreate = false">

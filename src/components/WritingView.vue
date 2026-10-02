@@ -40,10 +40,14 @@ function handleReplace(text) {
  * 若上一章的最后一笔还只在内存里，写回的数组会把它漏掉。
  * 正文并进建章动作一次完成，而不是「先建空章、再插入正文」——后者在
  * 插入落到旧章节上时会串写。
+ *
+ * `meta` 是编排器提取出的梗概与故事内时间。必须在这里随建章一起写入：
+ * 提取发生在正文还只存在于 AI 面板里的时候，那时新章节根本还不存在，
+ * 只有这条路径知道它最终落在哪个 id 上。
  */
-async function handleSaveAsNew(text) {
+async function handleSaveAsNew(text, meta) {
   await editorRef.value?.flush()
-  await addChapterWithContent(text)
+  await addChapterWithContent(text, '', meta || {})
   showEditor()
 }
 
@@ -74,7 +78,18 @@ function flush() {
   return editorRef.value?.flush()
 }
 
-defineExpose({ flush, handleBack })
+/**
+ * 让编辑器重读 store 里的正文。
+ *
+ * 局域网同步合并完之后必须走一次：合并改的是库，编辑器屏幕上那份是它自己
+ * 持有的副本，不重读就会「同步完成了但正文没变」。回滚场景已经用过同一个
+ * 入口（见 Editor.vue 的 reloadFromStore）。
+ */
+function reloadEditor() {
+  editorRef.value?.reloadFromStore()
+}
+
+defineExpose({ flush, handleBack, reloadEditor })
 </script>
 
 <template>

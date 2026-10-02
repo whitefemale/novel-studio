@@ -90,8 +90,8 @@ export function buildBackupName(book, date = new Date()) {
 }
 
 /** 浏览器兜底：Blob + 合成 <a download> 点击 */
-function downloadInBrowser(fileName, content) {
-  const blob = new Blob([content], { type: 'text/plain;charset=utf-8' })
+function downloadInBrowser(fileName, content, mime = 'text/plain') {
+  const blob = new Blob([content], { type: `${mime};charset=utf-8` })
   const url = URL.createObjectURL(blob)
   const a = document.createElement('a')
   a.href = url
@@ -112,6 +112,7 @@ function downloadInBrowser(fileName, content) {
  * @param {string} [o.ext]              扩展名，用于桌面保存框的过滤器排序
  * @param {object} [o.target]           桌面端直写目标 `{ dir, subDir }`；缺省则弹保存框
  * @param {boolean}[o.reveal]           写入后在资源管理器中定位文件
+ * @param {string} [o.mime]             浏览器下载时的 MIME，缺省 text/plain
  * @returns {Promise<object>}
  *   桌面直写   → `{ ok, filePath, bytes }` 或 `{ ok:false, code, message }`
  *   桌面保存框 → `{ canceled }` 或 `{ canceled:false, filePath }`
@@ -123,7 +124,8 @@ export async function saveToDisk({
   content,
   ext = 'txt',
   target = null,
-  reveal = false
+  reveal = false,
+  mime = 'text/plain'
 } = {}) {
   const name = sanitizeFileName(fileName)
 
@@ -155,7 +157,7 @@ export async function saveToDisk({
     return await shareTextFile(name, content)
   }
 
-  return downloadInBrowser(name, content)
+  return downloadInBrowser(name, content, mime)
 }
 
 /**
