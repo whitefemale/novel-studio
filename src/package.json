@@ -1,0 +1,5 @@
+{
+  "private": true,
+  "type": "module",
+  "description": "渲染层源码全部是 ESM。Node 内置测试（npm test）靠这一行把 src/ 下的 .js 按 ESM 加载；根目录不能加 type: module，因为 electron/main.js 是 CommonJS。打包只含 dist/，本文件不进安装包。"
+}

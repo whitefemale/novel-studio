@@ -1,9 +1,10 @@
 <script setup>
-import { computed } from 'vue'
+import { ref, computed, onMounted, watch } from 'vue'
 import { useCollections } from '../store/novel'
 import { useBooks } from '../store/books'
 import { ENTITY_SCHEMAS, extractionFields } from '../services/novel/schemas'
-import { applyChange } from '../services/ai/orchestrator'
+import { applyChange, undoMemoryChange } from '../services/ai/orchestrator'
+import { coll } from '../services/storage'
 import { toast } from '../store/toast'
 
 /**
@@ -53,24 +54,45 @@ function describe(item) {
 
 const chapterTitle = (id) => store.chapters.find((c) => c.id === id)?.title || ''
 
-async function approve(item) {
+async function approve(item, { silent = false } = {}) {
   const bookId = store.bookId
   if (!bookId) return
   // 应用时重新读一遍当前记录再合并（applyChange 里做的），而不是把入库时那份
   // 快照整体覆盖 —— 从提取到用户点「通过」之间可能隔了很久，用户也许已经改过。
-  const applied = await applyChange(bookId, {
-    entity: item.entity,
-    id: item.entityId,
-    op: item.op,
-    title: item.title,
-    data: item.data
-  })
+  const applied = await applyChange(
+    bookId,
+    {
+      entity: item.entity,
+      id: item.entityId,
+      op: item.op,
+      title: item.title,
+      field: item.field,
+      from: item.from,
+      to: item.to,
+      data: item.data,
+      risk: item.risk,
+      chapterId: item.chapterId,
+      evidence: item.evidence
+    },
+    { source: 'review' }
+  )
   if (!applied) {
     toast('原记录已不存在，请改为手动新增', 'error')
-    return
+    return false
   }
   await cols.remove('reviewQueue', item.id)
-  toast('已采纳', 'success')
+  await loadLogs()
+  if (!silent) toast('已采纳', 'success')
+  return true
+}
+
+/** 批量采纳：autoApplyLowRisk 关闭时，低风险项可能一次积很多条。 */
+async function approveAll() {
+  let n = 0
+  for (const item of [...pending.value]) {
+    if (await approve(item, { silent: true })) n++
+  }
+  if (n) toast(`已采纳 ${n} 条变更`, 'success')
 }
 
 async function reject(item) {
@@ -81,6 +103,47 @@ async function reject(item) {
 async function clearAll() {
   for (const item of pending.value) await cols.remove('reviewQueue', item.id)
   toast('已清空待确认项', 'success')
+}
+
+// ---------------- 最近变更与撤销 ----------------
+
+const logs = ref([])
+const undoing = ref('')
+
+async function loadLogs() {
+  if (!store.bookId) {
+    logs.value = []
+    return
+  }
+  const all = await coll.memoryChangeLog.getAll(store.bookId)
+  logs.value = [...all].sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)).slice(0, 20)
+}
+
+onMounted(loadLogs)
+watch(() => store.bookId, loadLogs)
+// 审阅队列变化（例如 AI 刚跑完一章自动入库了几条）也刷新日志，
+// 否则用户会以为「刚才自动改的那条没有记录」。
+watch(() => cols.list('reviewQueue').length, loadLogs)
+
+function logText(log) {
+  if (log.op === 'create') return `新增${entityLabel(log.entity)}：${log.title}`
+  if (log.op === 'delete') return `删除${entityLabel(log.entity)}：${log.title}`
+  if (log.op === 'undo') return `撤销：${log.title}`
+  const before = log.before?.[log.field]
+  const after = log.after?.[log.field]
+  return `${log.title} · ${labelOf(log.entity, log.field)}：${labelValue(log.entity, log.field, before)} → ${labelValue(log.entity, log.field, after)}`
+}
+
+async function undo(log) {
+  if (!store.bookId || undoing.value) return
+  undoing.value = log.id
+  try {
+    const res = await undoMemoryChange(store.bookId, log.id)
+    toast(res.message, res.ok ? 'success' : 'error')
+    await loadLogs()
+  } finally {
+    undoing.value = ''
+  }
 }
 
 function entityLabel(entity) {
@@ -98,12 +161,15 @@ function itemName(item) {
   <div class="review">
     <div class="rv-head">
       <h4>记忆审阅<span class="rv-count">{{ pending.length }} 条待确认</span></h4>
-      <button v-if="pending.length" class="btn ghost sm" @click="clearAll">全部忽略</button>
+      <div class="rv-head-ops">
+        <button v-if="pending.length" class="btn ghost sm" @click="approveAll">全部采纳</button>
+        <button v-if="pending.length" class="btn ghost sm" @click="clearAll">全部忽略</button>
+      </div>
     </div>
 
     <p class="rv-hint">
-      AI 写完一章后会提取设定变化。低风险项已自动入库；下面这些会改变后续每一章的生成前提，
-      改动很小但影响很大，所以请你过一眼。
+      AI 写完一章后会提取设定变化。低风险项通常会直接入库；下面这些会改变后续每一章的生成前提，
+      改动很小但影响很大，所以请你过一眼。关掉「低风险自动入库」后，低风险项也会排到这里。
     </p>
 
     <div v-if="!pending.length" class="rv-empty">没有待确认的变更。</div>
@@ -116,13 +182,52 @@ function itemName(item) {
           <span v-if="item.chapterId" class="rv-src">来自「{{ chapterTitle(item.chapterId) }}」</span>
         </div>
         <div class="rv-diff">{{ describe(item) }}</div>
-        <div v-if="item.reason" class="rv-reason">{{ item.reason }}</div>
+        <div v-if="item.evidence" class="rv-evidence">原文依据：{{ item.evidence }}</div>
+        <div v-if="item.reason" class="rv-reason">
+          <span v-if="item.coreImmutable" class="rv-lock">核心不可变</span>
+          {{ item.reason }}
+        </div>
         <div class="rv-ops">
           <button class="btn sm primary" @click="approve(item)">采纳</button>
           <button class="btn ghost sm" @click="reject(item)">忽略</button>
         </div>
       </li>
     </ul>
+
+    <div class="rv-log">
+      <div class="rv-log-head">
+        <h4>最近变更</h4>
+        <span class="rv-count">可撤销最近 20 条</span>
+      </div>
+      <p class="rv-hint">
+        自动入库的变更也在这里。撤销只会在「当前值仍是那次写入的值」时生效——
+        之后你又改过的话，撤销会拒绝执行，以免覆盖你的后续编辑。
+      </p>
+      <div v-if="!logs.length" class="rv-empty">还没有变更记录。</div>
+      <ul v-else class="rv-list">
+        <li v-for="log in logs" :key="log.id" class="rv-item">
+          <div class="rv-top">
+            <span class="rv-tag">{{ entityLabel(log.entity) }}</span>
+            <span class="rv-title">{{ logText(log) }}</span>
+            <span v-if="log.undone" class="rv-undone">已撤销</span>
+            <span v-else-if="log.source === 'undo'" class="rv-undone">撤销记录</span>
+          </div>
+          <div v-if="log.evidence" class="rv-evidence">原文依据：{{ log.evidence }}</div>
+          <div
+            v-if="!log.undone && log.source !== 'undo'"
+            class="rv-ops"
+          >
+            <button
+              class="btn ghost sm"
+              :disabled="undoing === log.id"
+              @click="undo(log)"
+            >
+              {{ undoing === log.id ? '撤销中…' : '撤销' }}
+            </button>
+          </div>
+        </li>
+      </ul>
+    </div>
   </div>
 </template>
 
@@ -204,6 +309,48 @@ function itemName(item) {
 .rv-reason {
   font-size: 12px;
   color: var(--danger);
+}
+.rv-evidence {
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--text-2);
+  background: var(--bg);
+  border-left: 2px solid var(--border);
+  padding: 4px 8px;
+  word-break: break-word;
+}
+.rv-lock {
+  display: inline-block;
+  font-size: 10px;
+  padding: 1px 5px;
+  border-radius: 999px;
+  background: var(--danger-soft);
+  color: var(--danger);
+  margin-right: 4px;
+}
+.rv-head-ops {
+  display: flex;
+  gap: 6px;
+}
+.rv-log {
+  margin-top: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.rv-log-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+.rv-log-head h4 {
+  margin: 0;
+  font-size: 14px;
+}
+.rv-undone {
+  font-size: 11px;
+  color: var(--text-3);
+  text-decoration: line-through;
 }
 .rv-ops {
   display: flex;

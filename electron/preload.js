@@ -34,5 +34,14 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // 合并结果回传给主进程，唤醒那个挂起的 HTTP 请求
   syncRespond: (payload) => ipcRenderer.invoke('sync:respond', payload),
   // 主→渲染：有设备来同步了，把远端快照交下来处理
-  onSyncIncoming: (cb) => ipcRenderer.on('sync:incoming', (_e, payload) => cb(payload))
+  onSyncIncoming: (cb) => ipcRenderer.on('sync:incoming', (_e, payload) => cb(payload)),
+  // ---- API Key 安全存储（safeStorage；密钥只在主进程加解密） ----
+  // 返回 { ok, value?, code?, message? }。code==='unsupported' 时渲染层回退明文。
+  secretGet: () => ipcRenderer.invoke('secret:get'),
+  secretSet: (value) => ipcRenderer.invoke('secret:set', { value }),
+  secretDelete: () => ipcRenderer.invoke('secret:delete'),
+  // ---- 关窗前的保存握手 ----
+  // 主进程拦下第一个 close 事件，等渲染层把防抖窗口里的正文落库后再放行
+  onBeforeClose: (cb) => ipcRenderer.on('app:before-close', () => cb()),
+  closeReady: () => ipcRenderer.invoke('app:close-ready')
 })

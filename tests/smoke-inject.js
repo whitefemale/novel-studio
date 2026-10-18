@@ -28,6 +28,13 @@
       defaultSettings,
       db,
       chatStream,
+      chatStreamReliable,
+      classifyError,
+      redactSecrets,
+      describeError,
+      computeBackoff,
+      shouldRetry,
+      parseSseChunk,
       createAutosaver,
       sanitizeFileName,
       buildChapterMarkdown,
@@ -64,7 +71,12 @@
       extractJson,
       classifyRisk,
       diffMemoryCandidates,
+      undoMemoryChange,
+      PROMPT_VERSION,
       STAGE_LABELS,
+      // V3 阶段 3：同步冲突副本与数据版本拒绝
+      CONFLICT_TITLE_PREFIX,
+      handleIncomingSnapshot,
       mergeSnapshot,
       snapshotStats,
       diffSnapshots,
@@ -73,6 +85,12 @@
       collectSnapshot,
       applySnapshot,
       emptySnapshot,
+      snapshotChecksum,
+      cloneSnapshotAsNewBooks,
+      createTaskRecord,
+      appendDraft,
+      markRunningInterrupted,
+      pickRecoverable,
       buildVersion,
       pruneVersions,
       captureVersion,
@@ -85,6 +103,19 @@
       runRuleChecks,
       CONSISTENCY_RULES,
       timeKey,
+      // V3 阶段 4：版本差异、施工卡、审校问题生命周期
+      diffText,
+      collapsedDiff,
+      splitSentences,
+      checkChapterPlan,
+      planCompleteness,
+      buildPlanProposal,
+      missingLockedBeats,
+      flattenReviewReport,
+      isIssueStale,
+      contentHashOf,
+      saveIssueStates,
+      setIssueStatus,
       DEFAULT_STAGES,
       SNAPSHOT_VERSION,
       buildSnapshot,
@@ -116,14 +147,22 @@
       'contextBudget',
       'autoExtractMemory',
       'reviewHighRisk',
+      'autoApplyLowRisk',
       'versionKeep',
       // V2 第二阶段：局域网同步
       'syncPort',
       'syncAutoStart',
       'syncUrl',
-      'syncCode'
+      'syncCode',
+      'syncConflictCopies',
+      // V3 阶段 2：请求稳定性
+      'requestIdleTimeoutSec',
+      'maxRetries'
     ]
     const resetSettings = async () => {
+      // API Key 也复位：冒烟测试会写入假 Key，而且（桌面端）会走 safeStorage。
+      // 主进程在 SMOKE_TEST 下把安全存储指向临时目录，所以这里删的是测试自己的码。
+      await s.clearApiKey()
       for (const k of NEW_KEYS) s.settings[k] = defaultSettings[k]
       await s.persist()
     }
@@ -182,15 +221,27 @@
       s.settings.apiKey === 'legacy-key' &&
       s.settings.baseUrl === 'https://legacy.example'
 
+    // 桌面端：load() 必须把旧明文 Key 迁进 safeStorage，并把 IndexedDB 里那份清掉。
+    // 顺序是「先加密写成功、再清明文」—— 失败时旧明文仍在，不丢 Key。
+    const recAfterBackfill = await db.getSettings()
+    out.secureKeyMigrationOk =
+      !s.settings.secureKeyAvailable || !recAfterBackfill || !recAfterBackfill.apiKey
+    if (s.settings.secureKeyAvailable) {
+      const sec = await window.electronAPI.secretGet()
+      out.secureKeyReadOk = !!sec && sec.ok === true && sec.value === 'legacy-key'
+    } else {
+      // 系统安全存储不可用（如无 keyring 的 Linux）：跳过而不是假装通过
+      out.secureKeyReadOk = true
+    }
+
     s.settings.saveDir = 'D:/ns-smoke-persist'
     await s.persist()
     const recAfter = await db.getSettings()
     out.saveDirPersisted = !!recAfter && recAfter.saveDir === 'D:/ns-smoke-persist'
     s.settings.saveDir = ''
     s.settings.baseUrl = defaultSettings.baseUrl
-    s.settings.apiKey = ''
     s.settings.model = defaultSettings.model
-    await s.persist()
+    await s.clearApiKey()
 
     // ------------------------------------------------------------------
     // B) 纯函数：文件名净化 / 单章 Markdown / 备份命名 / 淘汰挑选
@@ -364,11 +415,25 @@
     const outlines = await db.getOutlines(book.id)
     out.persisted = `${books.filter((x) => x.id === book.id).length}/${chapters.length}/${outlines.length}`
 
-    // 设置持久化
+    // 设置持久化。API Key 的落点随平台不同：
+    //  - 桌面端（safeStorage 可用）：密文进主进程，IndexedDB 里**不能**有明文；
+    //  - 否则：维持旧行为，明文进 IndexedDB。
     s.settings.apiKey = 'sk-test-123'
-    await s.persist()
+    await s.persistApiKey()
     const loadedSettings = await db.getSettings()
-    out.settingsSaved = loadedSettings && loadedSettings.apiKey === 'sk-test-123'
+    if (s.settings.secureKeyAvailable) {
+      const sec = await window.electronAPI.secretGet()
+      out.settingsSaved =
+        !!loadedSettings &&
+        loadedSettings.apiKey === undefined &&
+        !!sec &&
+        sec.ok === true &&
+        sec.value === 'sk-test-123'
+    } else {
+      out.settingsSaved = loadedSettings && loadedSettings.apiKey === 'sk-test-123'
+    }
+    out.settingsNoPlaintextKey =
+      !s.settings.secureKeyAvailable || !loadedSettings || loadedSettings.apiKey === undefined
 
     // ------------------------------------------------------------------
     // E) 落盘通道：保存地址的核心写入路径走 export:writeToDir，可无头驱动
@@ -689,6 +754,7 @@
     const legacyAfter = await db.getOutlines(migId)
     out.migrationAppliedOk =
       applied.migrated === 3 &&
+      applied.failed.length === 0 &&
       (await db.coll.characters.getAll(migId)).length === 2 &&
       (await db.coll.worldRules.getAll(migId)).length === 1
 
@@ -725,7 +791,10 @@
     const metaBefore = await ensureSchemaVersion()
     const metaAfter = await ensureSchemaVersion()
     out.schemaVersionOk =
-      metaBefore.schemaVersion === SCHEMA_VERSION && metaAfter.updatedAt === metaBefore.updatedAt
+      metaBefore.schemaVersion === SCHEMA_VERSION &&
+      metaAfter.updatedAt === metaBefore.updatedAt &&
+      Array.isArray(metaBefore.migrations) &&
+      metaBefore.migrations.some((m) => m.to === SCHEMA_VERSION && m.automatic === true)
 
     // ------------------------------------------------------------------
     // K) V2 Context Builder：分层 / 预算分配 / 与旧设定去重
@@ -943,6 +1012,45 @@
       badFile('第一章 正文…').includes('JSON') &&
       badFile('{"format":"other"}').includes('不是 Novel Studio') &&
       badFile(toSnapshotJson({ ...exported, version: 99 })).includes('高于当前软件')
+
+    // 校验和：内容被改过必须拒绝（截断/手改/网盘冲突都长得像合法 JSON），
+    // 而**没有** checksum 的旧备份必须照常接受 —— 否则老用户的备份一夜之间失效。
+    const tampered = JSON.parse(toSnapshotJson(exported))
+    tampered.data[snapBook.id].chapters[0].content = '被人改过的正文'
+    const legacy = JSON.parse(toSnapshotJson(exported))
+    delete legacy.checksum
+    out.snapshotChecksumOk =
+      badFile(JSON.stringify(tampered)).includes('校验失败') &&
+      parseSnapshotJson(JSON.stringify(legacy)).books.length === exported.books.length
+
+    // 作为副本导入：书 id 全换、标题加后缀，不覆盖任何现有记录。
+    let cloneSeq = 0
+    const clone = cloneSnapshotAsNewBooks(exported, {
+      newId: () => `smoke_clone_${++cloneSeq}`,
+      now: Date.now()
+    })
+    out.snapshotCloneOk =
+      clone.books.length === exported.books.length &&
+      clone.books.every((c) => c.title.endsWith('（导入副本）')) &&
+      clone.books.every((c) => !exported.books.some((o) => o.id === c.id)) &&
+      clone.counts.chapters === exported.counts.chapters
+
+    // 生成任务/流式草稿是**设备本地**的易失状态，绝不进全量备份与同步。
+    const taskSnap = buildSnapshot({
+      books: [{ id: 'taskbook', title: 'x' }],
+      data: { taskbook: { chapters: [], generationTasks: [{ id: 'draft-secret', outputText: '草稿' }] } }
+    })
+    out.snapshotExcludesTasksOk = !JSON.stringify(taskSnap).includes('draft-secret')
+
+    // 恢复前留底：全局键，且**不进快照**（否则每恢复一次就套一层，越滚越大）。
+    // 这是开发者的真实库，先保存原值再恢复，不覆盖已有的留底。
+    const priorPreRestore = await db.rawGet('preRestoreSnapshot')
+    await db.savePreRestoreSnapshot({ format: 'smoke-pre-restore', exportedAt: 1 })
+    out.preRestoreKeyOk =
+      (await db.getPreRestoreSnapshot())?.format === 'smoke-pre-restore' &&
+      !toSnapshotJson(await collectSnapshot()).includes('preRestoreSnapshot')
+    if (priorPreRestore === undefined) await db.rawDelete('preRestoreSnapshot')
+    else await db.savePreRestoreSnapshot(priorPreRestore)
 
     await b.removeBook(snapBook.id)
 
@@ -1237,32 +1345,52 @@
     out.timelineOverdueClearsOk = tlDone.counts.overdue === 0
 
     // ------------------------------------------------------------------
-    // N4) 一致性：七条规则各造一个反例 + 干净数据必须 0 条
+    // N4) 一致性：十二条规则各造一个反例 + 干净数据必须 0 条
     //
     // 两个方向都要钉。只测「能报出来」的实现，可以在任何数据上都报警 ——
     // 那种报告用户看两次就再也不看了。consistencyCleanOk 才是这条功能的底线。
     // ------------------------------------------------------------------
+    const dirtyChapters = [
+      // 规则 8：主线标记停在 k2，后面又写了 30 章
+      { id: 'k1', order: 1, title: '一', timelineStart: '5月', summary: '有', content: '正文', threads: '主线', arcId: 'arc1', purpose: '调查药庐的秘密' },
+      { id: 'k2', order: 2, title: '二', timelineStart: '2月', summary: '有', content: '正文', threads: '主线', purpose: '调查药庐的秘密。' },
+      { id: 'k3', order: 3, title: '三', summary: '有', content: '正文', status: 'done' },
+      // 规则 12：连续两章已确认施工卡、且没有任何有效变化
+      { id: 'k4', order: 4, title: '四', summary: '有', content: '正文', planStatus: 'confirmed', coreConflict: '等待' },
+      { id: 'k5', order: 5, title: '五', summary: '有', content: '正文', planStatus: 'confirmed', coreConflict: '继续等待' },
+      // 补满最近 10 章的窗口，供规则 9 使用
+      ...[6, 7, 8, 9].map((n) => ({
+        id: 'k' + n,
+        order: n,
+        title: String(n),
+        summary: '有',
+        content: '正文'
+      })),
+      { id: 'k32', order: 32, title: '三十二', summary: '', content: '正文' }
+    ]
     const dirty = {
-      chapters: [
-        { id: 'k1', order: 1, title: '一', timelineStart: '5月', summary: '有', content: '正文' },
-        { id: 'k2', order: 2, title: '二', timelineStart: '2月', summary: '有', content: '正文' },
-        { id: 'k3', order: 3, title: '三', summary: '有', content: '正文', status: 'done' },
-        { id: 'k9', order: 32, title: '三十二', summary: '', content: '正文' }
-      ],
+      chapters: dirtyChapters,
       memory: {
         characters: [
           // 规则 2：已死亡，却在更靠后的章节里还有戏
           { id: 'z1', name: '已死者', status: 'dead', lastUpdatedChapterId: 'k1' },
           // 规则 7：活着，但 31 章没更新过
           { id: 'z2', name: '久未出场', status: 'alive', lastUpdatedChapterId: 'k1' },
-          // 规则 1：指向一个已被删掉的地点
+          // 规则 1：指向一个已被删掉的地点；规则 9：窗口内出场 8 章
           { id: 'z3', name: '断链人物', status: 'alive', currentLocationId: 'gone' }
         ],
         events: [
           { id: 'q1', title: '唯一事件', chapterId: 'k3', characterIds: ['z1'] },
           // 规则 5：同一章里两条同名
           { id: 'q2', title: '重复事件', chapterId: 'k2' },
-          { id: 'q3', title: '重复事件', chapterId: 'k2' }
+          { id: 'q3', title: '重复事件', chapterId: 'k2' },
+          // 规则 9 的 8 个不同章节（避开 k4/k5，否则规则 12 会被事件化解）
+          ...[1, 2, 3, 6, 7, 8, 9, 32].map((n, i) => ({
+            id: 'dense' + i,
+            title: '密集事件' + i,
+            chapterId: n === 32 ? 'k32' : 'k' + n,
+            characterIds: ['z3']
+          }))
         ],
         foreshadowing: [
           // 规则 4：说好回收的那一章已经写完，状态还停在已埋下
@@ -1272,21 +1400,22 @@
         factions: [],
         worldRules: []
       },
-      structure: { volumes: [], arcs: [] },
+      // 规则 10：进行中的篇停在 k1
+      structure: { volumes: [], arcs: [{ id: 'arc1', title: '药庐疑云', status: 'active' }] },
       tombstones: [{ id: 'gone', type: 'locations', deletedAt: 1700000000000 }]
     }
     const dirtyRes = runRuleChecks(dirty)
     const per = dirtyRes.stats.byRule
     out.consistencyRuleOk =
-      // 七条各命中**恰好一次**：多一次就说明这条规则在自己的反例之外还会误伤，
+      // 十二条各命中**恰好一次**：多一次就说明这条规则在自己的反例之外还会误伤，
       // 那正是「报告变得没人看」的起点
-      CONSISTENCY_RULES.length === 7 &&
+      CONSISTENCY_RULES.length === 12 &&
       CONSISTENCY_RULES.every((r) => per[r.id] === 1) &&
-      dirtyRes.stats.total === 7 &&
+      dirtyRes.stats.total === 12 &&
       // 严重度不能全一个样，否则报告就没法用来排优先级
       dirtyRes.stats.bySeverity.high === 2 &&
-      dirtyRes.stats.bySeverity.medium === 2 &&
-      dirtyRes.stats.bySeverity.low === 3 &&
+      dirtyRes.stats.bySeverity.medium === 3 &&
+      dirtyRes.stats.bySeverity.low === 7 &&
       // 高的排前面
       dirtyRes.issues[0].severity === 'high' &&
       // 每条都带得动跳转所需的定位信息
@@ -1344,10 +1473,32 @@
     const rBook = await b.createBook({ title: '测试小说', intro: '一致性审校' })
     const rChapter = await b.addChapterWithContent('林昭推开门，苏九正在碾药。', '第一章')
     const genS = useGeneration()
+    // 新契约（规范 §9.2）：单一 issues 数组，每条自带 category 与证据字段。
+    // 旧的三个数组仍由 flattenReviewReport 兼容，但提示词已经只要求这一种。
     const reviewPayload = JSON.stringify({
-      issues: [{ title: '苏九已死却出场', detail: '第 1 章之后她仍出现', severity: 'high' }],
-      styleIssues: [],
-      continuityIssues: [{ title: '时间跳跃无过渡', detail: '从夜里直接到清晨', severity: 'medium' }],
+      issues: [
+        {
+          category: 'setting',
+          severity: 'high',
+          title: '苏九已死却出场',
+          quote: '苏九正在碾药',
+          location: '第 1 段',
+          explanation: '第 1 章之后她仍出现',
+          evidence: '第 1 章人物状态：死亡',
+          falsePositiveHint: '若是回忆或幻觉则不算问题',
+          suggestion: '删掉这一句'
+        },
+        {
+          category: 'continuity',
+          severity: 'medium',
+          title: '时间跳跃无过渡',
+          quote: '推开门',
+          explanation: '从夜里直接到清晨',
+          evidence: '',
+          falsePositiveHint: '',
+          suggestion: '补一句天色转亮'
+        }
+      ],
       severity: 'high'
     })
     const rwf = await runChapterWorkflow({
@@ -1375,11 +1526,24 @@
       // 审校**不在**默认档里：它不是每章都要跑的东西，塞进去等于替用户决定
       // 「每写一章都多付一次钱」
       !DEFAULT_STAGES.includes('review') &&
-      // 输出契约逐字采用规格书 04
+      // 输出契约逐字采用规格书 04 / §9.2
       !!rwf.reviewReport &&
       rwf.reviewReport.severity === 'high' &&
-      rwf.reviewReport.issues.length === 1 &&
-      rwf.reviewReport.continuityIssues.length === 1 &&
+      rwf.reviewReport.issues.length === 2 &&
+      rwf.reviewReport.issues[0].category === 'setting' &&
+      rwf.reviewReport.issues[0].falsePositiveHint.includes('回忆') &&
+      // 压平后的问题带确定性 id、类别与正文指纹（状态落库靠这三样对齐）
+      (() => {
+        const flat = flattenReviewReport(rwf.reviewReport, {
+          chapterId: rChapter.id,
+          content: rChapter.content
+        })
+        return (
+          flat.length === 2 &&
+          flat.every((i) => i.id.startsWith('ri_') && i.contentHash === contentHashOf(rChapter.content)) &&
+          flat.map((i) => i.category).sort().join(',') === 'continuity,setting'
+        )
+      })() &&
       rwf.run.stages.length === 1 &&
       rwf.run.stages[0].id === 'review' &&
       rwf.run.stages[0].status === 'done' &&
@@ -1396,12 +1560,228 @@
       // 拿它审校等于只审了后半章
       reviewSent.includes('【待审校正文】') &&
       reviewSent.includes('苏九正在碾药') &&
-      reviewSent.includes('styleIssues')
-    // 报告**不落库**：它是针对这一版正文的意见，正文一改就过期
+      // 提示词要求的是新契约字段，不是旧的三个数组
+      reviewSent.includes('"falsePositiveHint"') &&
+      reviewSent.includes('category：setting')
+
+    // 报告**不落库**；落库的只有「用户对这些问题的决定」。
+    // 这一组直接走渲染进程的真实 IndexedDB，覆盖 reviewIssueStates 的读写。
+    const flatIssues = flattenReviewReport(rwf.reviewReport, {
+      chapterId: rChapter.id,
+      content: rChapter.content
+    })
+    const saved = await saveIssueStates(rBook.id, flatIssues, { reportRunId: reviewRec.id })
+    const ignored = await setIssueStatus(rBook.id, flatIssues[0], 'ignored')
+    // 同一批问题再登记一次，不能把「已忽略」重置回「待处理」——
+    // 否则忽略按钮每深检一次就白点一次。
+    await saveIssueStates(rBook.id, flatIssues, { reportRunId: reviewRec.id })
+    const afterResave = await db.coll.reviewIssueStates.getAll(rBook.id)
+    const savedFirst = afterResave.find((x) => x.id === flatIssues[0].id)
     out.consistencyReviewNoPersistOk =
       // 这次审校只写了**一条**记录（计费那条），报告本身没有变成任何持久对象
       (await db.coll.generationRuns.getAll(rBook.id)).length === 1 &&
-      (await db.rawGet('consistencyReports:' + rBook.id)) === undefined
+      (await db.rawGet('consistencyReports:' + rBook.id)) === undefined &&
+      saved.length === 2 &&
+      afterResave.length === 2 &&
+      ignored?.status === 'ignored' &&
+      savedFirst?.status === 'ignored' &&
+      // 状态绑的是审校时那一版正文；正文一改就该显示为「报告已过期」
+      isIssueStale(savedFirst, rChapter.content) === false &&
+      isIssueStale(savedFirst, rChapter.content + '（改过）') === true
+
+    // ------------------------------------------------------------------
+    // N5) 阶段 4：施工卡、计划提案、上下文注入、版本差异、修复草案
+    //
+    // 这一节的重点是两条「不许自动写」：AI 计划与 AI 修复都只能产出草案，
+    // 章节数据在用户点「接受」之前一个字都不能变。
+    // ------------------------------------------------------------------
+    const draftCard = await b.saveChapterPlan(rChapter.id, {
+      arcId: 'a1',
+      coreConflict: '夺回灵石',
+      mustEvents: '林昭必须活下来',
+      forbidden: '苏九正在碾药',
+      lockedBeats: '林昭必须活下来',
+      targetWords: 100
+    })
+    // updateChapter 返回的是 store 里的**同一对象**，第二次保存会就地改写它。
+    // 所以草稿态的值必须在确认之前取下来，否则断言看到的是最终状态。
+    const draftStatus = draftCard?.planStatus
+    const draftVersion = draftCard?.planVersion
+    const confirmedCard = await b.saveChapterPlan(
+      rChapter.id,
+      { arcId: 'a1', coreConflict: '夺回灵石', mustEvents: '林昭必须活下来', forbidden: '苏九正在碾药', lockedBeats: '林昭必须活下来', targetWords: 100 },
+      { confirm: true }
+    )
+    const cardCheck = checkChapterPlan(confirmedCard, confirmedCard.content)
+    const cardCtx = buildContext(
+      {
+        book: rBook,
+        chapter: confirmedCard,
+        chapters: [confirmedCard],
+        outlines: [],
+        memory: { characters: [] },
+        structure: {
+          volumes: [{ id: 'v1', title: '第一卷' }],
+          arcs: [{ id: 'a1', title: '药庐篇', volumeId: 'v1' }],
+          scenes: [{ id: 'sc1', chapterId: rChapter.id, title: '入屋', order: 1, purpose: '试探' }]
+        },
+        settings: s.settings,
+        action: 'chapter'
+      },
+      6000
+    )
+    const layerIds = cardCtx.metadata.layers.map((l) => l.id)
+    out.planCardOk =
+      draftStatus === 'draft' &&
+      (draftVersion ?? 0) === 0 &&
+      confirmedCard.planStatus === 'confirmed' &&
+      confirmedCard.planVersion === 1 &&
+      // 施工卡 13 项里填了 4 项（锁定节点不算进 13 项里的完成度）
+      planCompleteness(confirmedCard).filled === 4 &&
+      // 禁发内容命中必须是 high；必发事件没写是 low
+      cardCheck.issues.some((i) => i.field === 'forbidden' && i.severity === 'high') &&
+      cardCheck.issues.some((i) => i.field === 'mustEvents' && i.severity === 'low') &&
+      // 卷 / 篇 / 施工卡 / 场景四层都进了提示词
+      layerIds.includes('volume') &&
+      layerIds.includes('arc') &&
+      layerIds.includes('chapterCard') &&
+      layerIds.includes('scenes') &&
+      cardCtx.context.includes('第一卷') &&
+      cardCtx.context.includes('药庐篇') &&
+      cardCtx.context.includes('施工卡（已确认 v1）') &&
+      !cardCtx.context.includes('临时计划（尚未确认）') &&
+      cardCtx.context.includes('入屋')
+
+    // 锁定节点被 AI 草稿触碰时必须出提案，而不是直接改施工卡
+    const planProposal = buildPlanProposal({
+      bookId: rBook.id,
+      chapterId: rChapter.id,
+      current: confirmedCard,
+      proposed: { coreConflict: '苏九杀了林昭', mustEvents: '主角死亡' }
+    })
+    out.planProposalOk =
+      !!planProposal &&
+      planProposal.status === 'pending' &&
+      planProposal.missingBeats.includes('林昭必须活下来') &&
+      planProposal.previous.coreConflict === '夺回灵石' &&
+      missingLockedBeats(confirmedCard, '林昭必须活下来').length === 0 &&
+      // 提案只是数据，不会自己进章节
+      b.store.chapters.find((c) => c.id === rChapter.id).planStatus === 'confirmed'
+
+    // 版本差异：等 / 增 / 删、中文长行按句切、折叠后保留变化上下文
+    const diffRes = diffText('第一行\n第二行', '第一行\n改写')
+    const cjkLine = '甲'.repeat(60) + '。' + '乙'.repeat(60) + '！'
+    out.diffOk =
+      diffRes.stats.added === 1 &&
+      diffRes.stats.removed === 1 &&
+      diffRes.stats.unchanged === 1 &&
+      diffRes.lines.some((r) => r.type === 'del' && r.text === '第二行') &&
+      collapsedDiff(diffRes.lines, 0).some((r) => r.type === 'add') &&
+      splitSentences(cjkLine).length === 2
+
+    // AI 计划：只出草案，章节施工卡一个字段都不许变
+    const planMsgs = []
+    const planChat = (text) => (opts) => {
+      planMsgs.push(opts.messages)
+      setTimeout(() => {
+        opts.callbacks.onDelta?.(text)
+        opts.callbacks.onUsage?.({ inputTokens: 300, outputTokens: 80 })
+        opts.callbacks.onDone?.()
+      }, 0)
+      return { abort: () => {} }
+    }
+    const planWf = await runChapterWorkflow({
+      input: {
+        book: rBook,
+        bookId: rBook.id,
+        chapter: confirmedCard,
+        chapters: [confirmedCard],
+        outlines: [],
+        memory: { characters: [], locations: [], factions: [], worldRules: [], events: [], foreshadowing: [] },
+        structure: { volumes: [], arcs: [] },
+        settings: s.settings,
+        action: 'plan'
+      },
+      settings: s.settings,
+      stages: ['plan'],
+      chat: planChat(
+        JSON.stringify({ coreConflict: '闯进密道', mustEvents: '发现密道', targetWords: 1800 })
+      ),
+      recordRun: genS.recordRun
+    })
+    const planSent = (planMsgs[0] || []).map((m) => m.content).join('\n')
+    out.planAiDraftOk =
+      planWf.planDraft?.coreConflict === '闯进密道' &&
+      planWf.planDraft?.targetWords === 1800 &&
+      // 提示词把锁定节点原样交给模型，并要求「不得删改或绕开」
+      planSent.includes('林昭必须活下来') &&
+      planSent.includes('不得删改或绕开') &&
+      // 草案没有进章节：coreConflict 仍是作者确认过的那一份
+      b.store.chapters.find((c) => c.id === rChapter.id).coreConflict === '夺回灵石'
+
+    // AI 修复：返回修订稿与差异预览，正文保持原样
+    const fixMsgs = []
+    const fixChat = (text) => (opts) => {
+      fixMsgs.push(opts.messages)
+      setTimeout(() => {
+        opts.callbacks.onDelta?.(text)
+        opts.callbacks.onUsage?.({ inputTokens: 500, outputTokens: 100 })
+        opts.callbacks.onDone?.()
+      }, 0)
+      return { abort: () => {} }
+    }
+    const contentBeforeFix = b.store.chapters.find((c) => c.id === rChapter.id).content
+    const fixWf = await runChapterWorkflow({
+      input: {
+        book: rBook,
+        bookId: rBook.id,
+        chapter: confirmedCard,
+        chapters: [confirmedCard],
+        outlines: [],
+        memory: { characters: [], locations: [], factions: [], worldRules: [], events: [], foreshadowing: [] },
+        structure: { volumes: [], arcs: [] },
+        settings: s.settings,
+        action: 'fix',
+        text: contentBeforeFix,
+        issue: flatIssues[0]
+      },
+      settings: s.settings,
+      stages: ['fix'],
+      chat: fixChat(JSON.stringify({ revised: '修订后的完整正文', explanation: '改了死亡设定' })),
+      recordRun: genS.recordRun
+    })
+    const fixSent = (fixMsgs[0] || []).map((m) => m.content).join('\n')
+    const storedAfterFixDraft = (await db.getChapters(rBook.id)).find((c) => c.id === rChapter.id)
+    out.fixDraftOk =
+      fixWf.fixDraft?.revised === '修订后的完整正文' &&
+      fixWf.fixDraft?.explanation === '改了死亡设定' &&
+      // 提示词带上了问题原文、说明与建议，并要求整章修订稿
+      fixSent.includes('【审校问题】') &&
+      fixSent.includes('苏九已死却出场') &&
+      fixSent.includes('苏九正在碾药') &&
+      fixSent.includes('修订后的完整章节正文') &&
+      // 草案没有自动覆盖：内存与库里都还是原文
+      b.store.chapters.find((c) => c.id === rChapter.id).content === contentBeforeFix &&
+      storedAfterFixDraft.content === contentBeforeFix
+
+    // 用户接受：先存版本（source=review），再写回正文，最后把问题标成已修复
+    const versionsBefore = await b.loadVersions()
+    await b.captureChapterVersion(rChapter.id, { source: 'review' })
+    const versionsAfter = await b.loadVersions()
+    const reviewVersion = versionsAfter.find(
+      (v) => v.source === 'review' && v.content === contentBeforeFix
+    )
+    b.setChapterContent(rChapter.id, fixWf.fixDraft.revised)
+    await b.persistChapter(rChapter.id)
+    const fixedState = await setIssueStatus(rBook.id, flatIssues[0], 'fixed')
+    const storedAfterAccept = (await db.getChapters(rBook.id)).find((c) => c.id === rChapter.id)
+    out.fixAcceptOk =
+      versionsAfter.length === versionsBefore.length + 1 &&
+      !!reviewVersion &&
+      storedAfterAccept.content === '修订后的完整正文' &&
+      fixedState?.status === 'fixed' &&
+      (await db.coll.reviewIssueStates.getAll(rBook.id)).find((x) => x.id === flatIssues[0].id)
+        ?.status === 'fixed'
     await b.removeBook(rBook.id)
 
     // ------------------------------------------------------------------
@@ -1423,7 +1803,32 @@
     await b.captureChapterVersion(uiCh.id, { source: 'manual' })
     await b.setChapterContent(uiCh.id, '第二版。')
     await b.persistChapter(uiCh.id)
+    // 第二章只服务后面的「全书搜索 → Enter 切章」：上面那节版本恢复会把当前章
+    // 正文变回「第一版。」，若仍拿它当搜索目标，Enter 之后正文不变，断言就
+    // 证明不了「跳转真的发生了」。openBook 会回到第一章，所以不影响前面的断言。
+    const uiCh2 = await b.addChapter()
+    await b.setChapterContent(uiCh2.id, '另一章独有的正文。')
+    await b.persistChapter(uiCh2.id)
     await new Promise((r) => setTimeout(r, 80))
+
+    // 造一条「上次生成到一半就退出」的任务：status 仍是 running，草稿有内容。
+    // 打开书后 AiPanel 必须把它标成 interrupted 并显示恢复条 —— 这正是崩溃、
+    // 关窗、Android 杀后台之后用户实际会遇到的场景。
+    await db.coll.generationTasks.upsert(uiBook.id, {
+      id: 'smoke_crash_task',
+      bookId: uiBook.id,
+      chapterId: uiCh.id,
+      action: 'continue',
+      stages: ['write'],
+      model: 'mock',
+      status: 'running',
+      startedAt: Date.now() - 5000,
+      updatedAt: Date.now() - 5000,
+      outputText: '中断前已经收到的一段草稿。',
+      lastError: '',
+      abortedByUser: false,
+      finishReason: ''
+    })
 
     const card = [...document.querySelectorAll('.book-card')].find(
       (el) => el.querySelector('.title')?.textContent === '测试小说'
@@ -1437,6 +1842,47 @@
         !!document.querySelector('.editor-ta') &&
         !!document.querySelector('.sidebar') &&
         !!document.querySelector('.ai-panel')
+
+      // 草稿恢复条：等 settleOnOpen 的异步读写跑完
+      await new Promise((r) => setTimeout(r, 250))
+      const crashTask = (await db.coll.generationTasks.getAll(uiBook.id)).find(
+        (t) => t.id === 'smoke_crash_task'
+      )
+      const recoveryBar = document.querySelector('.recovery-bar')
+      out.draftRecoveryOk =
+        crashTask?.status === 'interrupted' &&
+        !!recoveryBar &&
+        recoveryBar.textContent.includes('已保留') &&
+        recoveryBar.textContent.includes('服务端请求不会恢复')
+
+      const loadDraftBtn = [...(recoveryBar?.querySelectorAll('.btn') || [])].find((el) =>
+        el.textContent.includes('载入到输出框')
+      )
+      loadDraftBtn?.click()
+      await new Promise((r) => setTimeout(r, 120))
+      out.draftLoadOk =
+        (document.querySelector('.out-box')?.textContent || '').includes('中断前已经收到') &&
+        !document.querySelector('.recovery-bar')
+
+      // 生命周期冲刷：输入后**立刻**触发 pagehide，等过防抖窗口再读库。
+      // 若 App 没有在 pagehide 上调 flush()，这笔修改仍停在 1.5s 防抖里，库里就没有。
+      const ta = document.querySelector('.editor-ta')
+      if (ta) {
+        ta.value = '第二版。页面隐藏前补的一笔。'
+        ta.dispatchEvent(new Event('input', { bubbles: true }))
+        window.dispatchEvent(new Event('pagehide'))
+        await new Promise((r) => setTimeout(r, 350))
+      }
+      const afterPagehide = (await db.getChapters(uiBook.id)).find((c) => c.id === uiCh.id)
+      out.pagehideFlushOk = (afterPagehide?.content || '').includes('页面隐藏前补的一笔')
+
+      // 把这笔测试改动还原，后面的版本面板断言依赖当前正文正好是「第二版。」
+      if (ta) {
+        ta.value = '第二版。'
+        ta.dispatchEvent(new Event('input', { bubbles: true }))
+        window.dispatchEvent(new Event('pagehide'))
+        await new Promise((r) => setTimeout(r, 200))
+      }
 
       // 给时间线留一条可画的东西。控制台打开时会**从库里重载**全部集合，
       // 所以这条必须先落库（memory.upsert 会写），只放进内存是看不到的。
@@ -1523,6 +1969,61 @@
         (document.querySelector('.ai-panel .usage-detail')?.textContent || '').includes('deepseek-chat')
       await new Promise((r) => setTimeout(r, 200))
 
+      // 全书搜索：从顶栏真实打开，输入后必须出现命中，Enter 必须切章并关掉弹窗。
+      // 这一节同时覆盖「搜索结果的集合名 → 控制台标签键」的映射：events 的标签
+      // 叫「时间线」，直接传集合名会静默落到第一页。
+      const searchBtn = [...document.querySelectorAll('.topbar .btn')].find(
+        (el) => el.textContent.trim() === '搜索'
+      )
+      out.searchButtonFound = !!searchBtn
+      searchBtn?.click()
+      await new Promise((r) => setTimeout(r, 200))
+      const searchInput = document.querySelector('.modal.search-modal input[type="search"]')
+      out.searchModalOk = !!searchInput && !!document.querySelector('.modal.search-modal .hint')
+      if (searchInput) {
+        searchInput.value = '独有'
+        searchInput.dispatchEvent(new Event('input', { bubbles: true }))
+        await new Promise((r) => setTimeout(r, 350))
+      }
+      const firstHit = document.querySelector('.modal.search-modal .hit')
+      out.searchHitOk =
+        !!firstHit &&
+        firstHit.textContent.includes('章节') &&
+        firstHit.textContent.includes('独有') &&
+        !!firstHit.querySelector('mark')
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter' }))
+      await new Promise((r) => setTimeout(r, 300))
+      out.searchJumpOk =
+        !document.querySelector('.modal.search-modal') &&
+        document.querySelector('.editor-ta')?.value === '另一章独有的正文。'
+
+      // 搜实体：点中事件必须打开控制台并落在「时间线」标签，而不是首页。
+      searchBtn?.click()
+      await new Promise((r) => setTimeout(r, 200))
+      const searchInput2 = document.querySelector('.modal.search-modal input[type="search"]')
+      if (searchInput2) {
+        searchInput2.value = '挂载事件'
+        searchInput2.dispatchEvent(new Event('input', { bubbles: true }))
+        await new Promise((r) => setTimeout(r, 350))
+      }
+      const eventHit = [...document.querySelectorAll('.modal.search-modal .hit')].find((el) =>
+        el.textContent.includes('事件')
+      )
+      eventHit?.click()
+      await new Promise((r) => setTimeout(r, 400))
+      out.searchEntityOpenOk =
+        !document.querySelector('.modal.search-modal') &&
+        !!document.querySelector('.modal.console') &&
+        (document.querySelector('.console-tabs .ctab.active')?.textContent || '').includes('时间线') &&
+        (document.querySelector('.console-pane .tl-title')?.textContent || '').includes('挂载事件')
+
+      // 关掉搜索打开的那次控制台，后面的正常入口测试重新开一遍
+      const searchConsoleClose = [...document.querySelectorAll('.modal.console .modal-header .btn')].find(
+        (el) => el.textContent.trim() === '关闭'
+      )
+      searchConsoleClose?.click()
+      await new Promise((r) => setTimeout(r, 200))
+
       // 小说控制台：同样必须走真实点击。控制台一次性挂载 EntityTable ×8、
       // MemoryReview、ContextPreview、GenerationHistory 六个组件，是全项目
       // 依赖 setup 期正确性最重的一处 —— 只调 store 根本碰不到它们。
@@ -1536,13 +2037,16 @@
       const tabs = [...document.querySelectorAll('.console-tabs .ctab')]
       const pickTab = (label) =>
         tabs.find((el) => el.querySelector('span')?.textContent.trim() === label)
-      // 剧情页应当同时挂出「卷」与「篇」两张表
+      // 剧情页：全书规划面板 + 卷 / 篇 / 场景三张表（场景是阶段 4 新增的）
       const storyTables = document.querySelectorAll('.console-pane .entity-table')
       out.consoleMountOk =
         !!document.querySelector('.modal.console') &&
-        tabs.length === 12 &&
-        storyTables.length === 2 &&
-        (storyTables[0]?.querySelector('h4')?.textContent || '').includes('卷')
+        tabs.length === 14 &&
+        !!document.querySelector('.console-pane .bp') &&
+        document.querySelectorAll('.console-pane .bp-field').length === 7 &&
+        storyTables.length === 3 &&
+        (storyTables[0]?.querySelector('h4')?.textContent || '').includes('卷') &&
+        (storyTables[2]?.querySelector('h4')?.textContent || '').includes('场景')
 
       // 切标签：每次切换都会挂载一个不同的子组件，逐个确认它们真的渲染出内容
       pickTab('人物')?.click()
@@ -1582,6 +2086,15 @@
         srcLabels.includes('手动存档') &&
         srcLabels.includes('回滚前')
 
+      // 版本对比：点开当前章节这一组的「版本对比」，必须真的画出逐行差异。
+      // 只断言面板出现是不够的——diff 结果为空时面板同样会出现。
+      document.querySelector('.console-pane .cv-cmp-toggle .btn')?.click()
+      await new Promise((r) => setTimeout(r, 150))
+      out.versionCompareUiOk =
+        !!document.querySelector('.console-pane .cv-cmp') &&
+        document.querySelectorAll('.console-pane .cv-diff .dline').length >= 1 &&
+        (document.querySelector('.console-pane .cv-cmp-stats')?.textContent || '').includes('新增')
+
       // 时间线：轴是画出来的，光断言「组件挂载了」不够 —— 必须看到那个事件
       // 真的落在它的章节锚点下面。默认是轴，「表格」那一侧保留可编辑的实体表。
       pickTab('时间线')?.click()
@@ -1617,6 +2130,25 @@
         !!document.querySelector('.console-pane .cr-item') &&
         crText.includes('不产生费用') &&
         !!document.querySelector('.console-pane .cr-ai .btn')
+
+      // 文风与统计：两个新标签各挂一个组件。统计面板直接消费纯函数 buildStats，
+      // 这里断言它真的画出了卡片与条形，而不是空壳。
+      pickTab('文风')?.click()
+      await new Promise((r) => setTimeout(r, 120))
+      const styleOk = (document.querySelector('.console-pane .et-head h4')?.textContent || '').includes(
+        '文风'
+      )
+
+      pickTab('统计')?.click()
+      await new Promise((r) => setTimeout(r, 150))
+      const statsText = document.querySelector('.console-pane .stats')?.textContent || ''
+      const statsOk =
+        !!document.querySelector('.console-pane .stats') &&
+        statsText.includes('写作统计') &&
+        statsText.includes('总字数') &&
+        document.querySelectorAll('.console-pane .stats .card').length === 4 &&
+        document.querySelectorAll('.console-pane .stats .block').length >= 5
+      out.consoleStyleStatsOk = styleOk && statsOk
 
       out.consoleTabsOk = peopleOk && ctxOk
 
@@ -1731,7 +2263,15 @@
           callbacks: {
             onDelta: (t) => (acc.text += t),
             onUsage: (u) => (acc.usage = u),
-            onError: (m) => finish({ ...acc, err: m }),
+            onError: (info) =>
+              finish({
+                ...acc,
+                err:
+                  typeof info === 'string'
+                    ? info
+                    : info?.detail || info?.message || '请求失败',
+                errInfo: info
+              }),
             onDone: () => finish({ ...acc, done: true }),
             onAborted: () => finish({ ...acc, aborted: true })
           }
@@ -1798,6 +2338,119 @@
       parseSseLine(
         'data: ' + JSON.stringify({ choices: [], usage: { prompt_tokens: 1, completion_tokens: 1 } })
       ) === ''
+
+    // G5b) 错误对象契约：分类、状态码、脱敏。401 只回一句可行动的说明，
+    //      服务端回显的假 Key 必须被抹掉。
+    const authErr = await collect(
+      { ...sseSettings, baseUrl: `http://127.0.0.1:__PORT__/auth` },
+      [{ role: 'user', content: 'hi' }],
+      { forceBrowser: true }
+    )
+    out.errorObjectOk =
+      !authErr.done &&
+      !!authErr.errInfo &&
+      authErr.errInfo.category === 'auth' &&
+      authErr.errInfo.status === 401 &&
+      authErr.errInfo.retryable === false &&
+      authErr.errInfo.detail.includes('[redacted]') &&
+      !authErr.errInfo.detail.includes('sk-smoke-leak-123456')
+    out.serverErrorCategoryOk =
+      !!rErr.errInfo && rErr.errInfo.category === 'server' && rErr.errInfo.status === 500
+
+    // G5c) 可靠封装：没收到正文时，500 自动重试一次后成功；Retry-After 被尊重。
+    const runReliable = (base, extra = {}) =>
+      new Promise((resolve) => {
+        const acc = {
+          text: '',
+          retries: [],
+          err: null,
+          done: false,
+          truncated: null,
+          aborted: false,
+          finishReason: ''
+        }
+        let settled = false
+        const finish = (patch) => {
+          if (settled) return
+          settled = true
+          resolve({ ...acc, ...patch })
+        }
+        const timer = setTimeout(() => finish({ err: 'timeout' }), 8000)
+        chatStreamReliable({
+          settings: { ...sseSettings, baseUrl: base },
+          messages: [{ role: 'user', content: 'hi' }],
+          // 退避在测试里不真的睡
+          sleep: () => Promise.resolve(),
+          ...extra,
+          callbacks: {
+            onDelta: (t) => (acc.text += t),
+            onRetry: (r) => acc.retries.push(r),
+            onDone: (p) => {
+              clearTimeout(timer)
+              finish({ done: true, finishReason: p?.finishReason || '' })
+            },
+            onTruncated: (info) => {
+              clearTimeout(timer)
+              finish({ truncated: info, finishReason: info?.finishReason || '' })
+            },
+            onError: (info) => {
+              clearTimeout(timer)
+              finish({ err: info })
+            },
+            onAborted: () => {
+              clearTimeout(timer)
+              finish({ aborted: true })
+            }
+          }
+        })
+      })
+    const flaky = await runReliable(`http://127.0.0.1:__PORT__/flaky`)
+    out.retryOnceOk =
+      flaky.done &&
+      flaky.text === '你好，世界！' &&
+      flaky.retries.length === 1 &&
+      flaky.retries[0].attempt === 1 &&
+      flaky.retries[0].category === 'server' &&
+      flaky.retries[0].retryAfterMs === 1000
+
+    // 401 不重试：配置错误重试一百次也一样，而且每次都可能计费。
+    const authReliable = await runReliable(`http://127.0.0.1:__PORT__/auth`)
+    out.authNoRetryOk =
+      !!authReliable.err &&
+      authReliable.err.category === 'auth' &&
+      authReliable.retries.length === 0
+
+    // 截断：正文保留、走 onTruncated、绝不走 onDone。
+    const trunc = await runReliable(`http://127.0.0.1:__PORT__/truncated`)
+    out.truncatedOk =
+      trunc.text === '前半段正文' &&
+      !trunc.done &&
+      !!trunc.truncated &&
+      trunc.truncated.category === 'truncated' &&
+      trunc.finishReason === 'length'
+
+    // 流内错误块（HTTP 200）：必须变成终止错误，而不是「静默结束」。
+    const streamErr = await collect(
+      { ...sseSettings, baseUrl: `http://127.0.0.1:__PORT__/stream-error` },
+      [{ role: 'user', content: 'hi' }],
+      { forceBrowser: true }
+    )
+    out.streamErrorBlockOk =
+      !streamErr.done && !!streamErr.errInfo && String(streamErr.err).includes('余额不足')
+
+    // 退避：1s / 2s 指数增长且带抖动；Retry-After 优先。
+    const b0 = computeBackoff(0, { random: () => 0.5 })
+    const b1 = computeBackoff(1, { random: () => 0.5 })
+    out.backoffOk =
+      b0 === 1000 &&
+      b1 === 2000 &&
+      computeBackoff(0, { retryAfterMs: 5000, random: () => 0.5 }) === 5000 &&
+      shouldRetry({ category: 'server', retryable: true }, { attempt: 0, hasText: false }) ===
+        true &&
+      shouldRetry({ category: 'server', retryable: true }, { attempt: 0, hasText: true }) ===
+        false &&
+      shouldRetry({ category: 'auth', retryable: false }, { attempt: 0, hasText: false }) ===
+        false
 
     // G6) usage 经两条传输路径都能到达 onUsage。
     //     IPC 路径拿到的是 DeepSeek 形状（挂在最后一个内容块上），
@@ -2000,8 +2653,17 @@
       summary: '林昭夜访药庐，得知师父已死。',
       timelineEnd: '第七天夜里',
       characters: [
-        { name: '林昭', identity: '药童' },
-        { id: 'seed-su', name: '苏九', status: '死亡' }
+        {
+          name: '林昭',
+          identity: '药童',
+          evidence: '林昭推开门，看见苏九正在碾药。'
+        },
+        {
+          id: 'seed-su',
+          name: '苏九',
+          status: '死亡',
+          evidence: '苏九伏在案上，已经没了气息。'
+        }
       ],
       foreshadowing: [{ title: '断剑', content: '剑上刻着半个字' }],
       events: [{ title: '雨夜问诊', description: '林昭夜访药庐' }]
@@ -2050,6 +2712,7 @@
     const wfQueue = await db.coll.reviewQueue.getAll(wfBook.id)
     const wfSword = await db.coll.foreshadowing.getAll(wfBook.id)
     const wfRuns = await db.coll.generationRuns.getAll(wfBook.id)
+    const wfLogs = await db.coll.memoryChangeLog.getAll(wfBook.id)
     const wfSu = wfChars.find((c) => c.id === 'seed-su')
 
     out.workflowSyncAbortOk = ctlSync && ctlIsFn
@@ -2093,6 +2756,57 @@
       wfRuns.length === 2 &&
       wfRuns.every((r) => r.chapterId === wfChapter.id && r.priced === true) &&
       aggregateRuns(wfRuns).totalTokens === 380
+
+    // L4b) 证据链：AI 提取的每条记录都要带「出自正文哪句话」。
+    //      没有它，用户看到一条错误的人物状态时无从核对；审阅队列里的
+    //      高风险项也只能看到「alive → dead」而不知道模型据何判断。
+    out.memoryEvidenceOk =
+      wfChars.find((c) => c.name === '林昭')?.evidence ===
+        '林昭推开门，看见苏九正在碾药。' &&
+      wfChars.find((c) => c.name === '林昭')?.sourceChapterId === wfChapter.id &&
+      wfChars.find((c) => c.name === '林昭')?.factLayer === 'author-fact' &&
+      wfChars.find((c) => c.name === '林昭')?.confirmStatus === 'confirmed' &&
+      wfQueue[0].evidence === '苏九伏在案上，已经没了气息。' &&
+      wfQueue[0].chapterId === wfChapter.id &&
+      // 每次自动入库都有一条 before/after 日志，撤销靠它
+      wfLogs.filter((l) => l.op === 'create').length === 3 &&
+      wfLogs.every((l) => l.chapterId === wfChapter.id) &&
+      wfLogs.some((l) => l.evidence === '林昭推开门，看见苏九正在碾药。')
+
+    // L4c) 撤销最近一次自动入库：删掉「断剑」这条新建，其他记录不受影响；
+    //      原日志被标成已撤销，反向日志保留（历史不能凭空少一段）。
+    const swordLog = wfLogs.find((l) => l.entity === 'foreshadowing' && l.op === 'create')
+    const undoRes = await undoMemoryChange(wfBook.id, swordLog.id)
+    const logsAfterUndo = await db.coll.memoryChangeLog.getAll(wfBook.id)
+    out.memoryUndoOk =
+      !!swordLog &&
+      undoRes.ok === true &&
+      (await db.coll.foreshadowing.getAll(wfBook.id)).length === 0 &&
+      logsAfterUndo.some((l) => l.id === swordLog.id && l.undone === true) &&
+      logsAfterUndo.some((l) => l.source === 'undo' && l.undoOf === swordLog.id) &&
+      // 撤销一条不得波及同一批入库的其他记录
+      (await db.coll.characters.getAll(wfBook.id)).some((c) => c.name === '林昭') &&
+      (await db.coll.events.getAll(wfBook.id)).length === 1
+
+    // L4d) 生成记录可复现：提示词版本、请求参数、上下文摘要必须随每次调用落库。
+    //      没有它们，「同样的输入这次怎么写得不一样」就分不清是提示词改了、
+    //      参数改了，还是模型自己漂了。
+    out.generationTraceOk =
+      wfRuns.length === 2 &&
+      wfRuns.every(
+        (r) =>
+          r.promptVersion === PROMPT_VERSION &&
+          r.params &&
+          r.params.temperature === s.settings.temperature &&
+          r.params.maxTokens === s.settings.maxTokens &&
+          r.contextSummary &&
+          r.contextSummary.tokens > 0 &&
+          r.contextSummary.budget > 0 &&
+          Array.isArray(r.contextSummary.layers) &&
+          Array.isArray(r.contextSummary.sources)
+      ) &&
+      // 写正文那次上下文的来源列表能说清「都装了什么」
+      wfRuns.find((r) => r.stage === 'write')?.contextSummary.sources.length > 0
 
     // L5) 中途中止：不得留下半提交的记忆，但钱要记（已经花出去了）
     const charsBefore = (await db.coll.characters.getAll(wfBook.id)).length
@@ -2420,6 +3134,116 @@
       push2.diff.updated === 0 &&
       push2.diff.removed === 0
 
+    // N2) 同章冲突：两台设备**都改过**同一章且正文不同 → 不静默丢弃任何一边。
+    //
+    // 判定需要基线，所以要分两轮：
+    //   ① 先同步一次两边内容相同的 ch2 —— 只建基线，不报冲突（首次同步误报
+    //      会让每一对本来就不一样的章都被复制一份，是一场噪声灾难）；
+    //   ② 两边分别改动 ch2 后再同步 —— 主章保留电脑版本，手机版本另存
+    //      「【冲突副本】」，并写一条 syncConflicts 记录供两端处理。
+    const peersBefore = await db.getSyncPeers()
+    const conflictSettingBefore = s.settings.syncConflictCopies
+    s.settings.syncConflictCopies = true
+    // 上一次运行若中途崩过，真实库里可能残留同一台测试设备的基线。
+    // 先摘掉再建，否则「首次同步不误报」这一条会失败在一个陈旧时间戳上。
+    const peersClean = { ...peersBefore }
+    delete peersClean['smoke-device-B']
+    await db.saveSyncPeers(peersClean)
+
+    const baseCh2 = (await db.getChapters(syncBook.id)).find((c) => c.id === ch2.id)
+    const baseTime = baseCh2.updatedAt
+    const baselineSnap = buildSnapshot({
+      books: [{ ...b.store.book }],
+      deviceId: 'smoke-device-B',
+      data: {
+        [syncBook.id]: {
+          chapters: [{ ...baseCh2 }]
+        }
+      }
+    })
+    const baselinePush = await pushSnapshot(syncBase2, sync2.code, { snapshot: baselineSnap })
+    const copiesAfterBaseline = (await db.getChapters(syncBook.id)).filter((c) =>
+      String(c.title || '').startsWith(CONFLICT_TITLE_PREFIX)
+    ).length
+
+    // 电脑端（本机）先改；时间戳一定晚于基线
+    await db.upsertChapter(syncBook.id, {
+      ...baseCh2,
+      content: '电脑端修改后的第二章',
+      updatedAt: baseTime + 10
+    })
+    // 手机端也改。用 baseTime + 1 而不是「未来时间」：随后电脑端会把主章的
+    // 时间戳抬到 Date.now()，第二轮同步才能稳定地让主章继续赢。
+    const conflictSnap = buildSnapshot({
+      books: [{ ...b.store.book }],
+      deviceId: 'smoke-device-B',
+      data: {
+        [syncBook.id]: {
+          chapters: [
+            {
+              ...baseCh2,
+              content: '手机端修改后的第二章',
+              updatedAt: baseTime + 1
+            }
+          ]
+        }
+      }
+    })
+    const conflictPush = await pushSnapshot(syncBase2, sync2.code, { snapshot: conflictSnap })
+    const afterConflict = await db.getChapters(syncBook.id)
+    const mainCh2 = afterConflict.find((c) => c.id === ch2.id)
+    const copyChapters = afterConflict.filter((c) => !!c.conflictOf)
+    const conflictRecs = await db.coll.syncConflicts.getAll(syncBook.id)
+    const openRecs = conflictRecs.filter((r) => r.status === 'open')
+
+    out.syncConflictCopyOk =
+      baselinePush.ok === true &&
+      copiesAfterBaseline === 0 &&
+      conflictPush.ok === true &&
+      conflictPush.conflicts >= 1 &&
+      syncState.lastIncoming?.conflicts >= 1 &&
+      mainCh2?.content === '电脑端修改后的第二章' &&
+      copyChapters.length === 1 &&
+      copyChapters[0].content === '手机端修改后的第二章' &&
+      String(copyChapters[0].title || '').startsWith(CONFLICT_TITLE_PREFIX) &&
+      copyChapters[0].conflictOf === ch2.id &&
+      openRecs.length === 1 &&
+      openRecs[0].chapterId === ch2.id &&
+      openRecs[0].copyChapterId === copyChapters[0].id
+
+    // 重放同一份远端快照：确定性 id + 远端时间戳让副本不会每同步一次多一份。
+    const conflictAgain = await pushSnapshot(syncBase2, sync2.code, { snapshot: conflictSnap })
+    const afterAgain = await db.getChapters(syncBook.id)
+    out.syncConflictIdempotentOk =
+      conflictAgain.ok === true &&
+      afterAgain.filter((c) => !!c.conflictOf).length === 1 &&
+      (await db.coll.syncConflicts.getAll(syncBook.id)).length === 1 &&
+      afterAgain.find((c) => c.id === ch2.id)?.content === '电脑端修改后的第二章'
+
+    // N3) 数据版本不一致：同步是**双向写入**，不允许「半懂不懂」地合并。
+    //     低版本必须被明确拒绝（high 版在 normalizeSnapshot 就会被挡）。
+    const chaptersBeforeMismatch = (await db.getChapters(syncBook.id)).length
+    const lowerSnap = buildSnapshot({
+      books: [{ ...b.store.book }],
+      deviceId: 'smoke-device-C',
+      data: { [syncBook.id]: { chapters: [{ ...mainCh2, content: '旧版本设备的正文' }] } }
+    })
+    lowerSnap.schemaVersion = Math.max(0, SCHEMA_VERSION - 1)
+    const lowerRes = await handleIncomingSnapshot(lowerSnap)
+    const higherSnap = buildSnapshot({ books: [], data: {}, deviceId: 'smoke-device-D' })
+    higherSnap.schemaVersion = SCHEMA_VERSION + 1
+    const higherRes = await handleIncomingSnapshot(higherSnap)
+    out.syncSchemaRejectOk =
+      lowerRes.ok === false &&
+      lowerRes.code === 'schema-mismatch' &&
+      higherRes.ok === false &&
+      /版本/.test(higherRes.message || '') &&
+      (await db.getChapters(syncBook.id)).length === chaptersBeforeMismatch
+
+    // 收尾：还原开发者自己的 peer 基线与设置，别把测试的对端留在真实库里
+    await db.saveSyncPeers(peersBefore)
+    s.settings.syncConflictCopies = conflictSettingBefore
+
     // 生成中不许同步：合并是 saveChapters 整组回写，与流式写入抢同一个键，
     // 撞上就是一次静默丢稿。挡住它的代价只是让对面稍后重试，所以这条边界
     // 得真的走一遍 409，而不是只在注释里写着。
@@ -2454,6 +3278,9 @@
     out.pass =
       out.saveDirDefaults &&
       out.settingsBackfill &&
+      out.secureKeyMigrationOk &&
+      out.secureKeyReadOk &&
+      out.settingsNoPlaintextKey &&
       out.saveDirPersisted &&
       out.chapterMarkdownOk &&
       out.sanitizeOk &&
@@ -2521,6 +3348,10 @@
       out.snapshotCollectOk &&
       out.snapshotRoundTripOk &&
       out.snapshotParseOk &&
+      out.snapshotChecksumOk &&
+      out.snapshotCloneOk &&
+      out.snapshotExcludesTasksOk &&
+      out.preRestoreKeyOk &&
       out.snapshotStatsOk &&
       out.versionCaptureOk &&
       out.versionRestoreOk &&
@@ -2536,19 +3367,35 @@
       out.consistencyEmptyOk &&
       out.consistencyReviewOk &&
       out.consistencyReviewNoPersistOk &&
+      out.planCardOk &&
+      out.planProposalOk &&
+      out.diffOk &&
+      out.planAiDraftOk &&
+      out.fixDraftOk &&
+      out.fixAcceptOk &&
       out.uiCardFound &&
       out.uiWritingMounted &&
+      out.draftRecoveryOk &&
+      out.draftLoadOk &&
+      out.pagehideFlushOk &&
       out.uiFindBar &&
       out.versionPanelMountOk &&
       out.versionRestoreUiOk &&
       out.uiBackToShelf &&
       out.aiPanelUsageOk &&
       out.aiPanelUsageDetailOk &&
+      out.searchButtonFound &&
+      out.searchModalOk &&
+      out.searchHitOk &&
+      out.searchJumpOk &&
+      out.searchEntityOpenOk &&
       out.consoleButtonFound &&
       out.consoleMountOk &&
       out.consoleTabsOk &&
+      out.consoleStyleStatsOk &&
       out.consoleHistoryOk &&
       out.consoleVersionsOk &&
+      out.versionCompareUiOk &&
       out.timelineMountOk &&
       out.timelineTableOk &&
       out.consistencyMountOk &&
@@ -2565,6 +3412,13 @@
       out.streamIpc &&
       out.streamError &&
       out.streamBrowser &&
+      out.errorObjectOk &&
+      out.serverErrorCategoryOk &&
+      out.retryOnceOk &&
+      out.authNoRetryOk &&
+      out.truncatedOk &&
+      out.streamErrorBlockOk &&
+      out.backoffOk &&
       out.parseOk &&
       out.usageParseOk &&
       out.streamUsageIpc &&
@@ -2577,6 +3431,9 @@
       out.workflowSyncAbortOk &&
       out.workflowOk &&
       out.workflowCommitOk &&
+      out.memoryEvidenceOk &&
+      out.memoryUndoOk &&
+      out.generationTraceOk &&
       out.workflowAbortOk &&
       out.workflowExtractFailOk &&
       out.syncServerUpOk &&
@@ -2594,8 +3451,17 @@
       out.syncCursorPrepOk &&
       out.syncRoundTripOk &&
       out.syncIdempotentOk &&
+      out.syncConflictCopyOk &&
+      out.syncConflictIdempotentOk &&
+      out.syncSchemaRejectOk &&
       out.syncBusyOk &&
       out.snapshotNoApiKeyOk
+
+    // 断言计数：以 out 上的具名断言为准。pass / error / 本字段与诊断项不算。
+    // 这样 README / CLAUDE.md 里的数字可以直接引用真实值，不必手工维护。
+    out.assertionCount = Object.keys(out).filter(
+      (k) => !['pass', 'error', 'assertionCount', 'syncBigStatus'].includes(k)
+    ).length
   } catch (e) {
     out.error = String((e && e.stack) || e)
     out.pass = false

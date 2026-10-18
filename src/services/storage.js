@@ -215,6 +215,29 @@ export const COLLECTIONS = [
   // deleteBook 的级联删键自动覆盖它，snapshot.js 的 DATA_COLLECTIONS 由这里派生
   // 因而版本自动进全量备份与设备同步 —— 三处都不用各自记得加一遍。
   'chapterVersions',
+  // 生成任务（流式草稿、崩溃恢复）。**刻意只在设备本地**：它描述的是「这台设备
+  // 上正在进行/刚中断的一次调用」，随快照同步到另一台设备毫无意义，而且草稿
+  // 内容是易失的。snapshot.js 的 DATA_COLLECTIONS 会把它排除掉（见那里的注释）。
+  'generationTasks',
+  // 记忆变更日志。每一次经 AI/审阅/撤销写入的字段改动都记一条，供「最近变更」
+  // 与撤销使用。它随快照同步（另一台设备也该看得到「这个人的状态是怎么变的」），
+  // 但 generationTasks 不。
+  'memoryChangeLog',
+  // 同步冲突记录。正文冲突时保留的副本与双方时间戳记在这里，随合并结果
+  // 一并传给对端，于是两台设备都能看到「有一处冲突待处理」。
+  'syncConflicts',
+  // 场景：章 → 场景的下一层施工单位。它随快照同步，因为两台设备看到的
+  // 「这一章由哪几场戏组成」必须一致。
+  'scenes',
+  // 锁定节点的变更提案。AI 计划如果触碰作者锁定的节拍，不得直接改施工卡，
+  // 只能在这里留一条待确认提案；它随同步传播，另一台设备也该看到。
+  'planProposals',
+  // 审校问题的**状态**（打开/接受/忽略/已修复/复核失败）。完整报告仍不落库：
+  // 报告针对某一版正文，正文一改就过期；状态则是用户做出的决定，值得保留。
+  'reviewIssueStates',
+  // 文风档案。它是跨章稳定的表达层，由作者手写而不是从正文里提取；
+  // 随快照同步 —— 换台设备继续写，腔调应当还是同一套。
+  'styleProfiles',
   'tombstones'
 ]
 
@@ -376,6 +399,53 @@ export async function addBookTombstone(bookId, deletedAt = Date.now()) {
 
 export async function getBookTombstones() {
   return (await get(KEY_BOOK_TOMBSTONES, store)) || []
+}
+
+// ---------- 恢复前自动留底 ----------
+// 全局键而非 per-book：一次恢复可能同时动到很多本书，留底要能整体还原。
+// 它刻意**不进快照** —— 否则「恢复前快照」会被下一次恢复再套一层，越滚越大。
+
+const KEY_PRE_RESTORE = 'preRestoreSnapshot'
+
+/** 保存恢复/迁移前的整库快照。只保留最近一份。 */
+export async function savePreRestoreSnapshot(snapshot) {
+  return serialize(KEY_PRE_RESTORE, async () => {
+    await set(KEY_PRE_RESTORE, toPlain(snapshot), store)
+    return snapshot
+  })
+}
+
+export async function getPreRestoreSnapshot() {
+  return (await get(KEY_PRE_RESTORE, store)) || null
+}
+
+// ---------- 设备标识与同步基线 ----------
+// 两者都**刻意不进快照**：deviceId 是本机身份，基线记录的是「这台机器上次与某台
+// 设备同步后各章的样子」，把它们同步出去只会互相覆盖。
+
+const KEY_DEVICE_ID = 'deviceId'
+const KEY_SYNC_PEERS = 'syncPeers'
+
+/** 本机设备 id，首次调用时生成并落库。 */
+export async function getDeviceId() {
+  const existing = await get(KEY_DEVICE_ID, store)
+  if (existing) return existing
+  // 不用 crypto.randomUUID：它要求安全上下文，file:// 与部分 WebView 上没有。
+  const id = `dev_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`
+  await set(KEY_DEVICE_ID, id, store)
+  return id
+}
+
+/** 所有同步对端的基线：{ [peerDeviceId]: { deviceId, chapters: {id: updatedAt}, updatedAt } } */
+export async function getSyncPeers() {
+  return (await get(KEY_SYNC_PEERS, store)) || {}
+}
+
+export async function saveSyncPeers(peers) {
+  return serialize(KEY_SYNC_PEERS, async () => {
+    await set(KEY_SYNC_PEERS, toPlain(peers || {}), store)
+    return peers
+  })
 }
 
 /** 列出库里所有原始键。rawGet 需要逐个键名，这里给全量（快照与测试用）。 */

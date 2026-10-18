@@ -9,10 +9,15 @@ import {
   SNAPSHOT_VERSION
 } from './novel/snapshot'
 import { SCHEMA_VERSION } from './migration'
+import {
+  detectChapterConflicts,
+  applyConflictCopies,
+  updatePeerBaseline
+} from './sync/conflicts'
 import { useBooks } from '../store/books'
 import { useCollections } from '../store/novel'
 import { useGeneration } from '../store/generation'
-import { defaultSettings } from '../store/settings'
+import { defaultSettings, settings } from '../store/settings'
 
 /**
  * 局域网同步 · 渲染层。
@@ -61,18 +66,64 @@ export const syncState = reactive({
 // 服务端：把远端快照合并进本机
 // ---------------------------------------------------------------------------
 
+/** 两台设备的领域模型版本必须一致。半懂不懂地合并未知字段是静默丢数据的来源。 */
+function schemaMismatch(version) {
+  const v = Number(version) || 0
+  if (v === SCHEMA_VERSION) return null
+  return {
+    ok: false,
+    code: 'schema-mismatch',
+    message:
+      `两台设备的数据版本不一致（本机 v${SCHEMA_VERSION}，对方 v${v}）。` +
+      '请把两台设备都升级到同一版本后再同步——旧版本不认识新版本的字段，强行合并会丢数据。'
+  }
+}
+
+/** 快照里所有书的章节摊平成一张表（章节 id 全库唯一，基线可以用一张表）。 */
+function flattenChapters(snap) {
+  const out = []
+  for (const sets of Object.values(snap?.data || {})) {
+    for (const c of sets?.chapters || []) if (c?.id) out.push(c)
+  }
+  return out
+}
+
+/** 合并结果里还有多少条未处理的同步冲突。 */
+function countOpenConflicts(snap) {
+  let n = 0
+  for (const sets of Object.values(snap?.data || {})) {
+    for (const r of sets?.syncConflicts || []) if (r?.status === 'open') n++
+  }
+  return n
+}
+
+async function persistLastSync(at) {
+  try {
+    const meta = await db.getMeta()
+    await db.saveMeta({ ...(meta || {}), lastSyncAt: at })
+  } catch {
+    // 只是一个显示用的时间戳，写失败不该让整次同步失败
+  }
+}
+
 /**
  * 处理一份远端快照，返回给主进程（它会把这些字段写成 HTTP 响应）。
  *
- * **顺序是硬约束，四条都不能换**：
+ * **顺序是硬约束，几条都不能换**：
  *
  * 1. 正在生成 → 直接拒绝。合并是 `saveChapters` 整组回写，与流式写入抢同一个
  *    键，撞上就是一次静默丢稿。先挡住，代价只是让对面稍后重试。
- * 2. `flush()` —— 把编辑器防抖窗口里的正文先落库。不做这一步，用户刚敲的那
+ * 2. 版本检查 —— 数据版本不一致直接拒绝（见 schemaMismatch）。
+ * 3. `flush()` —— 把编辑器防抖窗口里的正文先落库。不做这一步，用户刚敲的
  *    几百字会被随后写回的整个章节数组**覆盖掉**，而且他看不到任何提示。
- * 3. `applySnapshot` —— 只写库，**完全不碰 store**。
- * 4. `reloadAfterSync` + `reloadEditor` —— 把内存态与屏幕上的正文重新对齐。
+ * 4. 冲突检测（只针对 chapters）→ 远端版本另存为副本、主章保留本地。
+ * 5. `applySnapshot` —— 只写库，**完全不碰 store**。
+ * 6. `reloadAfterSync` + `reloadEditor` —— 把内存态与屏幕上的正文重新对齐。
  *    漏掉这步的表现为「同步完了界面还是旧的，重启才变」。
+ *
+ * 第 4 步之后要把解决后的主章 `updatedAt` 抬高一点：否则手机端按 LWW 合并
+ * 响应时，它自己那份更新会赢，两台设备的主章就永远不一致了。副本已经保住了
+ * 手机的内容，所以这里让电脑的主章成为两边共同的主章是安全的。
  */
 export async function handleIncomingSnapshot(remote, { remoteAddr = '' } = {}) {
   const gen = useGeneration()
@@ -87,17 +138,75 @@ export async function handleIncomingSnapshot(remote, { remoteAddr = '' } = {}) {
   } catch (e) {
     return { ok: false, message: String((e && e.message) || e) }
   }
+  const mismatch = schemaMismatch(snap.schemaVersion)
+  if (mismatch) return mismatch
 
   syncState.merging = true
   try {
     await ui.flush()
-    const { stats, after } = await applySnapshot(snap)
+    const before = await collectSnapshot()
+    const remoteDeviceId = String(snap.deviceId || '').trim()
+    const peers = await db.getSyncPeers()
+    const baseline = remoteDeviceId ? peers[remoteDeviceId] || null : null
+
+    // 逐书检测同章冲突。章节 id 全库唯一，所以基线用一张平表即可。
+    const allConflicts = []
+    const bookIds = new Set([
+      ...Object.keys(before.data || {}),
+      ...Object.keys(snap.data || {})
+    ])
+    for (const bookId of bookIds) {
+      const localChapters = before.data?.[bookId]?.chapters || []
+      const remoteChapters = snap.data?.[bookId]?.chapters || []
+      allConflicts.push(
+        ...detectChapterConflicts({
+          localChapters,
+          remoteChapters,
+          baseline,
+          remoteDeviceId,
+          conflictCopies: settings.syncConflictCopies !== false
+        })
+      )
+    }
+
+    // 把「远端版本」从待合并快照里换成一个冲突副本：
+    // 主章因此保持本地版本，远端正文也没有丢。
+    const resolution = applyConflictCopies(snap, allConflicts)
+    const { stats } = await applySnapshot(resolution.snapshot)
+
+    // 抬高主章时间戳，让对端应用合并结果时也选这一版作为主章。
+    // 副本的时间戳保持远端原值（确定性、可幂等重放）。
+    const now = Date.now()
+    for (const c of resolution.conflicts) {
+      const rec = (before.data?.[c.bookId]?.chapters || []).find((x) => x.id === c.chapterId)
+      if (!rec) continue
+      await db.upsertChapter(c.bookId, { ...rec, updatedAt: now })
+    }
+
+    // 以库里的最终状态为准：冲突副本、基线都要基于它，而不是 applySnapshot
+    // 返回的那份在抬高时间戳之前的快照。
+    const final = await collectSnapshot()
+    if (remoteDeviceId) {
+      await db.saveSyncPeers(updatePeerBaseline(peers, remoteDeviceId, flattenChapters(final)))
+    }
+    await persistLastSync(now)
+
     await reloadAfterSync()
     ui.reloadEditor()
-    syncState.lastIncoming = { diff: stats, at: Date.now(), remoteAddr }
+    syncState.lastIncoming = {
+      diff: stats,
+      at: now,
+      remoteAddr,
+      conflicts: resolution.conflicts.length
+    }
     // 回给对面的是**合并结果**，不是「成功」两个字：它拿到就地应用，两边就此
     // 收敛，不需要第二次往返（两次往返之间任一侧再写入都会丢更新）。
-    return { ok: true, snapshot: after, stats }
+    return {
+      ok: true,
+      snapshot: final,
+      stats,
+      conflicts: resolution.conflicts.length
+    }
   } catch (e) {
     return { ok: false, message: String((e && e.message) || e) }
   } finally {
@@ -198,6 +307,18 @@ export async function testConnection(rawUrl) {
         message: `电脑端的软件版本比本机新（同步协议 v${info.snapshotVersion} > v${SNAPSHOT_VERSION}），请先升级本机`
       }
     }
+    // 数据版本必须**相等**：旧端不认识新字段，合并就是静默丢数据。
+    // 与「快照文件」不同，这里不允许向下兼容——同步是双向写入。
+    if (Number(info.schemaVersion) !== SCHEMA_VERSION) {
+      return {
+        ok: false,
+        base,
+        info,
+        message:
+          `两台设备的数据版本不一致（电脑 v${info.schemaVersion ?? '?'} / 本机 v${SCHEMA_VERSION}）。` +
+          '请把两台设备升级到同一版本后再同步。'
+      }
+    }
     return { ok: true, base, info }
   } catch {
     return {
@@ -272,11 +393,24 @@ export async function pushSnapshot(rawUrl, code, { snapshot } = {}) {
     // 相同而保留本地（mergeRecords 的平局规则），对方多出来的则补进来 ——
     // 这就是「收敛」，不需要再算一次差集。
     const merged = normalizeSnapshot(body)
+    const mismatch = schemaMismatch(merged.schemaVersion)
+    if (mismatch) return { ...mismatch, base }
     const applied = await applySnapshot(merged)
+
+    // 基线：记录「这次同步后各章的样子」。下一轮只有双方都在此之后改过、
+    // 且正文不同的章节才会被判成冲突。
+    const peers = await db.getSyncPeers()
+    if (merged.deviceId) {
+      await db.saveSyncPeers(updatePeerBaseline(peers, merged.deviceId, flattenChapters(applied.after)))
+    }
+    const now = Date.now()
+    await persistLastSync(now)
+
     await reloadAfterSync()
     ui.reloadEditor()
-    syncState.lastOutgoing = { diff: applied.stats, at: Date.now() }
-    return { ok: true, diff: applied.stats }
+    const openConflicts = countOpenConflicts(merged)
+    syncState.lastOutgoing = { diff: applied.stats, at: now, conflicts: openConflicts }
+    return { ok: true, diff: applied.stats, conflicts: openConflicts }
   } finally {
     syncState.working = false
   }

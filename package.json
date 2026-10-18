@@ -1,6 +1,6 @@
 {
   "name": "novel-studio",
-  "version": "2.1.0",
+  "version": "3.0.0",
   "description": "自动写小说软件：连接大模型 API 自动续写/生成小说，支持保存、编辑、导出",
   "author": "Novel Studio",
   "license": "MIT",
@@ -28,7 +28,8 @@
     "electron": "npm run build && electron .",
     "electron:dir": "npm run build && electron . --dir",
     "dist:win": "npm run build && electron-builder --win",
-    "dist:win:dir": "npm run build && electron-builder --win --dir"
+    "dist:win:dir": "npm run build && electron-builder --win --dir",
+    "test": "node --test tests/unit/*.test.mjs"
   },
   "dependencies": {
     "idb-keyval": "^6.2.1",

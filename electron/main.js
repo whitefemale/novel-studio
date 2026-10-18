@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, net, dialog, shell } = require('electron')
+const { app, BrowserWindow, ipcMain, net, dialog, shell, safeStorage } = require('electron')
 const path = require('path')
 const fs = require('fs')
 const http = require('http')
@@ -8,6 +8,52 @@ const crypto = require('crypto')
 let mainWindow = null
 // 活跃请求表：requestId -> AbortController
 const activeRequests = new Map()
+
+// ---------------------------------------------------------------------------
+// 关窗前的保存握手
+//
+// 渲染层的自动保存有 1.5 秒防抖窗口。用户点 ✕ 时，最后那几笔可能还没落库。
+// 直接关窗等于静默丢稿，所以主进程先拦下第一个 close：
+//   1. 发 app:before-close 给渲染层；
+//   2. 渲染层 await 编辑器的 flush() 后调 app:close-ready；
+//   3. 主进程放行真正的关闭；2 秒没等到也兜底关闭（不能因为渲染层卡死让窗口关不掉）。
+//
+// before-quit 也要走同一条路 —— Alt+F4 / 系统关机只会触发它，不经过 close。
+// ---------------------------------------------------------------------------
+let allowClose = false
+let closing = false
+let closeTimer = null
+
+function beginGracefulClose() {
+  if (process.env.SMOKE_TEST) {
+    allowClose = true
+    return
+  }
+  if (closing) return
+  closing = true
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    finishClose()
+    return
+  }
+  try {
+    mainWindow.webContents.send('app:before-close')
+  } catch {
+    finishClose()
+    return
+  }
+  closeTimer = setTimeout(finishClose, 2000)
+}
+
+function finishClose() {
+  if (closeTimer) {
+    clearTimeout(closeTimer)
+    closeTimer = null
+  }
+  allowClose = true
+  closing = false
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.close()
+  else app.quit()
+}
 
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -33,6 +79,13 @@ function createWindow() {
   } else {
     mainWindow.loadFile(path.join(__dirname, '..', 'dist', 'index.html'))
   }
+
+  // 第一个 close 拦下来，等渲染层把挂起的正文落库（见文件顶部 beginGracefulClose）
+  mainWindow.on('close', (e) => {
+    if (allowClose) return
+    e.preventDefault()
+    beginGracefulClose()
+  })
 
   mainWindow.on('closed', () => {
     mainWindow = null
@@ -75,6 +128,11 @@ function createWindow() {
       }
       try {
         fs.rmSync(SMOKE_DIR, { recursive: true, force: true })
+        // 冒烟用的临时安全存储目录（见 secureKeyFile）：里面只是一个假 Key
+        fs.rmSync(path.join(os.tmpdir(), 'novel-studio-smoke-secure'), {
+          recursive: true,
+          force: true
+        })
       } catch {
         // 清理失败不影响测试结论
       }
@@ -106,6 +164,9 @@ const SSE_MOCK_PORT = 18765
 // 冒烟测试用于验证「写入保存地址」的临时目录（仅 SMOKE_TEST 模式使用）
 const SMOKE_DIR = path.join(app.getPath('temp'), 'novel-studio-smoke')
 function startSseMockServer() {
+  // /flaky 的计数器：第一次 500、之后成功。每次启动 mock 都从 0 开始，
+  // 否则同一进程里重跑第二轮测试会看到「第一次就成功」，重试路径形同虚设。
+  let flakyHits = 0
   const server = http.createServer((req, res) => {
     console.log('SSE_MOCK_REQ ' + req.method + ' ' + req.url)
     let raw = ''
@@ -183,6 +244,38 @@ function startSseMockServer() {
     } else if (req.url.includes('/error/chat/completions')) {
       res.writeHead(500, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({ error: { message: 'mock 500' } }))
+    } else if (req.url.includes('/auth/chat/completions')) {
+      // 401 + 一个假密钥：用来验证错误详情会被脱敏，且 401 不重试
+      res.setHeader('Access-Control-Allow-Origin', '*')
+      res.writeHead(401, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ error: { message: 'invalid key sk-smoke-leak-123456' } }))
+    } else if (req.url.includes('/flaky/chat/completions')) {
+      // 第一次 500，第二次成功：验证「没收到正文时自动重试」
+      res.setHeader('Access-Control-Allow-Origin', '*')
+      flakyHits += 1
+      if (flakyHits === 1) {
+        res.writeHead(500, { 'Content-Type': 'application/json', 'Retry-After': '1' })
+        res.end(JSON.stringify({ error: { message: 'mock flaky 500' } }))
+      } else {
+        sendSse('deepseek')
+      }
+    } else if (req.url.includes('/truncated/chat/completions')) {
+      // finish_reason=length：正文保留，但必须走截断分支而不是「完成」
+      res.setHeader('Access-Control-Allow-Origin', '*')
+      res.writeHead(200, { 'Content-Type': 'text/event-stream' })
+      res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: '前半段正文' } }] })}\n\n`)
+      res.write(
+        `data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: 'length' }] })}\n\n`
+      )
+      res.write('data: [DONE]\n\n')
+      res.end()
+    } else if (req.url.includes('/stream-error/chat/completions')) {
+      // HTTP 200 的流内错误块：不识别就会表现为「生成突然结束、没有提示」
+      res.setHeader('Access-Control-Allow-Origin', '*')
+      res.writeHead(200, { 'Content-Type': 'text/event-stream' })
+      res.write(`data: ${JSON.stringify({ error: { message: '余额不足（流内错误）' } })}\n\n`)
+      res.write('data: [DONE]\n\n')
+      res.end()
     } else {
       res.writeHead(404)
       res.end()
@@ -201,11 +294,46 @@ function startSseMockServer() {
 // 通过 window.electronAPI.chatCompletions() 转发到这里，用主进程 net 发起请求。
 // 服务端 SSE 行经 webContents.send('llm:delta', line) 增量回传，实现流式显示。
 // ---------------------------------------------------------------------------
-ipcMain.handle('llm:chat', async (event, { requestId, url, headers, body }) => {
+/** HTTP 状态码 → 初步错误分类；渲染层会再跑一次 classifyError 补齐文案。 */
+function llmCategoryForStatus(status) {
+  const n = Number(status) || 0
+  if (n === 401 || n === 403) return 'auth'
+  if (n === 404) return 'not-found'
+  if (n === 408) return 'timeout'
+  if (n === 429) return 'rate-limit'
+  if (n >= 500 && n <= 599) return 'server'
+  if (n >= 400 && n <= 499) return 'bad-request'
+  return ''
+}
+
+ipcMain.handle('llm:chat', async (event, { requestId, url, headers, body, idleTimeoutSec } = {}) => {
   const controller = new AbortController()
   activeRequests.set(requestId, controller)
 
   const webContents = event.sender
+  const idleSec = Math.max(0, Number(idleTimeoutSec ?? 60) || 0)
+  let idleTimer = null
+  let timedOut = false
+
+  // 空闲超时：连上了但服务端不再发数据，比直接报错更难察觉。每次读到数据重置。
+  // 0 表示关闭（极端情况下由渲染层的可靠封装兜底）。
+  const clearIdle = () => {
+    if (idleTimer) {
+      clearTimeout(idleTimer)
+      idleTimer = null
+    }
+  }
+  const armIdle = () => {
+    clearIdle()
+    if (idleSec <= 0) return
+    idleTimer = setTimeout(() => {
+      idleTimer = null
+      timedOut = true
+      controller.abort()
+    }, idleSec * 1000)
+  }
+
+  armIdle()
   try {
     const res = await net.fetch(url, {
       method: 'POST',
@@ -213,10 +341,22 @@ ipcMain.handle('llm:chat', async (event, { requestId, url, headers, body }) => {
       body: JSON.stringify(body),
       signal: controller.signal
     })
+    armIdle()
 
     if (!res.ok) {
       const text = await res.text()
-      throw new Error(`HTTP ${res.status}: ${text.slice(0, 800)}`)
+      const status = res.status
+      const retryAfter = res.headers.get('retry-after') || ''
+      clearIdle()
+      // 错误体可能回显请求头，故只发给渲染层做脱敏与展示，绝不在这里写日志。
+      webContents.send('llm:error', {
+        requestId,
+        message: `HTTP ${status}: ${String(text || '').slice(0, 800)}`,
+        status,
+        retryAfter,
+        category: llmCategoryForStatus(status)
+      })
+      return { ok: false, status }
     }
 
     // 始终以 SSE 行流处理（body.stream 恒为 true）
@@ -226,6 +366,7 @@ ipcMain.handle('llm:chat', async (event, { requestId, url, headers, body }) => {
     for (;;) {
       const { done, value } = await reader.read()
       if (done) break
+      armIdle()
       buffer += decoder.decode(value, { stream: true })
       let nl
       while ((nl = buffer.indexOf('\n')) >= 0) {
@@ -234,18 +375,37 @@ ipcMain.handle('llm:chat', async (event, { requestId, url, headers, body }) => {
         webContents.send('llm:delta', { requestId, line })
       }
     }
+    clearIdle()
     webContents.send('llm:done', requestId)
     return { ok: true }
   } catch (err) {
+    clearIdle()
     if (err.name === 'AbortError') {
+      if (timedOut) {
+        webContents.send('llm:error', {
+          requestId,
+          message: '空闲超时：服务端长时间没有返回数据',
+          category: 'timeout',
+          status: 0
+        })
+        return { ok: false, timedOut: true }
+      }
       webContents.send('llm:aborted', requestId)
       return { ok: false, aborted: true }
     }
-    const msg = String((err && err.message) || err)
-    console.log('MAIN_SEND_ERR ' + requestId + ' ' + msg)
-    webContents.send('llm:error', { requestId, message: msg })
+    const status = Number(err && (err.status || err.statusCode)) || 0
+    // 只记 requestId / 状态码。错误正文可能回显 Authorization 头，主进程日志
+    // 不打印它 —— 「API Key 不进入任何日志」这条约束在这里落实。
+    console.log('MAIN_SEND_ERR ' + requestId + ' status=' + status)
+    webContents.send('llm:error', {
+      requestId,
+      message: String((err && err.message) || err),
+      status,
+      category: status ? llmCategoryForStatus(status) : 'network'
+    })
     return { ok: false }
   } finally {
+    clearIdle()
     activeRequests.delete(requestId)
   }
 })
@@ -253,6 +413,69 @@ ipcMain.handle('llm:chat', async (event, { requestId, url, headers, body }) => {
 ipcMain.on('llm:abort', (_event, requestId) => {
   const c = activeRequests.get(requestId)
   if (c) c.abort()
+})
+
+// ---------------------------------------------------------------------------
+// API Key 安全存储（Electron safeStorage）
+//
+// 三条硬约束：
+//
+// 1. **密钥只以密文落盘**，位置是 `userData/secure/api-key.bin`，不进 IndexedDB、
+//    不进快照、不进日志。`safeStorage` 在 Windows 上用 DPAPI 加密，密钥绑定当前
+//    系统账户。
+// 2. **不可用时明确返回 unsupported**，由渲染层回退为明文存储并如实告知用户。
+//    绝不「假装加密了」—— 那比明文更危险。
+// 3. **本文件的任何日志都不含密钥、不含密文、不含解密错误正文**。IPC 返回的
+//    message 也只是一句通用描述。
+// ---------------------------------------------------------------------------
+function secureKeyFile() {
+  // 冒烟测试用临时目录：测试会写入/删除一个假 Key，绝不能碰开发者真实账户下
+  // 的那份密文（那会把用户自己的 API Key 覆盖掉）。
+  const base = process.env.SMOKE_TEST
+    ? path.join(os.tmpdir(), 'novel-studio-smoke-secure')
+    : path.join(app.getPath('userData'), 'secure')
+  return path.join(base, 'api-key.bin')
+}
+
+ipcMain.handle('secret:set', async (_event, { value } = {}) => {
+  const key = typeof value === 'string' ? value : ''
+  if (!key) return { ok: false, code: 'EINVAL', message: '密钥为空' }
+  if (!safeStorage.isEncryptionAvailable()) {
+    return { ok: false, code: 'unsupported', message: '系统安全存储不可用' }
+  }
+  try {
+    const file = secureKeyFile()
+    fs.mkdirSync(path.dirname(file), { recursive: true })
+    fs.writeFileSync(file, safeStorage.encryptString(key), { mode: 0o600 })
+    return { ok: true }
+  } catch {
+    // 不把底层错误正文带出去：它可能包含路径，也可能包含部分数据。
+    return { ok: false, code: 'EWRITE', message: '安全存储写入失败' }
+  }
+})
+
+ipcMain.handle('secret:get', async () => {
+  if (!safeStorage.isEncryptionAvailable()) {
+    return { ok: false, code: 'unsupported', message: '系统安全存储不可用' }
+  }
+  const file = secureKeyFile()
+  try {
+    if (!fs.existsSync(file)) return { ok: true, value: '' }
+    const buf = fs.readFileSync(file)
+    return { ok: true, value: safeStorage.decryptString(buf) }
+  } catch {
+    return { ok: false, code: 'EDECRYPT', message: '无法解密已保存的 API Key（可能换了系统账户）' }
+  }
+})
+
+ipcMain.handle('secret:delete', async () => {
+  try {
+    const file = secureKeyFile()
+    if (fs.existsSync(file)) fs.unlinkSync(file)
+    return { ok: true }
+  } catch {
+    return { ok: false, code: 'EDELETE', message: '删除安全存储失败' }
+  }
 })
 
 // ---------------------------------------------------------------------------
@@ -875,8 +1098,20 @@ ipcMain.handle(
   }
 )
 
+// 渲染层冲刷完毕，放行真正的关闭
+ipcMain.on('app:close-ready', () => {
+  finishClose()
+})
+
 // 长驻的监听句柄必须显式关闭：当前退出路径只有 window-all-closed，
 // 不加这一条，服务开着时退出会留下一个没人在管的端口。
-app.on('before-quit', () => {
+//
+// 同时把「退出」也接进保存握手：Alt+F4、系统关机只触发 before-quit，
+// 不经过窗口的 close 事件。第一次先拦下来，冲刷完再由 finishClose 放行。
+app.on('before-quit', (e) => {
   stopSyncServer()
+  if (!allowClose) {
+    e.preventDefault()
+    beginGracefulClose()
+  }
 })

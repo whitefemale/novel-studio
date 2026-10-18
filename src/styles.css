@@ -16,6 +16,8 @@
   --danger: #e5484d;
   --danger-soft: #fdeeec;
   --success: #30a46c;
+  --warn: #b7791f;
+  --warn-soft: #fff8e6;
   --radius: 12px;
   --radius-sm: 8px;
   --shadow-sm: 0 1px 2px rgba(16, 24, 40, 0.04);
@@ -96,6 +98,22 @@ select {
   font-size: inherit;
   color: var(--text);
   outline: none;
+}
+
+/*
+ * 键盘焦点必须看得见。上面的 `outline: none` 是为鼠标点击去掉浏览器默认描边；
+ * 只对 :focus-visible 重新给出描边，键鼠两种操作都能接受。
+ * 这里的选择器带元素名 + 伪类，刻意高于 `input { outline: none }` 的优先级。
+ */
+button:focus-visible,
+a:focus-visible,
+summary:focus-visible,
+[tabindex]:focus-visible,
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 
 /* ---------- 按钮 ---------- */

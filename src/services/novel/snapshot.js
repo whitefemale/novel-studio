@@ -1,5 +1,8 @@
-import * as db from '../storage'
-import { SCHEMA_VERSION } from '../migration'
+// 显式带 .js：Node 内置测试按原生 ESM 加载这些模块，扩展名省略只有 Vite 能解析。
+import * as db from '../storage.js'
+import { SCHEMA_VERSION } from '../migration.js'
+import { genId } from '../ids.js'
+import { APP_VERSION } from '../../version.js'
 
 /**
  * 全量快照：整库导出成一个 .json，以及从 .json 合并回来。
@@ -31,8 +34,17 @@ export const SNAPSHOT_FORMAT = 'novel-studio-snapshot'
  */
 export const SNAPSHOT_VERSION = 1
 
-/** 快照里逐书保存的集合。与 storage.COLLECTIONS 同源，只是排除了 tombstones（单独处理）。 */
-const DATA_COLLECTIONS = db.COLLECTIONS.filter((n) => n !== 'tombstones')
+/**
+ * 快照里逐书保存的集合。与 storage.COLLECTIONS 同源，排除两类：
+ *
+ * - `tombstones`：单独处理（删除语义与普通记录不同）；
+ * - `generationTasks`：生成任务/流式草稿是**设备本地**状态。把「这台电脑上
+ *   正在进行的一次调用」同步到手机上没有任何意义，草稿还可能带着几万字正文，
+ *   白白撑大每次同步与备份。崩溃恢复只在本机做。
+ */
+const DATA_COLLECTIONS = db.COLLECTIONS.filter(
+  (n) => n !== 'tombstones' && n !== 'generationTasks'
+)
 
 /** 空快照。恢复的目标结构，也是合并的零元。 */
 export function emptySnapshot(exportedAt = 0) {
@@ -47,19 +59,120 @@ export function emptySnapshot(exportedAt = 0) {
   }
 }
 
+// ---------------- 校验和（纯函数） ----------------
+
+/**
+ * 稳定序列化：对象键递归排序后再 JSON.stringify。
+ *
+ * 不能直接对对象 JSON.stringify：同一份数据经过不同的组装路径（读库、合并、
+ * 解析文件）时键顺序可能不同，校验和会因此变成「文件刚导出就校验失败」。
+ * 数组保持原序 —— 顺序本身就是数据的一部分。
+ */
+export function stableStringify(value) {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value)
+  if (Array.isArray(value)) return '[' + value.map(stableStringify).join(',') + ']'
+  const keys = Object.keys(value).sort()
+  return '{' + keys.map((k) => JSON.stringify(k) + ':' + stableStringify(value[k])).join(',') + '}'
+}
+
+/** FNV-1a 32 位。同步、无依赖、跨平台一致；用于发现截断/手改，不做安全用途。 */
+export function fnv1a32(str) {
+  let h = 0x811c9dc5
+  const s = String(str)
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i)
+    h = Math.imul(h, 0x01000193)
+  }
+  return (h >>> 0).toString(16).padStart(8, '0')
+}
+
+/**
+ * 快照内容校验和。
+ *
+ * 只覆盖**数据本体**（books / data / bookTombstones），不覆盖 exportedAt 与
+ * appVersion 这类头字段：它们是否变化与内容是否损坏无关，纳入进去会让
+ * 「同一份数据换个导出时间」也校验失败。
+ */
+export function snapshotChecksum(snap) {
+  return fnv1a32(
+    stableStringify({
+      books: snap?.books || [],
+      data: snap?.data || {},
+      bookTombstones: snap?.bookTombstones || []
+    })
+  )
+}
+
+/** 快照内容计数。用于确认框里让用户看懂「这个文件里到底有多少东西」。 */
+export function snapshotCounts(snap) {
+  const collections = {}
+  let chapters = 0
+  let outlines = 0
+  let records = 0
+  for (const sets of Object.values(snap?.data || {})) {
+    chapters += (sets?.chapters || []).length
+    outlines += (sets?.outlines || []).length
+    for (const name of DATA_COLLECTIONS) {
+      const n = (sets?.[name] || []).length
+      if (n) collections[name] = (collections[name] || 0) + n
+      records += n
+    }
+    records += (sets?.tombstones || []).length
+  }
+  return {
+    books: (snap?.books || []).length,
+    chapters,
+    outlines,
+    collections,
+    records,
+    tombstones:
+      (snap?.bookTombstones || []).length +
+      Object.values(snap?.data || {}).reduce((n, s) => n + (s?.tombstones || []).length, 0)
+  }
+}
+
+/**
+ * 给快照补齐版本/计数/校验和。
+ *
+ * 头部字段全部**可选**：SNAPSHOT_VERSION 保持 1，旧版本软件读到多出来的字段
+ * 会直接忽略，新软件读到没有 checksum 的旧备份则跳过校验（只提示）。
+ */
+export function finalizeSnapshot(snap) {
+  const out = {
+    ...emptySnapshot(Number(snap?.exportedAt) || 0),
+    ...snap,
+    format: SNAPSHOT_FORMAT,
+    version: Number(snap?.version) || SNAPSHOT_VERSION
+  }
+  out.appVersion = snap?.appVersion || APP_VERSION
+  // 设备标识是同步冲突检测的「谁改的」那一半。它是**可选头字段**：
+  // 旧备份没有它照样能恢复；旧软件读到它直接忽略。校验和不覆盖头字段。
+  out.deviceId = typeof snap?.deviceId === 'string' ? snap.deviceId : ''
+  out.counts = snapshotCounts(out)
+  out.checksum = snapshotChecksum(out)
+  return out
+}
+
 /** 纯组装。I/O 由 collectSnapshot 负责，这里只为可确定性单测。 */
 export function buildSnapshot(
-  { books = [], data = {}, bookTombstones = [] } = {},
+  { books = [], data = {}, bookTombstones = [], appVersion = APP_VERSION, deviceId = '' } = {},
   exportedAt = Date.now()
 ) {
   const out = emptySnapshot(exportedAt)
+  out.appVersion = appVersion
+  out.deviceId = deviceId
   out.books = [...books]
   out.data = {}
+  // 新集合自动进快照，但 generationTasks / tombstones 除外（见 DATA_COLLECTIONS）
   for (const [bookId, sets] of Object.entries(data)) {
-    out.data[bookId] = { tombstones: [], ...sets }
+    const clean = {}
+    for (const [name, list] of Object.entries(sets || {})) {
+      if (name !== 'generationTasks') clean[name] = list
+    }
+    out.data[bookId] = { tombstones: [], ...clean }
   }
   out.bookTombstones = [...bookTombstones]
-  return out
+  return finalizeSnapshot(out)
 }
 
 // ---------------- 合并（纯函数） ----------------
@@ -155,7 +268,12 @@ export function mergeSnapshot(local, remote) {
     }
     out.data[bookId] = merged
   }
-  return out
+  // 合并结果代表「本机的数据」，所以它带上本机的 deviceId；对端拿到后
+  // 就知道这条基线属于谁。
+  out.deviceId = a.deviceId || b.deviceId || ''
+  // 合并结果也补齐头字段：它会被同步响应原样发给对端，也会作为「恢复后」
+  // 快照参与下一轮 diff。没有 checksum 的文件不能算一份合格的快照。
+  return finalizeSnapshot(out)
 }
 
 // ---------------- 只读统计（纯函数） ----------------
@@ -245,15 +363,39 @@ export function normalizeSnapshot(obj) {
       `备份文件的版本（v${obj.version}）高于当前软件支持的版本（v${SNAPSHOT_VERSION}），请先升级软件。`
     )
   }
-  return {
+  const schemaVersion = Number(obj.schemaVersion) || 0
+  // 备份允许来自更老的 schema（新字段全部可选），但拒绝更高版本：
+  // 让旧软件去「半懂不懂」地合并新字段，正是静默丢数据的来源。
+  if (schemaVersion > SCHEMA_VERSION) {
+    throw new Error(
+      `备份文件的数据版本（v${schemaVersion}）高于当前软件支持的版本（v${SCHEMA_VERSION}），请先升级软件。`
+    )
+  }
+  const snap = {
     format: SNAPSHOT_FORMAT,
     version: Number(obj.version) || 1,
-    schemaVersion: Number(obj.schemaVersion) || 0,
+    schemaVersion,
     exportedAt: Number(obj.exportedAt) || 0,
+    appVersion: typeof obj.appVersion === 'string' ? obj.appVersion : '',
+    deviceId: typeof obj.deviceId === 'string' ? obj.deviceId : '',
+    counts: obj.counts && typeof obj.counts === 'object' ? obj.counts : null,
+    checksum: typeof obj.checksum === 'string' ? obj.checksum : '',
     books: Array.isArray(obj.books) ? obj.books : [],
     data: obj.data && typeof obj.data === 'object' ? obj.data : {},
     bookTombstones: Array.isArray(obj.bookTombstones) ? obj.bookTombstones : []
   }
+  // 没有 checksum 的是旧版本软件导出的备份，照常接受；有的必须通过校验。
+  // 这一条挡的是「文件被截断/手改/网盘同步冲突」——它们往往仍是合法 JSON，
+  // 只在恢复时才发现少了一半章节，那时已经写进库了。
+  if (snap.checksum) {
+    const actual = snapshotChecksum(snap)
+    if (actual !== String(snap.checksum).toLowerCase()) {
+      throw new Error(
+        '备份文件校验失败：内容与导出时不一致（可能被截断、被修改，或复制过程出错）。为避免写入损坏数据，本次未做任何改动。'
+      )
+    }
+  }
+  return snap
 }
 
 /** 解析用户选的文件。 */
@@ -265,6 +407,104 @@ export function parseSnapshotJson(text) {
     throw new Error('这个文件不是有效的 JSON。请选择由本软件「全量备份」导出的 .json 文件。')
   }
   return normalizeSnapshot(obj)
+}
+
+// ---------------- 作为副本导入 ----------------
+
+/** 可能指向本书记录 id 的字段。导入时必须一起重映射，否则副本内部的关联会断。 */
+const REF_FIELDS = [
+  'arcId',
+  'volumeId',
+  'chapterId',
+  'firstChapterId',
+  'expectedRevealChapterId',
+  'sourceChapterId',
+  'lastUpdatedChapterId',
+  'entityId',
+  'generationRunId',
+  'reportRunId',
+  'chapterVersionId'
+]
+const REF_ARRAY_FIELDS = ['characterIds', 'locationIds', 'factionIds', 'threadIds']
+
+const cloneJson = (v) => JSON.parse(JSON.stringify(v))
+
+/**
+ * 把一份快照克隆成「全新的书」：每本书、每条记录都换新 id，内部引用一起重映射，
+ * 书名追加「（导入副本）」。
+ *
+ * 这是恢复时「作为副本导入」选项的实现。它解决的是合并模式解决不了的场景：
+ * 用户只想看看旧备份里那一版写了什么，并不想让它和当前正文比较时间戳。
+ * 合并模式在同 id 时必有一方胜出，而副本模式**不产生任何同名记录**，两本
+ * 书并存、互不覆盖。
+ *
+ * 墓碑不复制：副本是新书，复制墓碑等于新书一出生就被判死。
+ *
+ * `newId` 可注入，单元测试用它得到确定性结果；生产环境默认 genId。
+ */
+export function cloneSnapshotAsNewBooks(snap, { newId = genId, now = Date.now() } = {}) {
+  const src = normalizeSnapshot(snap)
+  const out = emptySnapshot(now)
+  out.schemaVersion = src.schemaVersion
+  out.books = []
+  out.data = {}
+  out.bookTombstones = []
+
+  // 第一遍：为**所有**记录分配新 id，才能正确处理跨集合引用
+  // （章节 → 篇、事件 → 章节、版本 → 章节、审阅项 → 实体）。
+  const idMap = new Map()
+  const bookMap = new Map()
+  const takeId = (old) => {
+    if (old == null || old === '') return old
+    if (!idMap.has(old)) idMap.set(old, newId())
+    return idMap.get(old)
+  }
+  for (const book of src.books || []) {
+    if (!book || !book.id) continue
+    bookMap.set(book.id, takeId(book.id))
+    const sets = src.data?.[book.id] || {}
+    for (const rec of sets.chapters || []) if (rec?.id) takeId(rec.id)
+    for (const rec of sets.outlines || []) if (rec?.id) takeId(rec.id)
+    for (const name of DATA_COLLECTIONS) {
+      for (const rec of sets[name] || []) if (rec?.id) takeId(rec.id)
+    }
+  }
+
+  const remapRecord = (rec, bookId) => {
+    const copy = cloneJson(rec)
+    copy.id = takeId(rec.id)
+    copy.bookId = bookId
+    for (const f of REF_FIELDS) {
+      if (typeof copy[f] === 'string' && idMap.has(copy[f])) copy[f] = idMap.get(copy[f])
+    }
+    for (const f of REF_ARRAY_FIELDS) {
+      if (Array.isArray(copy[f])) copy[f] = copy[f].map((x) => idMap.get(x) || x)
+    }
+    if (Array.isArray(copy.migratedTo)) {
+      copy.migratedTo = copy.migratedTo.map((x) => idMap.get(x) || x)
+    }
+    return copy
+  }
+
+  // 第二遍：真正克隆
+  for (const book of src.books || []) {
+    if (!book || !book.id) continue
+    const newBookId = bookMap.get(book.id)
+    const sets = src.data?.[book.id] || {}
+    const bookCopy = cloneJson(book)
+    bookCopy.id = newBookId
+    bookCopy.title = `${book.title || '未命名小说'}（导入副本）`
+    bookCopy.createdAt = now
+    bookCopy.updatedAt = now
+    out.books.push(bookCopy)
+
+    const dataCopy = { tombstones: [] }
+    for (const name of ['chapters', 'outlines', ...DATA_COLLECTIONS]) {
+      dataCopy[name] = (sets[name] || []).filter((r) => r && r.id).map((r) => remapRecord(r, newBookId))
+    }
+    out.data[newBookId] = dataCopy
+  }
+  return finalizeSnapshot(out)
 }
 
 // ---------------- I/O ----------------
@@ -290,7 +530,7 @@ export async function collectSnapshot() {
     for (const name of DATA_COLLECTIONS) sets[name] = await db.coll[name].getAll(bookId)
     data[bookId] = sets
   }
-  return buildSnapshot({ books, data, bookTombstones })
+  return buildSnapshot({ books, data, bookTombstones, deviceId: await db.getDeviceId() })
 }
 
 /**
@@ -307,27 +547,54 @@ export async function applySnapshot(remote, { now = Date.now() } = {}) {
   const before = await collectSnapshot()
   const after = mergeSnapshot(before, remote)
 
-  const keep = new Set(after.books.map((b) => b.id))
-  const beforeIds = new Set(before.books.map((b) => b.id))
-  for (const id of beforeIds) {
-    if (!keep.has(id)) await db.deleteBook(id)
-  }
-  await db.saveBooks(after.books)
-
-  for (const [bookId, sets] of Object.entries(after.data)) {
-    if (!keep.has(bookId)) continue
-    await db.saveChapters(bookId, sets.chapters || [])
-    await db.saveOutlines(bookId, sets.outlines || [])
-    for (const name of DATA_COLLECTIONS) {
-      await db.coll[name].saveAll(bookId, sets[name] || [])
+  try {
+    const keep = new Set(after.books.map((b) => b.id))
+    const beforeIds = new Set(before.books.map((b) => b.id))
+    for (const id of beforeIds) {
+      if (!keep.has(id)) await db.deleteBook(id)
     }
-    await db.coll.tombstones.saveAll(bookId, sets.tombstones || [])
-  }
+    await db.saveBooks(after.books)
 
-  const meta = await db.getMeta()
-  await db.saveMeta({ ...(meta || {}), schemaVersion: SCHEMA_VERSION, updatedAt: now })
+    for (const [bookId, sets] of Object.entries(after.data)) {
+      if (!keep.has(bookId)) continue
+      await db.saveChapters(bookId, sets.chapters || [])
+      await db.saveOutlines(bookId, sets.outlines || [])
+      for (const name of DATA_COLLECTIONS) {
+        await db.coll[name].saveAll(bookId, sets[name] || [])
+      }
+      await db.coll.tombstones.saveAll(bookId, sets.tombstones || [])
+    }
+
+    const meta = await db.getMeta()
+    await db.saveMeta({ ...(meta || {}), schemaVersion: SCHEMA_VERSION, updatedAt: now })
+  } catch (err) {
+    // 写回是逐键进行的，IndexedDB 没有跨键事务。空间不足时**可能已经写了一部分**，
+    // 所以这里绝不能对用户说「原数据未改动」——那是谎话，会让人放心地不再检查。
+    // 调用方（BackupModal / 同步）已经在写库之前存了恢复前快照（见 preRestoreSnapshot）。
+    const quota = isQuotaError(err)
+    const wrapped = new Error(
+      quota
+        ? '存储空间不足，恢复没有完成。部分数据可能已经被写入；恢复前的快照已自动保留，请先导出备份、清理磁盘空间后再试。'
+        : `恢复没有完成：${err?.message || err}`
+    )
+    wrapped.code = quota ? 'EQUOTA' : 'EAPPLYSNAPSHOT'
+    wrapped.cause = err
+    wrapped.partial = true
+    throw wrapped
+  }
 
   return { stats: diffSnapshots(before, after), before, after }
+}
+
+/** 判断 IndexedDB 的空间不足错误。各浏览器给的名字/码不一致，两种都认。 */
+export function isQuotaError(err) {
+  if (!err) return false
+  return (
+    err.name === 'QuotaExceededError' ||
+    err.name === 'NS_ERROR_DOM_QUOTA_REACHED' ||
+    err.code === 22 ||
+    err.code === 1014
+  )
 }
 
 /** 备份文件名：`NovelStudio-全量备份-YYYYMMDD-HHmm.json` */

@@ -3,9 +3,11 @@ import { ref, computed } from 'vue'
 import { useBooks } from '../store/books'
 import { useCollections } from '../store/novel'
 import { useSettings } from '../store/settings'
-import { buildContext } from '../services/novel/contextBuilder'
+import { buildContext, PROMPT_VERSION } from '../services/novel/contextBuilder'
 import { messagesFromContext } from '../services/prompts'
 import { ACTIONS } from '../services/novel/actions'
+import { copyToClipboard } from '../services/native'
+import { toast } from '../store/toast'
 
 /**
  * 上下文预览：把「这一章 AI 实际会看到什么」摊开给用户看。
@@ -48,6 +50,24 @@ const fullText = computed(() => {
 })
 
 const layerLabel = (id) => layers.value.find((l) => l.id === id)?.label || id
+
+/** 条目明细里被标了「冲突」的那些（同名记录并存） */
+const conflicts = computed(() =>
+  layers.value.flatMap((l) =>
+    (l.itemsDetail || [])
+      .filter((it) => it.conflict)
+      .map((it) => ({ layer: l.label, ...it }))
+  )
+)
+
+async function copyPrompt() {
+  try {
+    await copyToClipboard(fullText.value)
+    toast('已复制完整提示词', 'success')
+  } catch {
+    toast('复制失败，请展开全文后手动选择', 'error')
+  }
+}
 </script>
 
 <template>
@@ -62,7 +82,10 @@ const layerLabel = (id) => layers.value.find((l) => l.id === id)?.label || id
     <p class="ctx-hint">
       这是「{{ currentChapter?.title || '未选中章节' }}」在
       <b>{{ ACTIONS.find((a) => a.key === action)?.label }}</b> 模式下实际会发给 AI 的内容。
-      预算 {{ ctx.metadata.budget }} tokens，本次用掉 <b>{{ ctx.metadata.totalTokens }}</b>。
+      可用预算 <b>{{ ctx.metadata.budget }}</b> tokens（设置 {{ ctx.metadata.budgetBase }} − 输出预留
+      {{ ctx.metadata.outputReserve }} − 安全余量 {{ ctx.metadata.margin }}），
+      本次用掉 <b>{{ ctx.metadata.totalTokens }}</b>。
+      提示词版本 <code>{{ ctx.metadata.promptVersion || PROMPT_VERSION }}</code>。
       <span v-if="ctx.metadata.overBudget" class="ctx-warn">
         超出预算：必带的层不会被截断，因此总量可能高于预算。
       </span>
@@ -71,6 +94,11 @@ const layerLabel = (id) => layers.value.find((l) => l.id === id)?.label || id
     <div v-if="dropped.length" class="ctx-drop">
       因预算不足被丢弃：{{ dropped.map(layerLabel).join('、') }} ——
       这些内容这次**没有**告诉 AI，写出来对不上是正常的。
+    </div>
+
+    <div v-if="conflicts.length" class="ctx-drop">
+      同名记录冲突（未合并，已同时注入并标注）：
+      {{ conflicts.map((c) => `${c.layer}·${c.name}`).join('、') }}
     </div>
 
     <table class="ctx-table">
@@ -96,9 +124,12 @@ const layerLabel = (id) => layers.value.find((l) => l.id === id)?.label || id
       </tbody>
     </table>
 
-    <button class="btn ghost sm ctx-toggle" @click="showFull = !showFull">
-      {{ showFull ? '▾ 收起全文' : '▸ 查看最终提示词全文' }}
-    </button>
+    <div class="ctx-ops">
+      <button class="btn ghost sm" @click="showFull = !showFull">
+        {{ showFull ? '▾ 收起全文' : '▸ 查看最终提示词全文' }}
+      </button>
+      <button class="btn ghost sm" @click="copyPrompt">复制提示词</button>
+    </div>
     <pre v-if="showFull" class="ctx-full">{{ fullText }}</pre>
   </div>
 </template>
@@ -171,7 +202,10 @@ const layerLabel = (id) => layers.value.find((l) => l.id === id)?.label || id
   background: var(--danger-soft);
   color: var(--danger);
 }
-.ctx-toggle {
+.ctx-ops {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
   align-self: flex-start;
 }
 .ctx-full {

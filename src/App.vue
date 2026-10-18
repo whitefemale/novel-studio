@@ -5,15 +5,17 @@ import { useSettings } from './store/settings'
 import { toasts } from './store/toast'
 import { useCollections } from './store/novel'
 import { useGeneration } from './store/generation'
-import { initNativeUI, registerBackButton } from './services/native'
+import { initNativeUI, registerBackButton, registerAppStateChange } from './services/native'
 import { startAutoBackup, stopAutoBackup } from './services/backup'
 import { isDesktop } from './services/platform'
 import { setUiHooks, startSyncServer } from './services/sync'
+import { ensureSchemaVersion } from './services/migration'
 import BookShelf from './components/BookShelf.vue'
 import WritingView from './components/WritingView.vue'
 import SettingsPanel from './components/SettingsPanel.vue'
 import ExportModal from './components/ExportModal.vue'
 import NovelConsole from './components/NovelConsole.vue'
+import SearchModal from './components/SearchModal.vue'
 
 const { store, init, openBook, closeBook } = useBooks()
 const { load, settings } = useSettings()
@@ -24,12 +26,77 @@ const view = ref('shelf') // 'shelf' | 'writing'
 const showSettings = ref(false)
 const showExport = ref(false)
 const showConsole = ref(false)
+const showSearch = ref(false)
+// 控制台打开时落在哪个标签。搜索里点中一个实体时传它的集合名，
+// 平时从顶栏打开则固定回「剧情」——不记住上一次看过的标签是刻意的：
+// 用户点「控制台」的意图通常是查主线，而不是接着看上次的生成历史。
+const consoleTab = ref('story')
 const writingRef = ref(null)
+
+/**
+ * 把编辑器防抖窗口里的正文立即落库。
+ *
+ * 即发即忘：页面正在离开时没有地方 await；storage 的写队列会在后台把它走完，
+ * 而 persistChapter 在第一个 await 前已经捕获了目标 id（见 autosave.js）。
+ */
+function flushEditor() {
+  try {
+    const p = writingRef.value?.flush()
+    if (p && typeof p.catch === 'function') p.catch(() => {})
+  } catch {
+    // 离开路径上不能抛
+  }
+}
+
+function onVisibilityChange() {
+  if (document.visibilityState === 'hidden') flushEditor()
+}
+
+function onPageHide() {
+  flushEditor()
+}
+
+function onBeforeUnload() {
+  flushEditor()
+}
+
+function onWindowBlur() {
+  if (view.value === 'writing') flushEditor()
+}
 
 onMounted(async () => {
   await Promise.all([init(), load()])
+  // 只记录版本标记，不改写任何笔记/设定（V1→V2 的内容迁移仍由用户手动触发）。
+  // 冒烟测试与真实用户都会走到这里，meta 因此不再依赖某个功能被打开过。
+  await ensureSchemaVersion()
   initNativeUI()
   registerBackButton(handleBack)
+  registerAppStateChange((active) => {
+    if (!active) flushEditor()
+  })
+  // 页面生命周期兜底：切后台、关页、失焦时把防抖窗口里的正文落库。
+  // visibilitychange 是移动端最可靠的一路；pagehide 覆盖前进/后退缓存；
+  // blur 覆盖桌面端切到别的窗口。
+  document.addEventListener('visibilitychange', onVisibilityChange)
+  window.addEventListener('pagehide', onPageHide)
+  window.addEventListener('beforeunload', onBeforeUnload)
+  window.addEventListener('blur', onWindowBlur)
+  // Electron 关窗前主进程会发一次 app:before-close，等渲染层冲刷完再放行。
+  // 没有这一条，点右上角 ✕ 时最后 1.5 秒内的输入会丢。
+  if (isDesktop() && window.electronAPI?.onBeforeClose) {
+    window.electronAPI.onBeforeClose(async () => {
+      try {
+        await writingRef.value?.flush()
+      } catch {
+        // 保存失败时仍然放行关闭：主进程有 2 秒兜底，且编辑器里已有失败提示
+      }
+      try {
+        await window.electronAPI.closeReady()
+      } catch {
+        // 窗口可能已经被关掉了
+      }
+    })
+  }
   // 同步层要能冲刷编辑器、并在合并后让编辑器重读正文。钩子在这里注入而不是
   // 让 sync.js 去 import 组件 —— 那条反向依赖会把服务层和界面绑死。
   setUiHooks({
@@ -41,8 +108,14 @@ onMounted(async () => {
   if (isDesktop() && settings.syncAutoStart) startSyncServer(settings.syncPort)
 })
 
-// 定时器只在 App 这一层启停；组件里裸跑 setInterval 会在热更新时叠层
-onBeforeUnmount(stopAutoBackup)
+// 定时器与生命周期监听只在 App 这一层启停；组件里裸跑 setInterval 会在热更新时叠层
+onBeforeUnmount(() => {
+  stopAutoBackup()
+  document.removeEventListener('visibilitychange', onVisibilityChange)
+  window.removeEventListener('pagehide', onPageHide)
+  window.removeEventListener('beforeunload', onBeforeUnload)
+  window.removeEventListener('blur', onWindowBlur)
+})
 
 function handleOpenBook(id) {
   openBook(id)
@@ -77,6 +150,10 @@ function openExport() {
  * 而眼前这一层纹丝不动 —— 表现为「返回键坏了」。
  */
 function handleBack() {
+  if (showSearch.value) {
+    showSearch.value = false
+    return true
+  }
   if (showConsole.value) {
     showConsole.value = false
     return true
@@ -100,7 +177,29 @@ function handleBack() {
 /** 控制台需要一个已打开的书才有意义（迁移、记忆、生成记录都是按书隔离的） */
 function openConsole() {
   if (!store.bookId) return
+  consoleTab.value = 'story'
   showConsole.value = true
+}
+
+/** 搜索里点中一个结构化实体：直接落到它的集合标签 */
+function openConsoleAt(collection) {
+  if (!store.bookId) return
+  showSearch.value = false
+  consoleTab.value = collection || 'story'
+  showConsole.value = true
+}
+
+function openSearch() {
+  if (!store.bookId) return
+  showSearch.value = true
+}
+
+/**
+ * 控制台里改了正文（接受 AI 修订、把旧版复制为草稿）之后，让编辑器重读 store。
+ * 编辑器只在 chapterId 变化时同步正文，同章内被外部改写它一概不理会。
+ */
+function reloadEditorAfterConsole() {
+  writingRef.value?.reloadEditor()
 }
 
 /**
@@ -144,6 +243,7 @@ watch(
       <button class="btn ghost sm" @click="showSettings = true">⚙ 设置</button>
 
       <template v-if="view === 'writing'">
+        <button class="btn sm" @click="openSearch">搜索</button>
         <button class="btn sm" @click="openConsole">控制台</button>
         <button class="btn sm" @click="openExport">导出</button>
         <button class="btn sm" @click="handleBackToShelf">返回书库</button>
@@ -162,7 +262,19 @@ watch(
     <ExportModal v-if="showExport" @close="showExport = false" />
 
     <!-- 小说控制台（V2 记忆层与剧情骨架） -->
-    <NovelConsole v-if="showConsole" @close="showConsole = false" />
+    <NovelConsole
+      v-if="showConsole"
+      :initial-tab="consoleTab"
+      @close="showConsole = false"
+      @content-changed="reloadEditorAfterConsole"
+    />
+
+    <!-- 全书搜索（当前书的正文 / 设定 / 结构化实体） -->
+    <SearchModal
+      v-if="showSearch"
+      @close="showSearch = false"
+      @open-console="openConsoleAt"
+    />
 
     <!-- Toast -->
     <div class="toast-wrap">

@@ -1,9 +1,12 @@
 <script setup>
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, watch } from 'vue'
 import { useSettings } from '../store/settings'
+import { useBooks } from '../store/books'
+import { coll } from '../services/storage'
 import { isDesktop } from '../services/platform'
 import { copyToClipboard } from '../services/native'
 import { toast } from '../store/toast'
+import { isConflictStale } from '../services/sync/conflicts'
 import {
   startSyncServer,
   stopSyncServer,
@@ -26,22 +29,78 @@ import {
  * 它放在 SettingsPanel 的 `v-if="desktop"` **之外** —— 同步在两端的设置里都要能配。
  */
 const { settings } = useSettings()
+const { store, selectChapter } = useBooks()
 const desktop = isDesktop()
 
 const st = ref({ running: false, port: 0, code: '', addresses: [], last: null })
 const busy = ref(false)
 const testResult = ref(null)
 const pushResult = ref(null)
+const conflictRows = ref([])
 
 const addresses = computed(() => st.value.addresses || [])
+
+const openConflicts = computed(() => conflictRows.value.filter((r) => r.status === 'open'))
 
 async function refresh() {
   st.value = await syncStatus()
 }
 
+/**
+ * 冲突记录随快照同步，所以两台设备都会收到同一批。这里只展示**当前这本书**
+ * 的记录——在 A 书的设置页里看到 B 书的冲突，用户点「打开」会跳到一本他
+ * 根本没在看的书，那比不显示更糟。
+ */
+async function loadConflicts() {
+  if (!store.bookId) {
+    conflictRows.value = []
+    return
+  }
+  const all = await coll.syncConflicts.getAll(store.bookId)
+  conflictRows.value = [...all].sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))
+}
+
+function conflictStale(row) {
+  return isConflictStale(row, store.chapters)
+}
+
+function chapterTitle(id) {
+  return store.chapters.find((c) => c.id === id)?.title || '（章节已不存在）'
+}
+
+function openChapter(id) {
+  if (store.chapters.some((c) => c.id === id)) {
+    selectChapter(id)
+    toast('已切换到该章节', 'success')
+  } else {
+    toast('这一章已经不存在了', 'error')
+  }
+}
+
+async function resolveConflict(row) {
+  if (!store.bookId) return
+  await coll.syncConflicts.upsert(store.bookId, {
+    ...row,
+    status: 'resolved',
+    resolvedAt: Date.now(),
+    updatedAt: Date.now()
+  })
+  await loadConflicts()
+  toast('已标记为已解决（冲突副本仍保留在章节列表里）', 'success')
+}
+
 onMounted(async () => {
   if (desktop) await refresh()
+  await loadConflicts()
 })
+
+watch(() => store.bookId, loadConflicts)
+// 同步完成后刷新冲突列表。lastIncoming / lastOutgoing 是同步服务写入的状态，
+// 它们变化就说明这一轮往返已经落了库。
+watch(
+  () => [syncState.lastIncoming, syncState.lastOutgoing],
+  () => loadConflicts()
+)
 
 async function toggleServer() {
   if (busy.value) return
@@ -124,6 +183,32 @@ function when(ts) {
       <b>不经过任何第三方服务器</b>，也<b>不包含 API Key</b>。
     </p>
 
+    <!-- ---------------- 冲突（两端都显示） ---------------- -->
+    <div v-if="openConflicts.length" class="sync-conflicts">
+      <h5>待处理冲突 {{ openConflicts.length }} 条</h5>
+      <p class="hint">
+        同一章在两台设备上都被改过。同步不会替你选一个：主章保留电脑上的版本，
+        另一版本以「【冲突副本】」另存为一章，两边的正文都在。
+      </p>
+      <div v-for="row in openConflicts" :key="row.id" class="sync-conflict">
+        <div class="sync-conflict-title">{{ row.chapterTitle || chapterTitle(row.chapterId) }}</div>
+        <div class="hint">
+          主章：{{ chapterTitle(row.chapterId) }} · 副本：{{ chapterTitle(row.copyChapterId) }}
+        </div>
+        <div v-if="conflictStale(row)" class="hint warn">
+          这条冲突解决之后，主章或副本又被改过，请重新对照一下再标记。
+        </div>
+        <div class="sync-row">
+          <button class="btn sm" @click="openChapter(row.chapterId)">打开主章</button>
+          <button class="btn sm" @click="openChapter(row.copyChapterId)">打开冲突副本</button>
+          <button class="btn sm primary" @click="resolveConflict(row)">标记已解决</button>
+        </div>
+      </div>
+    </div>
+    <p v-else-if="conflictRows.length" class="hint ok">
+      同步冲突已全部处理（共 {{ conflictRows.length }} 条记录）。
+    </p>
+
     <!-- ---------------- 电脑端：服务端 ---------------- -->
     <template v-if="desktop">
       <div class="sync-row">
@@ -152,6 +237,17 @@ function when(ts) {
         <input v-model="settings.syncAutoStart" type="checkbox" />
         下次启动软件时自动开启（否则每次都要手动点一下）
       </label>
+
+      <div style="height: 8px"></div>
+      <label class="check">
+        <input v-model="settings.syncConflictCopies" type="checkbox" />
+        同章冲突时保留远端副本（推荐）
+      </label>
+      <p class="hint">
+        开启后，同一章在两端都改过时不会覆盖任何一边：主章保留本机版本，
+        远端版本另存为「【冲突副本】」，并在上方列出待处理冲突。
+        关闭它意味着同章冲突按「后改的赢」处理，被覆盖的正文将无法找回。
+      </p>
 
       <template v-if="st.running">
         <div style="height: 14px"></div>
@@ -319,6 +415,30 @@ function when(ts) {
   margin-top: 12px;
   font-size: 12px;
   color: var(--text-2);
+}
+.sync-conflicts {
+  margin-top: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px;
+  background: var(--bg-muted);
+}
+.sync-conflicts h5 {
+  margin: 0 0 6px;
+  font-size: 13px;
+  color: var(--danger);
+}
+.sync-conflict {
+  border-top: 1px solid var(--border);
+  padding-top: 10px;
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.sync-conflict-title {
+  font-size: 13px;
+  font-weight: 600;
 }
 .check {
   display: flex;

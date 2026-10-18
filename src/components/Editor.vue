@@ -6,6 +6,7 @@ import { toast } from '../store/toast'
 import { createAutosaver } from '../services/autosave'
 import { countWords } from '../services/wordCount'
 import ChapterVersions from './ChapterVersions.vue'
+import ChapterCardModal from './ChapterCardModal.vue'
 
 const emit = defineEmits(['selection-change'])
 const { store, currentChapter, setChapterContent, persistChapter, captureChapterVersion } =
@@ -14,8 +15,13 @@ const { store, currentChapter, setChapterContent, persistChapter, captureChapter
 const text = ref('')
 const preview = ref(false)
 const verOpen = ref(false)
+const cardOpen = ref(false)
 const ta = ref(null)
-const saved = ref(true)
+// 保存状态机。声明必须排在 saver 与下面的 immediate watcher 之前 —— setup 自上而下
+// 执行，回调里若命中尚未初始化的 const 会抛 TDZ 的 ReferenceError，而 Vue 会把它
+// 吞掉（见 CLAUDE.md 坑 #14，正是这个文件踩过的）。
+const saveState = ref('saved') // idle | dirty | saving | saved | failed
+const saveError = ref('')
 let lastSel = { start: 0, end: 0 }
 
 // 查找/替换的状态必须在下面的 watch 之前声明：那个 watcher 是 immediate 的，
@@ -37,7 +43,18 @@ const saver = createAutosaver({
   persist: (id) => persistChapter(id),
   delay: 1500,
   onSaved: (id) => {
-    if (currentChapter.value?.id === id) saved.value = true
+    // 旧回调保留：状态本身由 onState 驱动，这里只在切章检查上做一次兜底
+    if (currentChapter.value?.id === id) saveState.value = 'saved'
+  },
+  onState: (state, meta = {}) => {
+    // 状态属于「某一章的保存动作」。切章后旧章那轮迟到的回调不能改写
+    // 当前章节的标签——它会让用户以为新章也保存了。
+    if (meta.id != null && currentChapter.value?.id !== meta.id) return
+    saveState.value = state
+    saveError.value = state === 'failed' ? meta.message || '保存失败' : ''
+    if (state === 'failed') {
+      toast(`保存失败：${saveError.value}（已自动重试，可点「重试保存」）`, 'error')
+    }
   }
 })
 
@@ -54,7 +71,8 @@ watch(
     // 会拿着上一章的偏移量去改新章
     lastSel = { start: 0, end: 0 }
     findCursor.value = -1
-    saved.value = true
+    saveState.value = 'saved'
+    saveError.value = ''
   },
   { immediate: true }
 )
@@ -63,6 +81,16 @@ watch(
 // 算法在 services/wordCount.js 里，与落库的 chapters.wordCount 共用同一份——
 // 两处各写一份，用户早晚会看到两个不一样的数字。
 const wordCount = computed(() => countWords(text.value))
+
+const saveLabel = computed(() =>
+  saveState.value === 'dirty'
+    ? '未保存'
+    : saveState.value === 'saving'
+      ? '保存中…'
+      : saveState.value === 'failed'
+        ? '保存失败'
+        : '已保存'
+)
 
 // ---------------------------------------------------------------------------
 // 正文变更的统一入口：改内存 → 标脏 → 排队落盘
@@ -75,7 +103,6 @@ function applyText(next) {
   }
   text.value = next
   setChapterContent(id, next)
-  saved.value = false
   saver.schedule(id)
   return true
 }
@@ -84,17 +111,30 @@ function onInput() {
   const id = currentChapter.value?.id
   if (!id) return
   setChapterContent(id, text.value)
-  saved.value = false
   saver.schedule(id)
 }
 
 async function manualSave() {
   const id = currentChapter.value?.id
   if (!id) return
-  await saver.flush()
-  await persistChapter(id)
-  saved.value = true
-  toast('已保存', 'success')
+  try {
+    const res = await saver.flush()
+    if (res && res.ok === false) throw res.error || new Error('保存失败')
+    await persistChapter(id)
+    saveState.value = 'saved'
+    saveError.value = ''
+    toast('已保存', 'success')
+  } catch (e) {
+    const alreadyShown = saveState.value === 'failed'
+    saveState.value = 'failed'
+    saveError.value = String((e && e.message) || e)
+    if (!alreadyShown) toast('保存失败：' + saveError.value, 'error')
+  }
+}
+
+/** 失败后的手动重试。只重跑同一个目标 id，不会把内容写到别的章上。 */
+async function retrySave() {
+  await saver.retry()
 }
 
 /**
@@ -271,7 +311,8 @@ function reloadFromStore() {
   text.value = currentChapter.value?.content ?? ''
   lastSel = { start: 0, end: 0 }
   findCursor.value = -1
-  saved.value = true
+  saveState.value = 'saved'
+  saveError.value = ''
 }
 
 function onVersionRestored() {
@@ -303,9 +344,21 @@ onBeforeUnmount(() => {
         <span class="wcount">
           字数 {{ wordCount.total }}（中文 {{ wordCount.cjk }}）
         </span>
-        <span class="save-state" :class="{ ok: saved }">
-          {{ saved ? '已保存' : '保存中…' }}
+        <span
+          class="save-state"
+          :class="{ ok: saveState === 'saved' || saveState === 'idle', failed: saveState === 'failed' }"
+          :title="saveError || ''"
+        >
+          {{ saveLabel }}
         </span>
+        <button
+          v-if="saveState === 'failed'"
+          class="btn sm danger"
+          title="重新写入本章正文"
+          @click="retrySave"
+        >
+          重试保存
+        </button>
         <button class="btn sm" :class="{ primary: findOpen }" @click="findOpen ? closeFind() : openFind()">
           查找
         </button>
@@ -313,6 +366,15 @@ onBeforeUnmount(() => {
           {{ preview ? '编辑' : '预览' }}
         </button>
         <button class="btn sm" title="留一个以后能退回来的点" @click="saveVersion">存档</button>
+        <button
+          class="btn sm"
+          :class="{ primary: cardOpen }"
+          :disabled="!currentChapter"
+          title="编辑本章施工卡（给 AI 的硬约束）"
+          @click="cardOpen = true"
+        >
+          施工卡
+        </button>
         <button
           class="btn sm"
           :class="{ primary: verOpen }"
@@ -376,6 +438,12 @@ onBeforeUnmount(() => {
       版本面板复用控制台那一份组件，只是把范围收到当前章。
       真正要回滚的人正坐在编辑器里，不该逼他为了退一版而去开控制台。
     -->
+    <ChapterCardModal
+      v-if="cardOpen && currentChapter"
+      :chapter-id="currentChapter.id"
+      @close="cardOpen = false"
+    />
+
     <div v-if="verOpen" class="modal-mask" @click.self="verOpen = false">
       <div class="modal wide ver-modal">
         <div class="modal-header">
@@ -429,6 +497,10 @@ onBeforeUnmount(() => {
 }
 .save-state.ok {
   color: var(--success);
+}
+.save-state.failed {
+  color: var(--danger);
+  font-weight: 600;
 }
 .find-bar {
   display: flex;

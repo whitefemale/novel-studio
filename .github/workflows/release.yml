@@ -47,6 +47,12 @@ jobs:
       - name: 安装依赖
         run: npm ci
 
+      # Node 内置测试（node --test），不引入第三方依赖。只用纯函数与内存对象，
+      # 不碰 IndexedDB / Electron，所以能在 CI 上稳定跑。Electron 冒烟测试
+      # 依赖 GUI 会话，仍然只作为发版前的手工验收（见 README「测试」）。
+      - name: 单元测试
+        run: npm test
+
       # --publish never：发布统一交给最后的 release job。
       # 不加这个时 electron-builder 在 CI + tag 环境下可能自己去发一次，
       # 与 release job 抢同一个 Release。
@@ -86,7 +92,7 @@ jobs:
           path: Novel-Studio-*.exe
           if-no-files-found: error
 
-  # 可选：冒烟测试（48 项断言）。CI 上跑 Electron 需要 GUI 会话，
+  # 可选：冒烟测试（180 项断言）。CI 上跑 Electron 需要 GUI 会话，
   # 偶有 flaky，默认关闭；想开就把下面的 if 删掉。
   #  smoke:
   #    runs-on: windows-latest
@@ -126,6 +132,11 @@ jobs:
 
       - name: 安装依赖
         run: npm ci
+
+      # 同一套单元测试再跑一遍：windows 与 ubuntu 的路径/编码差异真的会出问题
+      # （例如 test 里显式写 `.js` 扩展名、路径分隔符），只在一个平台跑会漏掉。
+      - name: 单元测试
+        run: npm test
 
       # 拆成两步而非一条 run：日志正文要仓库管理员权限才读得到，
       # 但 step 级结论是公开可读的，分开才能定位是哪条命令挂的。

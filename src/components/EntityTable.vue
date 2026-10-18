@@ -3,6 +3,8 @@ import { ref, computed, watch } from 'vue'
 import { useBooks } from '../store/books'
 import { useCollections } from '../store/novel'
 import { ENTITY_SCHEMAS, entityTitle, renderEntity } from '../services/novel/schemas'
+import { relatedEntities } from '../services/novel/retrieval'
+import { usePagedList } from '../composables/usePagedList'
 import { toast } from '../store/toast'
 
 /**
@@ -64,6 +66,48 @@ const orderedRows = computed(() => {
   return list
 })
 
+/*
+ * 大列表分页：几千条人物/事件一次性铺成 DOM 会拖慢整个控制台，
+ * 而「加载更多」不需要任何新依赖。
+ * 切换集合或换书时回到第一页（watchKey），否则会在新书里看到空的「已加载 300 条」。
+ */
+const {
+  visible: visibleRows,
+  hasMore: hasMoreRows,
+  total: totalRows,
+  loadMore
+} = usePagedList(() => orderedRows.value, {
+  watchKey: () => [props.collection, store.bookId]
+})
+
+// ---------------- 关联展开 ----------------
+
+/**
+ * 「这条设定影响过什么」：人物 → 参与的事件/伏笔/出现过的章节。
+ * 只对记忆层的四种实体开放；卷/篇/场景/文风没有这套反向引用。
+ */
+const RELATED_KINDS = new Set(['characters', 'locations', 'factions', 'events'])
+const relatedId = ref('')
+
+function toggleRelated(row) {
+  relatedId.value = relatedId.value === row.id ? '' : row.id
+}
+
+const related = computed(() => {
+  if (!relatedId.value || !RELATED_KINDS.has(props.collection)) return null
+  return relatedEntities({
+    type: props.collection,
+    id: relatedId.value,
+    memory: cols.memory.store,
+    chapters: store.chapters
+  })
+})
+
+const relatedTitle = (kind, item) =>
+  kind === 'chapters'
+    ? `第${item.order}章 ${item.title || ''}`.trim()
+    : entityTitle(ENTITY_SCHEMAS[kind] || {}, item)
+
 // ---------------- 编辑 ----------------
 
 const editingId = ref(null)
@@ -73,7 +117,14 @@ const confirmId = ref(null)
 function blank() {
   const o = {}
   for (const f of schema.value.fields) {
-    o[f.key] = f.type === 'tags' || f.type === 'refs' ? [] : f.type === 'number' ? 0 : ''
+    o[f.key] =
+      f.type === 'tags' || f.type === 'refs'
+        ? []
+        : f.type === 'number'
+          ? 0
+          : f.type === 'checkbox'
+            ? false
+            : ''
   }
   return o
 }
@@ -158,7 +209,10 @@ function setTags(field, text) {
 // 切换实体时收起表单：留着会让上一个人的输入出现在下一个实体的表单里
 watch(
   () => props.collection,
-  () => cancelEdit()
+  () => {
+    cancelEdit()
+    relatedId.value = ''
+  }
 )
 </script>
 
@@ -174,12 +228,21 @@ watch(
     </div>
 
     <ul v-else class="et-list">
-      <li v-for="row in orderedRows" :key="row.id" class="et-row">
+      <li v-for="row in visibleRows" :key="row.id" class="et-row" :class="{ expanded: relatedId === row.id }">
         <div class="et-main">
           <div class="et-title">{{ entityTitle(schema, row) }}</div>
           <div v-if="rowText(row)" class="et-sub">{{ rowText(row) }}</div>
         </div>
         <div class="et-ops">
+          <button
+            v-if="RELATED_KINDS.has(props.collection)"
+            class="btn ghost sm"
+            :aria-expanded="relatedId === row.id"
+            :aria-label="`查看「${entityTitle(schema, row)}」的关联`"
+            @click="toggleRelated(row)"
+          >
+            关联
+          </button>
           <button class="btn ghost sm" @click="openEdit(row)">编辑</button>
           <template v-if="confirmId === row.id">
             <button class="btn ghost sm danger" @click="doRemove(row)">确认删除</button>
@@ -187,8 +250,42 @@ watch(
           </template>
           <button v-else class="btn ghost sm" @click="confirmId = row.id">删除</button>
         </div>
+
+        <div v-if="relatedId === row.id && related" class="et-related">
+          <div v-if="!related.events.length && !related.foreshadowing.length && !related.chapters.length" class="et-rel-empty">
+            没有找到关联记录。
+          </div>
+          <div v-if="related.events.length" class="et-rel-group">
+            <span class="et-rel-label">事件 · {{ related.events.length }}</span>
+            <span class="et-rel-items">
+              <span v-for="e in related.events.slice(0, 20)" :key="e.id">{{ relatedTitle('events', e) }}</span>
+              <span v-if="related.events.length > 20" class="et-rel-more">…还有 {{ related.events.length - 20 }} 条</span>
+            </span>
+          </div>
+          <div v-if="related.foreshadowing.length" class="et-rel-group">
+            <span class="et-rel-label">伏笔 · {{ related.foreshadowing.length }}</span>
+            <span class="et-rel-items">
+              <span v-for="f in related.foreshadowing.slice(0, 20)" :key="f.id">{{ relatedTitle('foreshadowing', f) }}</span>
+              <span v-if="related.foreshadowing.length > 20" class="et-rel-more">…还有 {{ related.foreshadowing.length - 20 }} 条</span>
+            </span>
+          </div>
+          <div v-if="related.chapters.length" class="et-rel-group">
+            <span class="et-rel-label">正文提及 · {{ related.chapters.length }}</span>
+            <span class="et-rel-items">
+              <span v-for="c in related.chapters.slice(0, 20)" :key="c.id">{{ relatedTitle('chapters', c) }}</span>
+              <span v-if="related.chapters.length > 20" class="et-rel-more">…还有 {{ related.chapters.length - 20 }} 章</span>
+            </span>
+          </div>
+          <p class="et-rel-hint">「正文提及」按名字出现在章节文本里统计，不代表这条设定一定被使用。</p>
+        </div>
       </li>
     </ul>
+
+    <div v-if="hasMoreRows" class="et-more">
+      <button class="btn sm" @click="loadMore">
+        加载更多（还有 {{ totalRows - visibleRows.length }} 条）
+      </button>
+    </div>
 
     <form v-if="editing" class="et-form" @submit.prevent="save">
       <div class="et-form-head">{{ editingId ? '编辑' : '新增' }}{{ schema.label }}</div>
@@ -197,7 +294,15 @@ watch(
           {{ f.label }}
           <em v-if="f.required" class="et-req">必填</em>
           <em v-if="f.inject" class="et-inject" title="这一项会被写进给 AI 的上下文">注入</em>
+          <em v-if="f.meta" class="et-meta" title="流程自动维护的元数据，AI 不会直接修改">元数据</em>
         </span>
+
+        <input
+          v-if="f.type === 'checkbox'"
+          v-model="form[f.key]"
+          class="et-check"
+          type="checkbox"
+        />
 
         <textarea
           v-if="f.type === 'textarea'"
@@ -291,10 +396,58 @@ watch(
 }
 .et-row {
   display: flex;
+  flex-wrap: wrap;
   align-items: flex-start;
   gap: 12px;
   padding: 10px 0;
   border-bottom: 1px solid var(--border);
+}
+.et-row.expanded {
+  background: var(--bg-muted);
+}
+.et-related {
+  flex-basis: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+  border: 1px dashed var(--border);
+}
+.et-rel-group {
+  display: flex;
+  gap: 8px;
+  font-size: 12px;
+  line-height: 1.7;
+}
+.et-rel-label {
+  flex-shrink: 0;
+  color: var(--text-3);
+}
+.et-rel-items {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  color: var(--text-2);
+}
+.et-rel-more {
+  color: var(--text-3);
+}
+.et-rel-empty {
+  font-size: 12px;
+  color: var(--text-3);
+}
+.et-rel-hint {
+  margin: 0;
+  font-size: 11px;
+  color: var(--text-3);
+  line-height: 1.6;
+}
+.et-more {
+  display: flex;
+  justify-content: center;
+  padding: 4px 0;
 }
 .et-main {
   flex: 1;
@@ -342,11 +495,22 @@ watch(
   gap: 6px;
 }
 .et-req,
-.et-inject {
+.et-inject,
+.et-meta {
   font-style: normal;
   font-size: 10px;
   padding: 1px 5px;
   border-radius: 999px;
+}
+.et-check {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--accent);
+}
+.et-meta {
+  background: var(--bg-muted);
+  color: var(--text-3);
+  border: 1px solid var(--border);
 }
 .et-req {
   background: var(--danger-soft);

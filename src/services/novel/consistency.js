@@ -1,6 +1,6 @@
-import { ENTITY_SCHEMAS } from './schemas'
-import { findBrokenRefs, overdueForeshadow } from './timeline'
-import { normalizeTitle } from '../migration'
+import { ENTITY_SCHEMAS } from './schemas.js'
+import { findBrokenRefs, overdueForeshadow } from './timeline.js'
+import { normalizeTitle } from '../migration.js'
 
 /**
  * 一致性检查的**规则部分**：确定性、零成本、打开控制台即算。
@@ -70,6 +70,36 @@ export const CONSISTENCY_RULES = [
     label: '人物久未出场',
     severity: 'low',
     hint: '超过 30 章没有更新过的人物，注入的记忆可能已经过时'
+  },
+  {
+    id: 'mainThreadStalled',
+    label: '主线停滞',
+    severity: 'medium',
+    hint: '施工卡里标了「主线」的章节之后，连续很多章都没有再推进主线'
+  },
+  {
+    id: 'keyCharacterOverdense',
+    label: '关键人物过度密集出场',
+    severity: 'low',
+    hint: '最近 10 章里几乎每章都出场的人物，可能是视点过于集中'
+  },
+  {
+    id: 'subplotStalled',
+    label: '支线长期无进展',
+    severity: 'low',
+    hint: '「进行中」的篇已经很多章没有对应章节了'
+  },
+  {
+    id: 'duplicatePurpose',
+    label: '相邻章节目标重复',
+    severity: 'low',
+    hint: '相邻两章的「本章目标」几乎一样，读起来会像原地踏步'
+  },
+  {
+    id: 'noChangeStretch',
+    label: '连续章节没有有效变化',
+    severity: 'low',
+    hint: '已确认施工卡的连续章节里，没有事件、伏笔动作或状态变化'
   }
 ]
 
@@ -77,6 +107,26 @@ const RULE_BY_ID = Object.fromEntries(CONSISTENCY_RULES.map((r) => [r.id, r]))
 
 /** 多久没更新算「陈旧」 */
 export const STALE_CHAPTERS = 30
+
+/** 施工卡里用来标记「这一章推进主线」的线索词。 */
+export const MAIN_THREAD_MARK = '主线'
+
+/**
+ * 主线连续多少章没被标记为推进就算停滞。
+ * 8 章是一个经验值：三到五章可能只是一个单元剧式的段落，八章之后读者会开始
+ * 忘记主线目标是什么。
+ */
+export const MAIN_THREAD_STALLED = 8
+
+/** 支线（篇）落后当前进度多少章算停滞。 */
+export const SUBPLOT_STALLED = 8
+
+/** 关键人物检查的窗口与密度阈值。窗口固定为最近 10 章。 */
+export const DENSITY_WINDOW = 10
+export const DENSITY_RATIO = 0.7
+
+/** 连续多少章没有有效变化才报告。两章内的停顿是正常的节奏处理。 */
+export const NO_CHANGE_MIN = 2
 
 const SEVERITY_LABELS = { high: '高', medium: '中', low: '低' }
 const SEVERITY_ORDER = { high: 0, medium: 1, low: 2 }
@@ -320,6 +370,158 @@ export function runRuleChecks({ chapters = [], memory = {}, structure = {}, tomb
       chapterId: ch.lastUpdatedChapterId
     })
   }
+
+  // --- 规则 8：主线停滞 -----------------------------------------------------
+  // 以「最后一章有正文的章节」为当前进度，而不是章号最大的那一章：作者经常先
+  // 建好一排空章当骨架，用空章算进度会让刚开书就报「主线停滞」。
+  const written = sorted.filter((c) => String(c.content || '').trim())
+  const frontier = written.length ? (written[written.length - 1].order ?? 0) : null
+  const mainMarkers = written.filter((c) => String(c.threads || '').includes(MAIN_THREAD_MARK))
+  // 至少要有两处主线标记才判。只有一处时，很可能只是作者没在每章重复写「主线」，
+  // 那是记法差异，不是剧情问题。
+  if (frontier != null && mainMarkers.length >= 2) {
+    const lastMain = mainMarkers.reduce((m, c) => Math.max(m, c.order ?? 0), 0)
+    if (frontier - lastMain > MAIN_THREAD_STALLED) {
+      push('mainThreadStalled', {
+        id: `mainThreadStalled:${lastMain}`,
+        title: `主线已经 ${frontier - lastMain} 章没有推进`,
+        detail:
+          `最后一次在施工卡里标记「${MAIN_THREAD_MARK}」是第${lastMain}章，` +
+          `而现在已写到第${frontier}章。若主线确实被放下了，给这几章的施工卡补上主线动作；` +
+          `若这是有意的支线段落，忽略即可。`,
+        entityType: 'chapters',
+        entityId: '',
+        chapterId: ''
+      })
+    }
+  }
+
+  // --- 规则 9：关键人物过度密集出场 -----------------------------------------
+  // 只看最近 DENSITY_WINDOW 章（含未写的章，按章号取）。窗口不满就不判：
+  // 前三章里主角每章都在，是正常的，不是「过度密集」。
+  const windowChapters = sorted.slice(-DENSITY_WINDOW)
+  if (windowChapters.length === DENSITY_WINDOW) {
+    const windowIds = new Set(windowChapters.map((c) => c.id))
+    const chaptersPerCharacter = new Map()
+    for (const ev of events) {
+      if (!windowIds.has(ev.chapterId)) continue
+      for (const cid of ev.characterIds || []) {
+        if (!cid) continue
+        if (!chaptersPerCharacter.has(cid)) chaptersPerCharacter.set(cid, new Set())
+        chaptersPerCharacter.get(cid).add(ev.chapterId)
+      }
+    }
+    const minAppearances = Math.floor(DENSITY_WINDOW * DENSITY_RATIO) + 1
+    for (const [cid, chapterSet] of chaptersPerCharacter) {
+      if (chapterSet.size < minAppearances) continue
+      const ch = characters.find((x) => x.id === cid)
+      if (!ch) continue
+      push('keyCharacterOverdense', {
+        id: `keyCharacterOverdense:${cid}`,
+        title: `「${ch.name || '未命名'}」最近 ${DENSITY_WINDOW} 章里出场了 ${chapterSet.size} 章`,
+        detail:
+          `超过 ${Math.round(DENSITY_RATIO * 100)}% 的章节都有他/她。不是错误，但视点可能过于集中；` +
+          `若其他人物已经很久没有戏份，考虑给配角留一场。`,
+        entityType: 'characters',
+        entityId: cid,
+        chapterId: ''
+      })
+    }
+  }
+
+  // --- 规则 10：支线长期无进展 ----------------------------------------------
+  // 只判「进行中」且有章节归属的篇。刚建好、还没挂章节的篇不算停滞 ——
+  // 那只是计划还没开始写。
+  const arcs = structure.arcs || []
+  const currentOrder = frontier ?? maxOrder
+  if (currentOrder != null) {
+    const lastChapterOfArc = new Map()
+    for (const c of chaptersArr) {
+      if (!c.arcId) continue
+      const o = c.order ?? 0
+      lastChapterOfArc.set(c.arcId, Math.max(lastChapterOfArc.get(c.arcId) ?? -Infinity, o))
+    }
+    for (const arc of arcs) {
+      if (arc.status !== 'active') continue
+      const last = lastChapterOfArc.get(arc.id)
+      if (last == null) continue
+      const gap = currentOrder - last
+      if (gap <= SUBPLOT_STALLED) continue
+      push('subplotStalled', {
+        id: `subplotStalled:${arc.id}`,
+        title: `「${arc.title || '未命名'}」已经 ${gap} 章没有对应章节`,
+        detail:
+          `这一篇的状态是「进行中」，但最后一章归属在第${last}章，当前已写到第${currentOrder}章。` +
+          `要么继续推进它，要么把状态改成「已完成 / 已废弃」。`,
+        entityType: 'arcs',
+        entityId: arc.id,
+        chapterId: ''
+      })
+    }
+  }
+
+  // --- 规则 11：相邻章节目标重复 --------------------------------------------
+  // 只比规范化后完全相同的 purpose，且要求至少有 4 个字：两个「推进剧情」确实
+  // 说明不了这一章要干什么，值得提醒；而空 / 过短的值属于「还没填」，不算重复。
+  const normPurpose = (s) =>
+    normalizeTitle(s).replace(/[，。！？；：、,.!?;:"'“”‘’（）()【】[\]…—\-·]/g, '')
+  for (let i = 1; i < sorted.length; i++) {
+    const prev = sorted[i - 1]
+    const cur = sorted[i]
+    const pa = normPurpose(prev.purpose)
+    const pb = normPurpose(cur.purpose)
+    if (pa.length < 4 || pa !== pb) continue
+    push('duplicatePurpose', {
+      id: `duplicatePurpose:${prev.id}:${cur.id}`,
+      title: `第${prev.order}章与第${cur.order}章的目标相同`,
+      detail: `两章的「本章目标」都是「${String(cur.purpose).trim()}」。相邻章节目标相同，读起来容易像在原地踏步。`,
+      entityType: 'chapters',
+      entityId: cur.id,
+      chapterId: cur.id
+    })
+  }
+
+  // --- 规则 12：连续章节没有有效变化 ----------------------------------------
+  // 只在**已确认施工卡**的章节上判。临时计划随时会改，拿它判「没有变化」会
+  // 变成对半成品报错；而施工卡都没填的旧章节更不该被这条规则碰。
+  //
+  // 「有效变化」= 有事件、有伏笔动作、有状态变化。章节缺摘要另有规则 6。
+  const eventChapterIds = new Set(events.map((e) => e.chapterId).filter(Boolean))
+  const cardValue = (c) => {
+    const fields = [
+      c.openingState, c.coreConflict, c.mustEvents, c.threads, c.stateChanges,
+      c.worldReveals, c.foreshadowActions, c.endingHook, c.continuity, c.acceptance
+    ]
+    return fields.some((v) => String(v ?? '').trim() !== '') || (Number(c.targetWords) || 0) > 0
+  }
+  let run = []
+  const flushRun = () => {
+    if (run.length >= NO_CHANGE_MIN) {
+      const first = run[0]
+      const last = run[run.length - 1]
+      push('noChangeStretch', {
+        id: `noChangeStretch:${first.id}:${last.id}`,
+        title: `第${first.order}–${last.order}章连续 ${run.length} 章没有有效变化`,
+        detail:
+          '这几章的施工卡已确认，但既没有事件记录，也没有伏笔动作或人物状态变化。' +
+          '若它们是过场 / 气氛段落，可以忽略；否则补上一处变化会让节奏更结实。',
+        entityType: 'chapters',
+        entityId: first.id,
+        chapterId: first.id
+      })
+    }
+    run = []
+  }
+  for (const c of sorted) {
+    const isConfirmedCard = c.planStatus === 'confirmed' && cardValue(c)
+    const hasChange =
+      eventChapterIds.has(c.id) ||
+      String(c.foreshadowActions || '').trim() !== '' ||
+      String(c.stateChanges || '').trim() !== ''
+    if (isConfirmedCard && !hasChange) run.push(c)
+    else flushRun()
+  }
+  flushRun()
 
   // 高严重度的排前面，同级别内保持规则清单的顺序（稳定，不会两次渲染两个样）
   const ruleIndex = new Map(CONSISTENCY_RULES.map((r, i) => [r.id, i]))

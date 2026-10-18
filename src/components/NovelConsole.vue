@@ -5,7 +5,13 @@ import { useCollections } from '../store/novel'
 import { useGeneration } from '../store/generation'
 import { ENTITY_SCHEMAS } from '../services/novel/schemas'
 import { groupVersions } from '../services/novel/versioning'
-import { planMigrationForBook, applyMigration } from '../services/migration'
+import {
+  planMigrationForBook,
+  applyMigration,
+  recordMigrationReport
+} from '../services/migration'
+import { collectSnapshot } from '../services/novel/snapshot'
+import { savePreRestoreSnapshot } from '../services/storage'
 import { toast } from '../store/toast'
 import EntityTable from './EntityTable.vue'
 import MemoryReview from './MemoryReview.vue'
@@ -14,6 +20,8 @@ import GenerationHistory from './GenerationHistory.vue'
 import ChapterVersions from './ChapterVersions.vue'
 import TimelineView from './TimelineView.vue'
 import ConsistencyReport from './ConsistencyReport.vue'
+import BookPlanPanel from './BookPlanPanel.vue'
+import StatsPanel from './StatsPanel.vue'
 import { runRuleChecks } from '../services/novel/consistency'
 
 /**
@@ -26,7 +34,18 @@ import { runRuleChecks } from '../services/novel/consistency'
  * 标签顺序 = 用户排查问题的顺序：先看骨架（卷/篇），再看人物与世界，
  * 然后时间线与伏笔，最后才是 AI 干活留下的痕迹（审阅/上下文/花费）。
  */
-const emit = defineEmits(['close'])
+// content-changed：审校修复接受后正文变了，编辑器屏幕上那份还是旧的，
+// 必须让 App 调一次 reloadEditor（见 App.vue 的处理器）。
+const emit = defineEmits(['close', 'content-changed'])
+
+/**
+ * 打开时落在哪个标签。搜索弹窗点中一个实体时会传它的集合名进来，
+ * 否则用户还要自己在十几个标签里再找一遍。
+ * 未知值回落到「剧情」，避免拼错一个字符串就得到空白面板。
+ */
+const props = defineProps({
+  initialTab: { type: String, default: 'story' }
+})
 
 const { store } = useBooks()
 const cols = useCollections()
@@ -38,16 +57,18 @@ const TABS = [
   { key: 'locations', label: '地点' },
   { key: 'factions', label: '势力' },
   { key: 'worldRules', label: '世界规则' },
+  { key: 'styleProfiles', label: '文风' },
   { key: 'timeline', label: '时间线' },
   { key: 'foreshadowing', label: '伏笔' },
   { key: 'review', label: '记忆审阅' },
   { key: 'consistency', label: '一致性' },
   { key: 'versions', label: '版本' },
+  { key: 'stats', label: '统计' },
   { key: 'workflow', label: '上下文与迁移' },
   { key: 'history', label: '生成历史' }
 ]
 
-const tab = ref('story')
+const tab = ref(TABS.some((t) => t.key === props.initialTab) ? props.initialTab : 'story')
 
 const pendingCount = computed(
   () => cols.list('reviewQueue').filter((r) => r.status === 'pending').length
@@ -93,6 +114,7 @@ function badgeOf(key) {
 
 const migration = ref(null) // planMigration 的结果，null = 没查到候选
 const migrating = ref(false)
+const migrationReport = ref(null) // 上一次手动迁移的结果，含失败明细
 
 /**
  * 只在控制台打开时**查询**候选，绝不自动执行。
@@ -109,15 +131,41 @@ async function scanMigration() {
 async function runMigration() {
   if (!migration.value || migrating.value) return
   migrating.value = true
+  migrationReport.value = null
+  let backedUp = false
   try {
-    const res = await applyMigration(store.bookId, migration.value.candidates)
+    const candidates = migration.value.candidates
+    // 落库前自动留底。留底失败就不动数据 —— 「先备份再改」在这里是硬顺序，
+    // 失败后继续迁移等于把用户放进一个无法回退的处境。
+    const snapshot = await collectSnapshot()
+    await savePreRestoreSnapshot(snapshot)
+    backedUp = true
+
+    const res = await applyMigration(store.bookId, candidates)
+    await recordMigrationReport({
+      kind: 'v1-to-v2-entities',
+      bookId: store.bookId,
+      candidates: candidates.length,
+      migrated: res.migrated,
+      failed: res.failed.length,
+      failures: res.failed.slice(0, 20)
+    })
     // 落库之后刷新内存态，否则新建的实体要等下次开控制台才看得到
     await cols.loadForBook(store.bookId)
     migration.value = null
-    toast(`已升级 ${res.migrated} 条旧设定`, 'success')
+    migrationReport.value = { ...res, total: candidates.length }
+    if (res.failed.length) {
+      toast(`升级完成 ${res.migrated} 条，${res.failed.length} 条失败（可重试）`, 'error')
+    } else {
+      toast(`已升级 ${res.migrated} 条旧设定`, 'success')
+    }
   } catch (e) {
     console.error('[console] 迁移失败', e)
-    toast('升级失败：' + String((e && e.message) || e), 'error')
+    toast(
+      (backedUp ? '升级中断：' : '升级前未能保存留底，已停止：') +
+        String((e && e.message) || e),
+      'error'
+    )
   } finally {
     migrating.value = false
   }
@@ -150,6 +198,19 @@ onMounted(async () => {
         </button>
       </div>
 
+      <div v-if="migrationReport" class="console-banner">
+        <span>
+          迁移结果：新建 {{ migrationReport.migrated }} / {{ migrationReport.total }} 条，
+          <template v-if="migrationReport.failed.length">
+            <strong>{{ migrationReport.failed.length }} 条失败</strong>（可再次点击升级重试）：
+            {{ migrationReport.failed.map((f) => f.message).join('；') }}
+          </template>
+          <template v-else>全部成功。</template>
+          迁移前的整库快照已自动保留。
+        </span>
+        <button class="btn sm ghost" @click="migrationReport = null">知道了</button>
+      </div>
+
       <div class="console-body">
         <nav class="console-tabs">
           <button
@@ -165,11 +226,15 @@ onMounted(async () => {
         </nav>
 
         <div class="console-pane">
-          <!-- 剧情：卷与篇是作者自己规划的骨架，不由 AI 从正文反推 -->
+          <!-- 剧情：先全书方向，再卷/篇骨架，最后本章的场景（最小施工单位） -->
           <template v-if="tab === 'story'">
+            <BookPlanPanel />
+            <hr class="console-hr" />
             <EntityTable collection="volumes" order-by="order" />
             <hr class="console-hr" />
             <EntityTable collection="arcs" order-by="order" />
+            <hr class="console-hr" />
+            <EntityTable collection="scenes" order-by="timeline" />
           </template>
 
           <!-- 时间线：轴用来看，表格用来录。表格那一份就是原来那行 EntityTable -->
@@ -187,8 +252,13 @@ onMounted(async () => {
             v-else-if="tab === 'consistency'"
             @goto="tab = $event"
             @close="emit('close')"
+            @content-changed="emit('content-changed')"
           />
-          <ChapterVersions v-else-if="tab === 'versions'" />
+          <ChapterVersions
+            v-else-if="tab === 'versions'"
+            @content-changed="emit('content-changed')"
+          />
+          <StatsPanel v-else-if="tab === 'stats'" />
           <ContextPreview v-else-if="tab === 'workflow'" />
           <GenerationHistory v-else-if="tab === 'history'" />
         </div>

@@ -1,6 +1,6 @@
-import * as db from '../storage'
-import { genId } from '../ids'
-import { countWords } from '../wordCount'
+import * as db from '../storage.js'
+import { genId } from '../ids.js'
+import { countWords } from '../wordCount.js'
 
 /**
  * 章节版本：正文的历史副本，用于回滚与「误删救回」。
@@ -35,7 +35,12 @@ export const VERSION_SOURCES = {
   ai: 'AI 覆盖前',
   manual: '手动存档',
   rollback: '回滚前',
-  delete: '删除前'
+  delete: '删除前',
+  // 第四阶段：接受 AI 定向修复前留的一版，以及从外部文件导入前留的一版。
+  // 来源必须分得开 —— 「这一版是 AI 改的」和「这一版是我自己回的」对回看的人
+  // 意味着完全不同的信任度。
+  review: '审校修复前',
+  import: '导入前'
 }
 
 export function sourceLabel(source) {
@@ -50,6 +55,8 @@ export function buildVersion({
   content = '',
   source = 'manual',
   generationRunId = null,
+  note = '',
+  model = '',
   createdAt = Date.now()
 }) {
   const text = String(content ?? '')
@@ -62,6 +69,10 @@ export function buildVersion({
     wordCount: countWords(text).total,
     source,
     generationRunId: generationRunId || null,
+    // note / model 可选：手动存档时写一句「改了什么」，审校修复时记下模型，
+    // 回看版本时才知道这一版为什么存在。旧版本没有这两个字段，读取处容忍缺失。
+    ...(String(note || '').trim() ? { note: String(note).trim() } : {}),
+    ...(String(model || '').trim() ? { model: String(model).trim() } : {}),
     createdAt
   }
 }
@@ -116,6 +127,8 @@ export async function captureVersion({
   content = '',
   source = 'manual',
   generationRunId = null,
+  note = '',
+  model = '',
   keep = DEFAULT_VERSION_KEEP,
   createdAt
 }) {
@@ -128,6 +141,8 @@ export async function captureVersion({
     content,
     source,
     generationRunId,
+    note,
+    model,
     createdAt
   })
   // update 把「追加 + 裁剪」放进同一次 serialize，两次并发捕获不会互相裁掉对方。

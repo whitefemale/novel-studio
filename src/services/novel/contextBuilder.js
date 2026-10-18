@@ -1,12 +1,27 @@
-import { estimateTokens, cutToTokens } from '../ai/tokenUsage'
+import { estimateTokens, cutToTokens } from '../ai/tokenUsage.js'
 import {
   ENTITY_SCHEMAS,
   renderEntity,
   entityTitle,
-  ACTIVE_FORESHADOW_STATUS
-} from './schemas'
-import { normalizeTitle } from '../migration'
-import { collectOutlineText } from '../prompts'
+  renderBookPlan,
+  isBookPlanEmpty,
+  CHAPTER_PLAN_FIELDS,
+  ACTIVE_FORESHADOW_STATUS,
+  FACT_LAYER_LABELS,
+  NON_FACT_LAYERS,
+  NON_INJECTABLE_CONFIRM
+} from './schemas.js'
+import { normalizeTitle } from '../migration.js'
+import { collectOutlineText } from '../prompts.js'
+import { rankEntities, eventRelevance, mentionedIds } from './retrieval.js'
+import { styleProfileText } from './style.js'
+
+/**
+ * 提示词版本。每次改动分层规则、硬规则或任务描述时**必须**手动递增，
+ * 它会随每一条生成记录落库。没有它，「同样的输入这次怎么写得不一样」
+ * 就分不清是提示词改了、参数改了，还是模型自己漂了。
+ */
+export const PROMPT_VERSION = 'v3.5'
 
 /**
  * Context Builder：把「写这一章需要知道的一切」按相关性分层组装成提示词。
@@ -79,6 +94,9 @@ function focusText(input) {
   const ch = input.chapter
   if (ch) {
     parts.push(ch.title || '', ch.purpose || '', ch.summary || '')
+    // 施工卡字段同样决定「这一章跟谁有关」：写「与苏九在药庐对峙」时，
+    // 苏九和药庐应当在相关性排序里被顶上来。
+    for (const f of CHAPTER_PLAN_FIELDS) parts.push(String(ch[f.key] ?? ''))
     // 当前章已写的部分当然也要算进来
     parts.push(String(ch.content || '').slice(-4000))
   }
@@ -90,36 +108,70 @@ function focusText(input) {
  * 名字有没有出现在焦点文本里。单字名字（「王」）不参与判断 —— 一个汉字的
  * 命中率高到没有信息量，只会把预算浪费在不相干的人物上。
  */
-function isMentioned(entity, focus) {
-  if (!focus || !entity) return false
-  const names = [entity.name, entity.title]
-  if (Array.isArray(entity.aliases)) names.push(...entity.aliases)
-  return names.some((n) => n && String(n).length > 1 && focus.includes(String(n)))
+/**
+ * 只有「作者确认过、并且仍是有效」的记录才作为作者事实注入。
+ *
+ * 待确认（pending）的候选、已否决（rejected）与已弃用（deprecated）的记录
+ * 如果照样注入，AI 会把它当成既定事实继续写——于是用户刚在审阅队列里点了
+ * 「忽略」，下一章里那件事仍然发生了，且界面上完全看不出原因。
+ */
+function visibleMemory(list) {
+  return (list || []).filter((e) => e && !NON_INJECTABLE_CONFIRM.includes(e.confirmStatus))
 }
 
-/** 排前面的先被保留（预算不够时从后往前丢） */
-function byRelevance(list, focus) {
-  const mentioned = []
-  const rest = []
-  for (const e of list || []) (isMentioned(e, focus) ? mentioned : rest).push(e)
-  return [...mentioned, ...rest]
+/**
+ * 同一层里的重名记录：规范化标题相同但未被合并的两条。
+ *
+ * **不静默择一**是关键。两条「林昭」各自写着不同的境界时，无论挑哪一条，
+ * 模型都会把另一半当成不存在；而用户完全不知道提示词里发生过一次取舍。
+ * 所以两条都注入，并在层文本里明确标出冲突，让模型与用户都看见。
+ */
+function duplicateTitleSet(list, schema) {
+  const counts = new Map()
+  for (const e of list || []) {
+    const key = normalizeTitle(entityTitle(schema, e))
+    if (!key) continue
+    counts.set(key, (counts.get(key) || 0) + 1)
+  }
+  return new Set([...counts.entries()].filter(([, n]) => n > 1).map(([k]) => k))
 }
 
-/** V2 实体 → 层条目 */
+/** 非作者事实（角色认知/传闻/推测）加前缀，避免被当成世界真相 */
+function factLayerPrefix(entity) {
+  const layer = entity?.factLayer
+  if (!NON_FACT_LAYERS.includes(layer)) return ''
+  return `[${FACT_LAYER_LABELS[layer] || layer}] `
+}
+
+/** V2 实体 → 层条目（带来源与原因，供 Context Preview 解释「为什么它在」） */
 function itemsFrom(list, schema, resolveRef, focus) {
-  return byRelevance(list, focus).map((e) => ({
-    name: entityTitle(schema, e),
-    text: renderEntity(schema, e, resolveRef),
-    mentioned: isMentioned(e, focus)
-  }))
+  const visible = visibleMemory(list)
+  const duplicates = duplicateTitleSet(visible, schema)
+  return rankEntities(visible, focus).map(({ entity: e, score, reason }) => {
+    const name = entityTitle(schema, e)
+    const dup = duplicates.has(normalizeTitle(name))
+    const body = `${factLayerPrefix(e)}${renderEntity(schema, e, resolveRef)}`
+    return {
+      name,
+      text: dup
+        ? `${body}\n⚠ 冲突：另有同名记录「${name}」，两条内容不一致且未合并，请勿同时当作事实。`
+        : body,
+      mentioned: score > 0,
+      source: `${schema.label}「${name}」`,
+      reason,
+      conflict: dup
+    }
+  })
 }
 
 /** 旧侧栏设定行 → 层条目。旧行只有 title + 一段自由文本，直接拼。 */
 function legacyItems(list, focus) {
-  return byRelevance(list, focus).map((o) => ({
+  return rankEntities(list, focus).map(({ entity: o, score, reason }) => ({
     name: o.title || '未命名',
     text: `${o.title || '未命名'}：${o.content}`,
-    mentioned: isMentioned(o, focus)
+    mentioned: score > 0,
+    source: `旧设定「${o.title || '未命名'}」`,
+    reason
   }))
 }
 
@@ -203,11 +255,26 @@ export function buildLayers(input = {}) {
   // 1) 写作硬规则（必需）
   layers.push(
     layer('writingRules', '写作硬规则', { priority: 1, required: true, keep: KEEP.head }, [
-      { name: 'rules', text: WRITING_RULES }
+      { name: 'rules', text: WRITING_RULES, source: '写作硬规则', reason: 'required' }
     ])
   )
 
-  // 2) 故事大纲。直接复用 V1 的 collectOutlineText，保证「单条 tail 8000 /
+  // 2) 全书规划。它比卷/篇更高一层，也最稳定 —— 放在大纲之前，
+  //    让模型先看到「这本书到底在讲什么」，再看到具体骨架。
+  if (!isBookPlanEmpty(input.book?.plan)) {
+    layers.push(
+      layer('bookPlan', '全书规划', { priority: 2, keep: KEEP.head }, [
+        {
+          name: 'bookPlan',
+          text: renderBookPlan(input.book.plan),
+          source: `书「${input.book?.title || '未命名'}」的规划`,
+          reason: 'required'
+        }
+      ])
+    )
+  }
+
+  // 3) 故事大纲。直接复用 V1 的 collectOutlineText，保证「单条 tail 8000 /
   //    多条各 4000」的历史行为逐字不变（既有断言钉着它）。
   //    老书没有卷/篇，这一层就是它唯一的长程规划来源，所以优先级很高。
   //
@@ -217,14 +284,16 @@ export function buildLayers(input = {}) {
   const outlineText = settings.includeOutline !== false ? collectOutlineText(input.outlines) : ''
   if (outlineText) {
     layers.push(
-      layer('storyOutline', '故事大纲', { priority: 2, keep: KEEP.head }, [
-        { name: 'outline', text: outlineText }
+      layer('storyOutline', '故事大纲', { priority: 3, keep: KEEP.head }, [
+        { name: 'outline', text: outlineText, source: '旧设定·故事大纲', reason: 'required' }
       ])
     )
   }
 
-  // 3) 当前卷 / 4) 当前篇。章 → 篇 → 卷 是 V2 的结构，卷不直接挂章，
+  // 4) 当前卷 / 5) 当前篇。章 → 篇 → 卷 是 V2 的结构，卷不直接挂章，
   //    所以要先由章的 arcId 找到篇，再由篇的 volumeId 找到卷。
+  //    `arcs.volumeId` 是第四阶段补上的字段；旧数据没有它时仍回退到
+  //    `book.currentVolumeId`，不会因为加了字段反而让老书失去卷层上下文。
   const arcs = structure.arcs || []
   const volumes = structure.volumes || []
   const curChapter = input.chapter
@@ -234,20 +303,30 @@ export function buildLayers(input = {}) {
 
   if (curVolume) {
     layers.push(
-      layer('volume', '当前卷', { priority: 3, keep: KEEP.head }, [
-        { name: curVolume.title, text: renderEntity(ENTITY_SCHEMAS.volumes, curVolume, resolveRef) }
+      layer('volume', '当前卷', { priority: 4, keep: KEEP.head }, [
+        {
+          name: curVolume.title,
+          text: renderEntity(ENTITY_SCHEMAS.volumes, curVolume, resolveRef),
+          source: `卷「${curVolume.title}」`,
+          reason: 'focus'
+        }
       ])
     )
   }
   if (curArc) {
     layers.push(
-      layer('arc', '当前篇', { priority: 4, keep: KEEP.head }, [
-        { name: curArc.title, text: renderEntity(ENTITY_SCHEMAS.arcs, curArc, resolveRef) }
+      layer('arc', '当前篇', { priority: 5, keep: KEEP.head }, [
+        {
+          name: curArc.title,
+          text: renderEntity(ENTITY_SCHEMAS.arcs, curArc, resolveRef),
+          source: `篇「${curArc.title}」`,
+          reason: 'focus'
+        }
       ])
     )
   }
 
-  // 5) 本章目标
+  // 6) 本章目标
   if (curChapter) {
     const bits = []
     if (curChapter.purpose) bits.push(`本章要完成：${curChapter.purpose}`)
@@ -257,11 +336,85 @@ export function buildLayers(input = {}) {
     }
     if (bits.length) {
       layers.push(
-        layer('chapterGoal', '本章目标', { priority: 5, keep: KEEP.head }, [
-          { name: chapterLabel(curChapter), text: `${chapterLabel(curChapter)}\n${bits.join('\n')}` }
+        layer('chapterGoal', '本章目标', { priority: 6, keep: KEEP.head }, [
+          {
+            name: chapterLabel(curChapter),
+            text: `${chapterLabel(curChapter)}\n${bits.join('\n')}`,
+            source: chapterLabel(curChapter),
+            reason: 'focus'
+          }
         ])
       )
     }
+  }
+
+  // 7) 本章施工卡。`planStatus` 必须如实告诉模型：临时计划不等于已确认计划，
+  //    否则模型会把作者随手记的草稿当成硬约束，而作者一改计划就会前后矛盾。
+  if (curChapter) {
+    const planBits = []
+    for (const f of CHAPTER_PLAN_FIELDS) {
+      let v = curChapter[f.key]
+      if (f.type === 'ref' && v) v = resolveRef(f.ref, v) || v
+      v = String(v ?? '').trim()
+      if (v) planBits.push(`${f.label}：${v}`)
+    }
+    const locked = String(curChapter.lockedBeats || '').trim()
+    if (locked) planBits.push(`锁定节点（不得改动）：\n${locked}`)
+    if (planBits.length) {
+      const status =
+        curChapter.planStatus === 'confirmed'
+          ? `已确认${Number(curChapter.planVersion) > 0 ? ` v${curChapter.planVersion}` : ''}`
+          : curChapter.planStatus === 'draft'
+            ? '临时计划（尚未确认）'
+            : '未确认'
+      layers.push(
+        layer('chapterCard', '本章施工卡', { priority: 7, keep: KEEP.head }, [
+          {
+            name: chapterLabel(curChapter),
+            text: `${chapterLabel(curChapter)} 施工卡（${status}）\n${planBits.join('\n')}`,
+            source: chapterLabel(curChapter),
+            reason: 'focus'
+          }
+        ])
+      )
+    }
+  }
+
+  // 8) 本章场景。场景比章节更细，只在真正写了场景规划时才注入；
+  //    按章内 order 排序，确保「先发生什么」的顺序不会被集合载入顺序打乱。
+  if (curChapter) {
+    const scenes = (structure.scenes || [])
+      .filter((s) => s.chapterId === curChapter.id)
+      .sort((a, b) => (a.order ?? 0) - (b.order ?? 0))
+    if (scenes.length) {
+      layers.push(
+        layer(
+          'scenes',
+          '本章场景',
+          { priority: 8, keep: KEEP.head, minTokens: 60 },
+          scenes.map((s) => ({
+            name: s.title || '未命名场景',
+            text: renderEntity(ENTITY_SCHEMAS.scenes, s, resolveRef),
+            source: `场景「${s.title || '未命名场景'}」`,
+            reason: 'focus'
+          }))
+        )
+      )
+    }
+  }
+
+  // 9) 文风档案。位置刻意排在本章场景之后、人物之前：
+  //    - 它跨章稳定，不属于「这一章的信息」，但必须先于正文与摘要出现，
+  //      模型才会在动笔前定下腔调；
+  //    - 它已经被 style.js 压到十几行，不会挤掉人物/世界规则；
+  //    - `includeStyle` 与人物/大纲/世界观三个开关同语义，关掉就一个字都不发。
+  const styleText = styleProfileText(input.styleProfiles || [], settings.includeStyle !== false)
+  if (styleText) {
+    layers.push(
+      layer('style', '文风档案', { priority: 9, keep: KEEP.head, minTokens: 60 }, [
+        { name: 'style', text: styleText, source: '文风档案', reason: 'required' }
+      ])
+    )
   }
 
   // 6) 人物状态。被提到的排前面 —— 预算不够时先丢的是「这一章用不到的人」。
@@ -311,15 +464,19 @@ export function buildLayers(input = {}) {
   }
 
   // 9) 时间线：近几章发生过什么（「现在到哪儿了」）
-  const events = rows('events')
+  const events = visibleMemory(rows('events'))
   const recentIds = new Set(
     [...prevChapters(input, 5).map((c) => c.id), curChapter?.id].filter(Boolean)
   )
-  const byChapterOrder = (a, b) => {
-    const oa = (input.chapters || []).find((c) => c.id === a.chapterId)?.order ?? 1e9
-    const ob = (input.chapters || []).find((c) => c.id === b.chapterId)?.order ?? 1e9
-    return oa - ob
-  }
+  const chapterOrderOf = (id) =>
+    (input.chapters || []).find((c) => c.id === id)?.order ?? 1e9
+  const byChapterOrder = (a, b) => chapterOrderOf(a.chapterId) - chapterOrderOf(b.chapterId)
+  const eventItem = (e, reason) => ({
+    name: entityTitle(ENTITY_SCHEMAS.events, e),
+    text: `${factLayerPrefix(e)}${renderEntity(ENTITY_SCHEMAS.events, e, resolveRef)}`,
+    source: `事件「${entityTitle(ENTITY_SCHEMAS.events, e)}」`,
+    reason
+  })
   const inWindow = events.filter((e) => recentIds.has(e.chapterId)).sort(byChapterOrder)
   if (inWindow.length) {
     layers.push(
@@ -327,50 +484,60 @@ export function buildLayers(input = {}) {
         'timeline',
         '时间线',
         { priority: 9, keep: KEEP.head, minTokens: 60 },
-        inWindow.map((e) => ({
-          name: entityTitle(ENTITY_SCHEMAS.events, e),
-          text: renderEntity(ENTITY_SCHEMAS.events, e, resolveRef)
-        }))
+        inWindow.map((e) => eventItem(e, 'recent'))
       )
     )
   }
 
-  // 10) 相关伏笔：只注入尚未揭示的
-  const foreshadowing = (rows('foreshadowing') || []).filter((f) =>
+  // 10) 相关伏笔：只注入尚未揭示、且仍有效的
+  const foreshadowing = visibleMemory(rows('foreshadowing')).filter((f) =>
     ACTIVE_FORESHADOW_STATUS.includes(f.status)
   )
-  const sortedForeshadow = byRelevance(foreshadowing, focus).sort(
-    (a, b) => (a.status === 'developing' ? -1 : 0) - (b.status === 'developing' ? -1 : 0)
-  )
+  const sortedForeshadow = rankEntities(foreshadowing, focus)
+    .sort(
+      (a, b) =>
+        (a.entity.status === 'developing' ? -1 : 0) -
+        (b.entity.status === 'developing' ? -1 : 0)
+    )
+    .map(({ entity: f, score }) => ({
+      name: entityTitle(ENTITY_SCHEMAS.foreshadowing, f),
+      text: `${factLayerPrefix(f)}${renderEntity(ENTITY_SCHEMAS.foreshadowing, f, resolveRef)}`,
+      mentioned: score > 0,
+      source: `伏笔「${entityTitle(ENTITY_SCHEMAS.foreshadowing, f)}」`,
+      reason: score > 0 ? 'focus' : 'available'
+    }))
   if (sortedForeshadow.length) {
     layers.push(
       layer(
         'foreshadowing',
         '未收束的伏笔',
         { priority: 10, keep: KEEP.head, minTokens: 60 },
-        sortedForeshadow.map((f) => ({
-          name: entityTitle(ENTITY_SCHEMAS.foreshadowing, f),
-          text: renderEntity(ENTITY_SCHEMAS.foreshadowing, f, resolveRef)
-        }))
+        sortedForeshadow
       )
     )
   }
 
-  // 11) 相关历史事件：窗口之外、但与本章人物/地点相关的旧事（背景而非当前进度）
+  // 11) 相关历史事件：窗口之外、但与本章人物/地点/势力相关的旧事。
+  //     这里用结构化关联（characterIds / locationId / factionIds）而不只是
+  //     标题字符串：「A 回到药庐」应当带出「三年前在药庐发生的事」。
+  const focusIds = {
+    characters: mentionedIds(rows('characters'), focus),
+    locations: mentionedIds(rows('locations'), focus),
+    factions: mentionedIds(rows('factions'), focus)
+  }
   const older = events
     .filter((e) => !recentIds.has(e.chapterId))
-    .filter((e) => isMentioned(e, focus))
-    .sort(byChapterOrder)
+    .map((e) => ({ e, score: eventRelevance(e, focus, focusIds) }))
+    .filter((x) => x.score > 0)
+    .sort((a, b) => b.score - a.score || byChapterOrder(a.e, b.e))
+    .map((x) => eventItem(x.e, 'focus'))
   if (older.length) {
     layers.push(
       layer(
         'relevantEvents',
         '相关历史事件',
         { priority: 11, keep: KEEP.head, minTokens: 60 },
-        older.map((e) => ({
-          name: entityTitle(ENTITY_SCHEMAS.events, e),
-          text: renderEntity(ENTITY_SCHEMAS.events, e, resolveRef)
-        }))
+        older
       )
     )
   }
@@ -386,7 +553,9 @@ export function buildLayers(input = {}) {
         { priority: 12, keep: KEEP.tail, minTokens: 80, maxTokens: 1500 },
         withSummary.map((c) => ({
           name: chapterLabel(c),
-          text: `${chapterLabel(c)}：${c.summary}`
+          text: `${chapterLabel(c)}：${c.summary}`,
+          source: chapterLabel(c),
+          reason: 'recent'
         }))
       )
     )
@@ -399,13 +568,17 @@ export function buildLayers(input = {}) {
     if (!c.content) continue
     recentTextItems.push({
       name: chapterLabel(c),
-      text: `【${c.title || chapterLabel(c)}】\n${String(c.content).slice(-800)}`
+      text: `【${c.title || chapterLabel(c)}】\n${String(c.content).slice(-800)}`,
+      source: chapterLabel(c),
+      reason: 'recent'
     })
   }
   if (curChapter?.content) {
     recentTextItems.push({
       name: `${chapterLabel(curChapter)}（已写部分）`,
-      text: `【本章已写部分】\n${String(curChapter.content).slice(-6000)}`
+      text: `【本章已写部分】\n${String(curChapter.content).slice(-6000)}`,
+      source: chapterLabel(curChapter),
+      reason: 'recent'
     })
   }
   if (recentTextItems.length) {
@@ -419,7 +592,12 @@ export function buildLayers(input = {}) {
   if (inst) {
     layers.push(
       layer('instruction', '本次要求', { priority: 14, required: true, keep: KEEP.head }, [
-        { name: 'instruction', text: `【本次要求】\n${inst}` }
+        {
+          name: 'instruction',
+          text: `【本次要求】\n${inst}`,
+          source: '本次要求',
+          reason: 'required'
+        }
       ])
     )
   }
@@ -428,7 +606,12 @@ export function buildLayers(input = {}) {
   if (selection) {
     layers.push(
       layer('selection', '待处理文字', { priority: 15, required: true, keep: KEEP.head }, [
-        { name: 'selection', text: `【待处理文字】\n${selection}` }
+        {
+          name: 'selection',
+          text: `【待处理文字】\n${selection}`,
+          source: '待处理文字',
+          reason: 'required'
+        }
       ])
     )
   }
@@ -467,16 +650,29 @@ export function allocate(layers, budget) {
       continue
     }
 
+    // 条目包装：把 source/reason/mentioned/conflict 一路带到 metadata，
+    // Context Preview 才能回答「为什么这一条被注入了」。
+    const wrap = (it, tokens, extra) => ({
+      name: it.name,
+      text: extra?.text ?? it.text,
+      tokens,
+      source: it.source || '',
+      reason: it.reason || '',
+      mentioned: !!it.mentioned,
+      conflict: !!it.conflict,
+      ...(extra || {})
+    })
+
     const kept = new Array(items.length).fill(null)
     let truncated = false
     let dropped = false
 
     if (l.required) {
-      items.forEach((it, i) => (kept[i] = { name: it.name, text: it.text, tokens: sizes[i] }))
+      items.forEach((it, i) => (kept[i] = wrap(it, sizes[i])))
       remaining -= need
       if (remaining < 0) overBudget = true
     } else if (need <= remaining) {
-      items.forEach((it, i) => (kept[i] = { name: it.name, text: it.text, tokens: sizes[i] }))
+      items.forEach((it, i) => (kept[i] = wrap(it, sizes[i])))
       remaining -= need
     } else if (remaining < l.minTokens) {
       dropped = true
@@ -488,18 +684,13 @@ export function allocate(layers, budget) {
       let left = remaining
       for (const i of order) {
         if (sizes[i] <= left) {
-          kept[i] = { name: items[i].name, text: items[i].text, tokens: sizes[i] }
+          kept[i] = wrap(items[i], sizes[i])
           left -= sizes[i]
           continue
         }
         const text = cutToTokens(items[i].text, left, l.keep)
         if (text) {
-          kept[i] = {
-            name: items[i].name,
-            text,
-            tokens: estimateTokens(text),
-            truncated: true
-          }
+          kept[i] = wrap(items[i], estimateTokens(text), { text, truncated: true })
           truncated = true
           left -= kept[i].tokens
         }
@@ -546,15 +737,19 @@ const TASK_BY_ACTION = {
   chapter: '请根据上述设定与大纲，创作本章的完整正文。',
   expand: '请扩写下面的文字，使其更丰富、细节更生动、更有画面感，同时保持原意、风格与视角一致。',
   rewrite: '请改写下面的文字，优化文笔、语言节奏与逻辑表达，保持原意不变。',
-  // 审校不是写作，任务描述由 orchestrator 的 buildReviewTask 给的 JSON 契约接管；
-  // 这里只提供一句方向性的说明，让上下文里的设定层有了明确的用途。
-  review: '请以审校者的身份阅读下面这一章，对照上述设定逐条指出问题。'
+  // 下面三种动作的产物是 JSON 而不是正文，具体契约由 orchestrator 的
+  // buildReviewTask / buildPlanTask / buildFixTask 接管；这里只提供方向性说明。
+  review: '请以审校者的身份阅读下面这一章，对照上述设定逐条指出问题。',
+  plan: '请为本章生成施工卡草案，按下面的 JSON 契约输出。',
+  fix: '请针对给定的审校问题修订整章正文，按下面的 JSON 契约输出。'
 }
+
+/** 产物是 JSON 而非正文的动作。「只输出正文本身」对它们是反向要求。 */
+const JSON_ACTIONS = ['review', 'plan', 'fix']
 
 function taskText(action) {
   const base = TASK_BY_ACTION[action] || '请根据上述设定继续写作。'
-  // 审校的产物是 JSON 而不是正文，「只输出正文本身」这句话在这里是反的
-  if (action === 'review') return base
+  if (JSON_ACTIONS.includes(action)) return base
   return `${base}\n（再次强调：只输出正文本身，不要标题，不要解释。）`
 }
 
@@ -570,8 +765,31 @@ function taskText(action) {
  * 注意 task 里的层是从 metadata 里取回来的：层文本已经过预算裁剪，
  * 若再从这里读原始数据就会出现「预览说裁掉了、提示词里却还在」的不一致。
  */
-export function buildContext(input, budget) {
-  const effectiveBudget = budget ?? (Number(input?.settings?.contextBudget ?? 6000) || 6000)
+export function buildContext(input, budget, options = {}) {
+  const settings = input?.settings || {}
+  // 显式传入的 budget 是「最终分配预算」——Context Preview 与冒烟测试用它
+  // 查看固定预算下的完整分配结果。不传时才按设置算：
+  //   可用上下文 = contextBudget - 输出预留(maxTokens) - 安全余量
+  // 给输出预留是必需的：把窗口全塞满输入，模型就没有空间写正文，
+  // 表现是「请求成功但输出立刻截断」。余量则留给 chat 模板与工具各自的开销。
+  const explicit = budget != null && Number.isFinite(Number(budget))
+  const baseBudget = explicit
+    ? Number(budget)
+    : Number(settings.contextBudget ?? 6000) || 6000
+  const outputReserve = explicit
+    ? Math.max(0, Number(options.outputReserve) || 0)
+    : Math.max(0, Number(options.outputReserve ?? settings.maxTokens ?? 0) || 0)
+  const margin = explicit
+    ? Math.max(0, Number(options.margin) || 0)
+    : Math.max(0, Number(options.margin ?? 256) || 0)
+  // 下限 512 只作用于「按设置算出来的预算」：低于它连硬规则都放不下，再减下去
+  // 只会让所有层都被判超预算，预览里全是红色告警，反而看不出真正的问题。
+  // 显式传入的 budget 是调用方指定的**最终**分配预算（冒烟测试与调试会故意传
+  // 60 这种极小值来验证降级），必须原样使用，不能再抬高 —— 否则那些层永远
+  // 不会被丢弃，「必需层保住、其余层降级」这条路径就再也测不到了。
+  const effectiveBudget = explicit
+    ? Math.max(0, baseBudget)
+    : Math.max(512, baseBudget - outputReserve - margin)
   const layers = buildLayers(input)
   const alloc = allocate(layers, effectiveBudget)
   const byId = new Map(alloc.layers.map((l) => [l.id, l]))
@@ -599,7 +817,11 @@ export function buildContext(input, budget) {
     task,
     metadata: {
       action: input?.action || 'continue',
+      promptVersion: PROMPT_VERSION,
       budget: alloc.budget,
+      budgetBase: baseBudget,
+      outputReserve,
+      margin,
       totalTokens: alloc.totalTokens,
       overBudget: alloc.overBudget,
       droppedLayers: alloc.droppedLayers,
@@ -609,11 +831,20 @@ export function buildContext(input, budget) {
         id: l.id,
         label: l.label,
         tokens: l.tokens,
+        // `items` 保留**条数**（既有界面与断言依赖它），条目明细在 itemsDetail。
         items: l.items.length,
         totalItems: l.totalItems,
         truncated: l.truncated,
         dropped: l.dropped,
-        required: l.required
+        required: l.required,
+        itemsDetail: l.items.map((it) => ({
+          name: it.name,
+          source: it.source || '',
+          reason: it.reason || '',
+          tokens: it.tokens,
+          truncated: !!it.truncated,
+          conflict: !!it.conflict
+        }))
       }))
     }
   }

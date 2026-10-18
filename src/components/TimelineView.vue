@@ -3,6 +3,7 @@ import { ref, computed } from 'vue'
 import { useBooks } from '../store/books'
 import { useCollections } from '../store/novel'
 import { buildTimeline, TIMELINE_SORTS, TIMELINE_KINDS } from '../services/novel/timeline'
+import { usePagedList } from '../composables/usePagedList'
 import EntityTable from './EntityTable.vue'
 
 /**
@@ -67,6 +68,16 @@ const groups = computed(() => {
   return out
 })
 
+// 轴按「章节锚点组」分页：一次加载 100 章的事件，而不是 100 个节点
+//（一章里挂十几条伏笔时，按节点分页会把同一章劈成两半）。
+// 切换排序或换书时回到第一页。
+const {
+  visible: visibleGroups,
+  hasMore: hasMoreGroups,
+  total: totalGroups,
+  loadMore: loadMoreGroups
+} = usePagedList(() => groups.value, { watchKey: () => [sortBy.value, store.bookId] })
+
 const warningOf = (sourceType, sourceId) =>
   warnings.value.filter((w) => w.sourceType === sourceType && w.sourceId === sourceId)
 
@@ -120,7 +131,7 @@ function jumpTo(n) {
       </div>
 
       <ol v-else class="tl-axis">
-        <li v-for="g in groups" :key="g.key || '__none__'" class="tl-group">
+        <li v-for="g in visibleGroups" :key="g.key || '__none__'" class="tl-group">
           <div class="tl-anchor">
             <span class="tl-dot"></span>
             <span class="tl-chap">
@@ -174,6 +185,12 @@ function jumpTo(n) {
           </div>
         </li>
       </ol>
+
+      <div v-if="hasMoreGroups" class="tl-more">
+        <button class="btn sm" @click="loadMoreGroups">
+          加载更多（还有 {{ totalGroups - visibleGroups.length }} 个章节节点）
+        </button>
+      </div>
     </template>
 
     <!-- 录入与修改仍走 schema 驱动的那张表，不另写编辑器 -->
@@ -239,6 +256,11 @@ function jumpTo(n) {
   color: var(--text-3);
   font-size: 13px;
   padding: 16px 0;
+}
+.tl-more {
+  display: flex;
+  justify-content: center;
+  padding: 4px 0 12px;
 }
 
 /* ---- 竖轴 ---- */

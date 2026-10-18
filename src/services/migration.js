@@ -1,5 +1,6 @@
-import * as db from './storage'
-import { genId } from './ids'
+// 显式带 .js，供 Node 原生 ESM（tests/unit）加载。
+import * as db from './storage.js'
+import { genId } from './ids.js'
 
 /**
  * V1 → V2 迁移。
@@ -22,7 +23,7 @@ import { genId } from './ids'
  *    这个承诺的落实方式。
  */
 
-export const SCHEMA_VERSION = 2
+export const SCHEMA_VERSION = 3
 
 /**
  * 标题规范化，用于跨来源比对两个名字是不是同一个人/同一条规则。
@@ -129,34 +130,82 @@ export async function planMigrationForBook(bookId) {
  * 护栏（规范化标题比对）照样会挡下重复迁移。
  */
 export async function applyMigration(bookId, candidates = []) {
-  if (!bookId) return { migrated: 0, created: [] }
+  if (!bookId) return { migrated: 0, created: [], failed: [] }
   const now = Date.now()
-  const outlines = await db.getOutlines(bookId)
-  const bySource = new Map(outlines.map((o) => [o.id, o]))
+  // 每一轮都重新读旧设定：同一批候选里可能有多条指向同一源行，
+  // 用过期副本写回会把前一条刚追加的 migratedTo 覆盖掉。
+  const bySource = new Map((await db.getOutlines(bookId)).map((o) => [o.id, o]))
   const created = []
+  const failed = []
 
   for (const cand of candidates) {
-    if (!db.COLLECTIONS.includes(cand.kind)) continue
-    const item = { ...cand.data, id: genId(), bookId, createdAt: now, updatedAt: now }
-    await db.coll[cand.kind].upsert(bookId, item)
-    created.push({ kind: cand.kind, id: item.id, sourceId: cand.sourceId })
+    if (!db.COLLECTIONS.includes(cand.kind)) {
+      failed.push({ sourceId: cand?.sourceId, kind: cand?.kind, message: '不支持的实体类型' })
+      continue
+    }
+    try {
+      const item = { ...cand.data, id: genId(), bookId, createdAt: now, updatedAt: now }
+      await db.coll[cand.kind].upsert(bookId, item)
+      created.push({ kind: cand.kind, id: item.id, sourceId: cand.sourceId })
 
-    const src = bySource.get(cand.sourceId)
-    if (src) {
-      // 只追加这一个字段。title / content / type 一律不动。
-      src.migratedTo = [...(src.migratedTo || []), item.id]
-      src.updatedAt = now
-      await db.upsertOutline(bookId, src)
+      const src = bySource.get(cand.sourceId)
+      if (src) {
+        // 只追加这一个字段。title / content / type 一律不动。
+        src.migratedTo = [...(src.migratedTo || []), item.id]
+        src.updatedAt = now
+        await db.upsertOutline(bookId, src)
+        bySource.set(src.id, src)
+      }
+    } catch (err) {
+      // 单条失败不中止整批：已经成功的那些是真实数据，回滚它们反而更危险。
+      // 失败项原样报出去，用户可以再点一次「一键升级」——幂等护栏保证不会重复。
+      failed.push({ sourceId: cand?.sourceId, kind: cand?.kind, message: err?.message || String(err) })
     }
   }
-  return { migrated: created.length, created }
+  return { migrated: created.length, created, failed }
 }
 
-/** 记录 schemaVersion。它只是个标记，不做任何破坏性转换。 */
+/**
+ * 记录 schemaVersion 与迁移报告。
+ *
+ * 这一轮升到 3 只是**标记**：V3 的新字段全部可选、没有任何数据必须重写，
+ * 所以 `automatic` 为 true 且 `changes` 为 0。真正的数据迁移（V1→V2 旧设定
+ * 转实体）仍然只在用户点按钮时跑，报告记在 applyMigration 的调用方。
+ *
+ * 报告保留最近 20 条，避免 meta 随版本迭代无限膨胀。
+ */
 export async function ensureSchemaVersion() {
   const meta = await db.getMeta()
   if (meta && meta.schemaVersion === SCHEMA_VERSION) return meta
-  const next = { ...(meta || {}), schemaVersion: SCHEMA_VERSION, updatedAt: Date.now() }
+  const now = Date.now()
+  const from = Number(meta?.schemaVersion) || 0
+  const report = {
+    from,
+    to: SCHEMA_VERSION,
+    at: now,
+    automatic: true,
+    changes: 0,
+    note: from === 0 ? '首次记录数据版本' : '仅记录版本标记，未改写任何记录'
+  }
+  const migrations = [...(Array.isArray(meta?.migrations) ? meta.migrations : []), report].slice(-20)
+  const next = {
+    ...(meta || {}),
+    schemaVersion: SCHEMA_VERSION,
+    updatedAt: now,
+    migrations
+  }
+  await db.saveMeta(next)
+  return next
+}
+
+/** 追加一条迁移报告（手动迁移用）。返回写入后的 meta。 */
+export async function recordMigrationReport(report) {
+  const meta = (await db.getMeta()) || {}
+  const migrations = [
+    ...(Array.isArray(meta.migrations) ? meta.migrations : []),
+    { at: Date.now(), automatic: false, ...report }
+  ].slice(-20)
+  const next = { ...meta, migrations, updatedAt: Date.now() }
   await db.saveMeta(next)
   return next
 }

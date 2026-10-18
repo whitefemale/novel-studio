@@ -1,5 +1,11 @@
 // OpenAI 兼容大模型客户端：支持 SSE 流式输出。
 // 桌面端（Electron）走主进程 IPC 代理（规避 CORS）；浏览器 / Android WebView 直连。
+//
+// 错误一律以**对象**交给调用方（成功路径见 request.js 的可靠封装）：
+//   { category, status, retryable, retryAfterMs, message, action, detail }
+// 字符串形式的旧契约已移除 —— 调用方只需要一处 `onError(info)`。
+
+import { classifyError } from './ai/errors.js'
 
 let reqSeq = 0
 function genRequestId() {
@@ -86,7 +92,34 @@ function usageOf(json) {
  */
 export function parseSseChunk(line) {
   const json = parseSseJson(line)
-  return { text: contentOf(json), usage: usageOf(json) }
+  return {
+    text: contentOf(json),
+    usage: usageOf(json),
+    finishReason: finishReasonOf(json),
+    error: errorOf(json)
+  }
+}
+
+/** 结束原因：'stop' 正常结束，'length'/'max_tokens' 表示被长度上限截断。 */
+function finishReasonOf(json) {
+  const r = json?.choices?.[0]?.finish_reason
+  return typeof r === 'string' ? r : ''
+}
+
+/**
+ * 流内错误块：`data: {"error": {"message": "...", "type": "..."}}`。
+ * 有的兼容端点在 HTTP 200 的流里发这个（限流、余额不足都可能这样），
+ * 不识别的话会表现为「生成突然结束、正文为空、没有任何提示」。
+ */
+function errorOf(json) {
+  const e = json?.error
+  if (!e) return null
+  if (typeof e === 'string') return { message: e }
+  return {
+    message: String(e.message || e.type || '服务端返回错误'),
+    code: String(e.code || ''),
+    type: String(e.type || '')
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -99,7 +132,10 @@ const ipcHub = {
   usage: new Map(),
   done: new Map(),
   aborted: new Map(),
-  error: new Map()
+  error: new Map(),
+  // 结束原因在 delta 行里，但 onDone 事件本身不带负载；在这里中转一次，
+  // 让 onDone({ finishReason }) 的契约在两条传输路径上完全一致。
+  finish: new Map()
 }
 let hubReady = false
 
@@ -109,6 +145,7 @@ function hubCleanup(id) {
   ipcHub.done.delete(id)
   ipcHub.aborted.delete(id)
   ipcHub.error.delete(id)
+  ipcHub.finish.delete(id)
 }
 
 function ensureIpcHub() {
@@ -118,15 +155,24 @@ function ensureIpcHub() {
     // 同一行里文本与用量各取各的：DeepSeek 把 usage 挂在最后一个**内容块**上
     // （该块 delta 为空），独立 usage 块则反过来没有文本。任何「有文本才处理
     // 用量」的写法都会漏掉前者。
-    const { text, usage } = parseSseChunk(line)
+    const { text, usage, finishReason, error } = parseSseChunk(line)
+    if (finishReason) ipcHub.finish.set(requestId, finishReason)
+    if (error) {
+      // 流内错误是终止错误：先收尾，后续行不再分发
+      const cb = ipcHub.error.get(requestId)
+      hubCleanup(requestId)
+      cb?.(error)
+      return
+    }
     if (usage) ipcHub.usage.get(requestId)?.(usage)
     if (text) ipcHub.delta.get(requestId)?.(text)
   })
   window.electronAPI.onDone((id) => {
     const cb = ipcHub.done.get(id)
     if (cb) {
+      const finishReason = ipcHub.finish.get(id) || ''
       hubCleanup(id)
-      cb()
+      cb({ finishReason })
     }
   })
   window.electronAPI.onAborted((id) => {
@@ -142,7 +188,7 @@ function ensureIpcHub() {
     const cb = ipcHub.error.get(id)
     if (cb) {
       hubCleanup(id)
-      cb(payload.message || '请求失败')
+      cb(payload)
     }
   })
 }
@@ -150,12 +196,21 @@ function ensureIpcHub() {
 // 渲染进程加载即注册（模块作用域）
 if (typeof window !== 'undefined') ensureIpcHub()
 
+/** 空闲超时秒数：每次收到数据重置；0 表示关闭。默认 60 秒。 */
+export function idleTimeoutSecOf(settings) {
+  const n = Number(settings?.requestIdleTimeoutSec)
+  if (!Number.isFinite(n) || n < 0) return 60
+  return n
+}
+
 /**
- * 发起流式对话。
+ * 发起流式对话（底层实现；需要重试/退避请用 ai/request.js 的 chatStreamReliable）。
+ *
  * @param {object} opts
- * @param {object} opts.settings    { baseUrl, apiKey, model, temperature, maxTokens }
+ * @param {object} opts.settings    { baseUrl, apiKey, model, temperature, maxTokens, requestIdleTimeoutSec }
  * @param {Array}  opts.messages    [{role:'system'|'user'|'assistant', content}]
- * @param {object} opts.callbacks   { onDelta(text), onUsage(usage), onDone(), onError(msg), onAborted() }
+ * @param {object} opts.callbacks   { onDelta(text), onUsage(usage), onDone({finishReason}),
+ *                                    onError(info), onAborted() }
  * @param {boolean} [opts.forceBrowser]  测试用：强制走浏览器直连路径
  * @returns {{ abort: Function }}
  */
@@ -176,21 +231,120 @@ export function chatStream({ settings, messages, callbacks = {}, forceBrowser = 
   // 所以留了 settings.streamUsage 开关（默认开）。
   if (settings.streamUsage !== false) body.stream_options = { include_usage: true }
 
+  const idleSec = idleTimeoutSecOf(settings)
+
   // 桌面端：经 Electron 主进程代理
   if (window.electronAPI?.isDesktop && !forceBrowser) {
     const requestId = genRequestId()
     ensureIpcHub()
-    ipcHub.delta.set(requestId, (t) => callbacks.onDelta?.(t))
-    ipcHub.usage.set(requestId, (u) => callbacks.onUsage?.(u))
-    ipcHub.done.set(requestId, () => callbacks.onDone?.())
-    ipcHub.aborted.set(requestId, () => callbacks.onAborted?.())
-    ipcHub.error.set(requestId, (msg) => callbacks.onError?.(msg))
-    window.electronAPI.chatCompletions({ requestId, url, headers, body })
-    return { abort: () => window.electronAPI.abortChat(requestId) }
+    let settled = false
+    let idleTimer = null
+
+    const clearIdle = () => {
+      if (idleTimer) {
+        clearTimeout(idleTimer)
+        idleTimer = null
+      }
+    }
+    const timeoutInfo = () =>
+      classifyError({ category: 'timeout', message: '空闲超时：服务端长时间没有返回数据' })
+
+    const emitTimeout = () => {
+      if (settled) return
+      settled = true
+      clearIdle()
+      hubCleanup(requestId)
+      callbacks.onError?.(timeoutInfo())
+      try {
+        window.electronAPI.abortChat(requestId)
+      } catch {
+        // 主进程已经收尾，忽略
+      }
+    }
+    const armIdle = () => {
+      clearIdle()
+      if (idleSec <= 0) return
+      idleTimer = setTimeout(emitTimeout, idleSec * 1000)
+    }
+    const finish = (cb, payload) => {
+      if (settled) return
+      settled = true
+      clearIdle()
+      cb?.(payload)
+    }
+
+    ipcHub.delta.set(requestId, (t) => {
+      armIdle()
+      if (!settled) callbacks.onDelta?.(t)
+    })
+    ipcHub.usage.set(requestId, (u) => {
+      armIdle()
+      if (!settled) callbacks.onUsage?.(u)
+    })
+    ipcHub.done.set(requestId, (payload) => finish(callbacks.onDone, payload || { finishReason: '' }))
+    ipcHub.aborted.set(requestId, () => finish(callbacks.onAborted))
+    ipcHub.error.set(requestId, (payload) => {
+      if (settled) return
+      settled = true
+      clearIdle()
+      callbacks.onError?.(classifyError(payload))
+    })
+
+    armIdle()
+    Promise.resolve(window.electronAPI.chatCompletions({ requestId, url, headers, body })).catch(
+      (err) => {
+        if (settled) return
+        settled = true
+        clearIdle()
+        hubCleanup(requestId)
+        callbacks.onError?.(classifyError(err))
+      }
+    )
+    return {
+      abort: () => {
+        clearIdle()
+        try {
+          window.electronAPI.abortChat(requestId)
+        } catch {
+          // 忽略
+        }
+      }
+    }
   }
 
   // 浏览器 / Android WebView：直连
   const controller = new AbortController()
+  let settled = false
+  let idleTimer = null
+  let finishReason = ''
+
+  const clearIdle = () => {
+    if (idleTimer) {
+      clearTimeout(idleTimer)
+      idleTimer = null
+    }
+  }
+  const emitError = (err) => {
+    if (settled) return
+    settled = true
+    clearIdle()
+    callbacks.onError?.(classifyError(err))
+  }
+  const armIdle = () => {
+    clearIdle()
+    if (idleSec <= 0) return
+    idleTimer = setTimeout(() => {
+      if (settled) return
+      emitError({ category: 'timeout', message: '空闲超时：服务端长时间没有返回数据' })
+      try {
+        controller.abort()
+      } catch {
+        // 忽略
+      }
+    }, idleSec * 1000)
+  }
+
+  armIdle()
   ;(async () => {
     try {
       const res = await fetch(url, {
@@ -201,40 +355,77 @@ export function chatStream({ settings, messages, callbacks = {}, forceBrowser = 
       })
       if (!res.ok) {
         const t = await res.text()
-        throw new Error(`HTTP ${res.status}：${t.slice(0, 300)}`)
+        const err = new Error(`HTTP ${res.status}: ${t.slice(0, 800)}`)
+        err.status = res.status
+        const retryAfter = res.headers?.get?.('retry-after')
+        if (retryAfter) err.retryAfter = retryAfter
+        throw err
       }
       const reader = res.body.getReader()
       const decoder = new TextDecoder('utf-8')
       let buffer = ''
+      /** 返回 true 表示这一行是终止错误，外层循环应停止。 */
       const consume = (line) => {
-        const { text, usage } = parseSseChunk(line)
-        if (usage) callbacks.onUsage?.(usage)
-        if (text) callbacks.onDelta?.(text)
+        const chunk = parseSseChunk(line)
+        if (chunk.finishReason) finishReason = chunk.finishReason
+        if (chunk.error) {
+          emitError(chunk.error)
+          try {
+            controller.abort()
+          } catch {
+            // 忽略
+          }
+          return true
+        }
+        if (chunk.usage) callbacks.onUsage?.(chunk.usage)
+        if (chunk.text) callbacks.onDelta?.(chunk.text)
+        return false
       }
       for (;;) {
         const { done, value } = await reader.read()
         if (done) break
+        armIdle()
         buffer += decoder.decode(value, { stream: true })
         let nl
+        let stop = false
         while ((nl = buffer.indexOf('\n')) >= 0) {
           const line = buffer.slice(0, nl)
           buffer = buffer.slice(nl + 1)
-          consume(line)
+          if (consume(line)) {
+            stop = true
+            break
+          }
         }
+        if (stop || settled) break
       }
       // 尾行兜底：流若在最后一个事件后没有换行就结束，上面那层 while 会把它
       // 留在 buffer 里丢掉。以前丢了只是少几个字，现在 usage 就在末尾那一块里，
       // 丢掉的表现是「这一章永远显示估算用量」——不报错、也看不出来。
-      if (buffer.trim()) consume(buffer)
-      callbacks.onDone?.()
+      if (!settled && buffer.trim()) consume(buffer)
+      if (!settled) {
+        settled = true
+        clearIdle()
+        callbacks.onDone?.({ finishReason })
+      }
     } catch (err) {
+      if (settled) return
       if (err.name === 'AbortError') {
+        settled = true
+        clearIdle()
         callbacks.onAborted?.()
       } else {
-        callbacks.onError?.(err.message || '请求失败')
+        emitError(err)
       }
     }
   })()
 
-  return { abort: () => controller.abort() }
+  return {
+    abort: () => {
+      try {
+        controller.abort()
+      } catch {
+        // 忽略
+      }
+    }
+  }
 }

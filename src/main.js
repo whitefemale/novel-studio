@@ -5,15 +5,57 @@ import * as db from './services/storage'
 import { useBooks } from './store/books'
 import { useSettings, defaultSettings } from './store/settings'
 import { buildMessages, messagesFromContext, collectOutlineText } from './services/prompts'
-import { buildContext, buildLayers, allocate } from './services/novel/contextBuilder'
+import {
+  buildContext,
+  buildLayers,
+  allocate,
+  PROMPT_VERSION
+} from './services/novel/contextBuilder'
 import {
   ENTITY_SCHEMAS,
   injectableFields,
   entityTitle,
   renderEntity,
   extractionSpec,
-  ACTIVE_FORESHADOW_STATUS
+  ACTIVE_FORESHADOW_STATUS,
+  FACT_LAYERS,
+  FACT_LAYER_LABELS,
+  NON_FACT_LAYERS,
+  CONFIRM_STATUSES,
+  NON_INJECTABLE_CONFIRM,
+  BOOK_PLAN_FIELDS,
+  CHAPTER_PLAN_FIELDS,
+  ALL_CHAPTER_PLAN_FIELDS,
+  LOCKED_BEATS_FIELD,
+  CHAPTER_PLAN_STATUS,
+  SCENE_STATUS,
+  isBookPlanEmpty,
+  renderBookPlan
 } from './services/novel/schemas'
+import {
+  entityNames,
+  relevanceOf,
+  rankEntities,
+  eventRelevance,
+  mentionedIds,
+  snippetAround,
+  searchBook,
+  relatedEntities
+} from './services/novel/retrieval'
+import {
+  CONFLICT_TITLE_PREFIX,
+  CONFLICT_ID_PREFIX,
+  CONFLICTS_COLLECTION,
+  conflictCopyId,
+  conflictRecordId,
+  isConflictCopy,
+  baselineTime,
+  makeChapterBaseline,
+  detectChapterConflicts,
+  applyConflictCopies,
+  updatePeerBaseline,
+  isConflictStale
+} from './services/sync/conflicts'
 import {
   buildTxt,
   buildMarkdown,
@@ -45,6 +87,7 @@ import {
   planMigrationForBook,
   applyMigration,
   ensureSchemaVersion,
+  recordMigrationReport,
   normalizeTitle,
   SCHEMA_VERSION
 } from './services/migration'
@@ -52,9 +95,27 @@ import { useNovelMemory, MEMORY_COLLECTIONS } from './store/novelMemory'
 import { useStoryStructure, STRUCTURE_COLLECTIONS } from './store/storyStructure'
 import { useGeneration, aggregateRuns, describeRun } from './store/generation'
 import {
+  TASK_MODEL_KEYS,
+  TASK_MODEL_LABELS,
+  defaultTaskModels,
+  normalizeTaskModels,
+  modelForStage,
+  settingsForStage
+} from './services/ai/models'
+import { dayStart, spentOnDay, estimateCall, checkBudget } from './services/ai/budget'
+import {
+  activeStyleProfile,
+  renderStyleProfile,
+  styleProfileText,
+  describeStyleProfile
+} from './services/novel/style'
+import { buildStats, DENSITY_BUCKET } from './services/novel/stats'
+import {
   runChapterWorkflow,
   buildExtractionMessages,
   buildReviewTask,
+  buildPlanTask,
+  buildFixTask,
   extractJson,
   classifyRisk,
   riskReason,
@@ -62,6 +123,7 @@ import {
   diffMemoryCandidates,
   describeChange,
   applyChange,
+  undoMemoryChange,
   commitChanges,
   STAGE_LABELS,
   DEFAULT_STAGES
@@ -92,8 +154,43 @@ import {
   CONSISTENCY_RULES,
   severityLabel,
   timeKey,
-  STALE_CHAPTERS
+  STALE_CHAPTERS,
+  MAIN_THREAD_MARK,
+  MAIN_THREAD_STALLED,
+  SUBPLOT_STALLED,
+  DENSITY_WINDOW,
+  DENSITY_RATIO,
+  NO_CHANGE_MIN
 } from './services/novel/consistency'
+import { splitLines, splitSentences, diffLinesOf, diffText, collapsedDiff } from './services/novel/diff'
+import {
+  splitPlanTerms,
+  matchesTerm,
+  planCompleteness,
+  checkChapterPlan
+} from './services/novel/planCheck'
+import {
+  PLAN_PROPOSAL_STATUSES,
+  splitLockedBeats,
+  missingLockedBeats,
+  normalizePlanDraft,
+  buildPlanProposal,
+  proposalPatch
+} from './services/novel/planning'
+import {
+  REVIEW_ISSUE_STATUSES,
+  REVIEW_STATUS_LABELS,
+  REVIEW_CATEGORIES,
+  REVIEW_CATEGORY_LABELS,
+  contentHashOf,
+  normalizeReviewIssue,
+  flattenReviewReport,
+  isIssueStale,
+  stateMap,
+  saveIssueStates,
+  setIssueStatus,
+  listIssueStates
+} from './services/novel/reviewIssues'
 import {
   buildSnapshot,
   mergeSnapshot,
@@ -108,9 +205,48 @@ import {
   applySnapshot,
   normalizeSnapshot,
   emptySnapshot,
+  stableStringify,
+  fnv1a32,
+  snapshotChecksum,
+  snapshotCounts,
+  finalizeSnapshot,
+  cloneSnapshotAsNewBooks,
+  isQuotaError,
   SNAPSHOT_FORMAT,
   SNAPSHOT_VERSION
 } from './services/novel/snapshot'
+import {
+  TASK_STATUSES,
+  RECOVERABLE_STATUSES,
+  TASK_STATUS_LABELS,
+  createTaskRecord,
+  appendDraft,
+  settleTaskRecord,
+  shouldFlushDraft,
+  markRunningInterrupted,
+  isRecoverable,
+  pickRecoverable,
+  pruneTasks,
+  taskSummary,
+  loadTasks
+} from './services/ai/taskStore'
+import {
+  classifyError,
+  redactSecrets,
+  shouldRetry,
+  computeBackoff,
+  parseRetryAfter,
+  describeError,
+  ERROR_CATEGORIES,
+  RETRYABLE_CATEGORIES
+} from './services/ai/errors'
+import {
+  chatStreamReliable,
+  isTruncatedFinishReason,
+  DEFAULT_IDLE_TIMEOUT_SEC,
+  DEFAULT_MAX_RETRIES
+} from './services/ai/request'
+import { APP_VERSION } from './version'
 import {
   setUiHooks,
   syncState,
@@ -175,8 +311,10 @@ window.__ns = {
   planMigrationForBook,
   applyMigration,
   ensureSchemaVersion,
+  recordMigrationReport,
   normalizeTitle,
   SCHEMA_VERSION,
+  APP_VERSION,
 
   // ---- V2：新 store ----
   useNovelMemory,
@@ -193,17 +331,67 @@ window.__ns = {
   buildContext,
   buildLayers,
   allocate,
+  PROMPT_VERSION,
   ENTITY_SCHEMAS,
   injectableFields,
   entityTitle,
   renderEntity,
   extractionSpec,
   ACTIVE_FORESHADOW_STATUS,
+  FACT_LAYERS,
+  FACT_LAYER_LABELS,
+  NON_FACT_LAYERS,
+  CONFIRM_STATUSES,
+  NON_INJECTABLE_CONFIRM,
+
+  // ---- V3 阶段 5：多模型 / 预算 / 文风 / 统计 ----
+  TASK_MODEL_KEYS,
+  TASK_MODEL_LABELS,
+  defaultTaskModels,
+  normalizeTaskModels,
+  modelForStage,
+  settingsForStage,
+  dayStart,
+  spentOnDay,
+  estimateCall,
+  checkBudget,
+  activeStyleProfile,
+  renderStyleProfile,
+  styleProfileText,
+  describeStyleProfile,
+  buildStats,
+  DENSITY_BUCKET,
+
+  // ---- V3 阶段 3：检索与相关性 ----
+  entityNames,
+  relevanceOf,
+  rankEntities,
+  eventRelevance,
+  mentionedIds,
+  snippetAround,
+  searchBook,
+  relatedEntities,
+
+  // ---- V3 阶段 3：同步冲突副本 ----
+  CONFLICT_TITLE_PREFIX,
+  CONFLICT_ID_PREFIX,
+  CONFLICTS_COLLECTION,
+  conflictCopyId,
+  conflictRecordId,
+  isConflictCopy,
+  baselineTime,
+  makeChapterBaseline,
+  detectChapterConflicts,
+  applyConflictCopies,
+  updatePeerBaseline,
+  isConflictStale,
 
   // ---- V2：AI 编排器 ----
   runChapterWorkflow,
   buildExtractionMessages,
   buildReviewTask,
+  buildPlanTask,
+  buildFixTask,
   extractJson,
   classifyRisk,
   riskReason,
@@ -211,6 +399,7 @@ window.__ns = {
   diffMemoryCandidates,
   describeChange,
   applyChange,
+  undoMemoryChange,
   commitChanges,
   STAGE_LABELS,
   DEFAULT_STAGES,
@@ -229,8 +418,44 @@ window.__ns = {
   applySnapshot,
   normalizeSnapshot,
   emptySnapshot,
+  stableStringify,
+  fnv1a32,
+  snapshotChecksum,
+  snapshotCounts,
+  finalizeSnapshot,
+  cloneSnapshotAsNewBooks,
+  isQuotaError,
   SNAPSHOT_FORMAT,
   SNAPSHOT_VERSION,
+
+  // ---- V3 阶段 1：流式草稿 / 崩溃恢复 ----
+  TASK_STATUSES,
+  RECOVERABLE_STATUSES,
+  TASK_STATUS_LABELS,
+  createTaskRecord,
+  appendDraft,
+  settleTaskRecord,
+  shouldFlushDraft,
+  markRunningInterrupted,
+  isRecoverable,
+  pickRecoverable,
+  pruneTasks,
+  taskSummary,
+  loadTasks,
+
+  // ---- V3 阶段 2：错误分类 / 重试 / 超时 / 截断 ----
+  classifyError,
+  redactSecrets,
+  shouldRetry,
+  computeBackoff,
+  parseRetryAfter,
+  describeError,
+  ERROR_CATEGORIES,
+  RETRYABLE_CATEGORIES,
+  chatStreamReliable,
+  isTruncatedFinishReason,
+  DEFAULT_IDLE_TIMEOUT_SEC,
+  DEFAULT_MAX_RETRIES,
 
   // ---- V2：局域网同步（电脑端服务控制 + 客户端 + 事件中枢）----
   setUiHooks,
@@ -271,5 +496,54 @@ window.__ns = {
   CONSISTENCY_RULES,
   severityLabel,
   timeKey,
-  STALE_CHAPTERS
+  STALE_CHAPTERS,
+  MAIN_THREAD_MARK,
+  MAIN_THREAD_STALLED,
+  SUBPLOT_STALLED,
+  DENSITY_WINDOW,
+  DENSITY_RATIO,
+  NO_CHANGE_MIN,
+
+  // ---- V3 阶段 4：版本差异 ----
+  splitLines,
+  splitSentences,
+  diffLinesOf,
+  diffText,
+  collapsedDiff,
+
+  // ---- V3 阶段 4：施工卡与计划提案 ----
+  BOOK_PLAN_FIELDS,
+  CHAPTER_PLAN_FIELDS,
+  ALL_CHAPTER_PLAN_FIELDS,
+  LOCKED_BEATS_FIELD,
+  CHAPTER_PLAN_STATUS,
+  SCENE_STATUS,
+  isBookPlanEmpty,
+  renderBookPlan,
+  buildPlanTask,
+  buildFixTask,
+  splitPlanTerms,
+  matchesTerm,
+  planCompleteness,
+  checkChapterPlan,
+  PLAN_PROPOSAL_STATUSES,
+  splitLockedBeats,
+  missingLockedBeats,
+  normalizePlanDraft,
+  buildPlanProposal,
+  proposalPatch,
+
+  // ---- V3 阶段 4：审校问题生命周期 ----
+  REVIEW_ISSUE_STATUSES,
+  REVIEW_STATUS_LABELS,
+  REVIEW_CATEGORIES,
+  REVIEW_CATEGORY_LABELS,
+  contentHashOf,
+  normalizeReviewIssue,
+  flattenReviewReport,
+  isIssueStale,
+  stateMap,
+  saveIssueStates,
+  setIssueStatus,
+  listIssueStates
 }

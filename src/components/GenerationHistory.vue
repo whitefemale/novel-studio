@@ -1,10 +1,11 @@
 <script setup>
-import { computed } from 'vue'
+import { ref, computed } from 'vue'
 import { useBooks } from '../store/books'
 import { useGeneration, aggregateRuns } from '../store/generation'
 import { STAGE_LABELS } from '../services/ai/orchestrator'
 import { formatTokens, formatCost } from '../services/ai/tokenUsage'
 import { toast } from '../store/toast'
+import { usePagedList } from '../composables/usePagedList'
 
 /**
  * 生成历史与成本汇总。
@@ -22,6 +23,15 @@ const rows = computed(() =>
 
 const total = computed(() => aggregateRuns(gen.store.runs))
 
+// 生成记录可能上千条（每次调用一行），翻页保持在「最近 100 次」以内。
+// 换书时回到第一页。
+const {
+  visible: visibleRows,
+  hasMore: hasMoreRows,
+  total: totalRows,
+  loadMore
+} = usePagedList(() => rows.value, { watchKey: () => store.bookId })
+
 const chapterTitle = (id) => store.chapters.find((c) => c.id === id)?.title || ''
 
 function fmtTime(ts) {
@@ -32,6 +42,20 @@ function fmtTime(ts) {
 }
 
 const stageOf = (run) => STAGE_LABELS[run.stage] || run.stage || '调用'
+
+/** 展开一行，显示可复现参数与上下文摘要。 */
+const expandedId = ref('')
+function toggle(run) {
+  expandedId.value = expandedId.value === run.id ? '' : run.id
+}
+
+const statusLabel = (s) =>
+  ({ done: '完成', aborted: '已中止', error: '失败', truncated: '被截断' })[s] || s || ''
+
+function droppedText(run) {
+  const dropped = run.contextSummary?.dropped || []
+  return dropped.length ? dropped.join('、') : '无'
+}
 
 async function clearAll() {
   const bookId = store.bookId
@@ -89,21 +113,60 @@ async function clearAll() {
         </tr>
       </thead>
       <tbody>
-        <tr v-for="r in rows" :key="r.id">
-          <td>{{ fmtTime(r.createdAt) }}</td>
-          <td>
-            {{ stageOf(r) }}
-            <span v-if="r.status !== 'done'" class="gh-bad">
-              {{ r.status === 'aborted' ? '已中止' : '失败' }}
-            </span>
-          </td>
-          <td>{{ chapterTitle(r.chapterId) || '—' }}</td>
-          <td class="gh-model">{{ r.model || '—' }}</td>
-          <td>{{ formatTokens((r.inputTokens || 0) + (r.outputTokens || 0)) }}</td>
-          <td>{{ r.priced === false ? '—' : formatCost({ total: r.cost, currency: r.currency }) }}</td>
-        </tr>
+        <template v-for="r in visibleRows" :key="r.id">
+          <tr class="gh-row" @click="toggle(r)">
+            <td>{{ fmtTime(r.createdAt) }}</td>
+            <td>
+              {{ stageOf(r) }}
+              <span v-if="r.status !== 'done'" class="gh-bad">{{ statusLabel(r.status) }}</span>
+              <span class="gh-caret">{{ expandedId === r.id ? '▾' : '▸' }}</span>
+            </td>
+            <td>{{ chapterTitle(r.chapterId) || '—' }}</td>
+            <td class="gh-model">{{ r.model || '—' }}</td>
+            <td>{{ formatTokens((r.inputTokens || 0) + (r.outputTokens || 0)) }}</td>
+            <td>{{ r.priced === false ? '—' : formatCost({ total: r.cost, currency: r.currency }) }}</td>
+          </tr>
+          <tr v-if="expandedId === r.id" class="gh-detail">
+            <td colspan="6">
+              <div class="gh-detail-grid">
+                <div><span class="gh-k">提示词版本</span><b>{{ r.promptVersion || '（旧记录未保存）' }}</b></div>
+                <div>
+                  <span class="gh-k">参数</span>
+                  <b>
+                    <template v-if="r.params">
+                      温度 {{ r.params.temperature ?? '—' }} · 最大输出
+                      {{ r.params.maxTokens ?? '—' }} tokens
+                    </template>
+                    <template v-else>（旧记录未保存）</template>
+                  </b>
+                </div>
+                <div><span class="gh-k">任务 id</span><b>{{ r.taskId || '—' }}</b></div>
+                <div><span class="gh-k">尝试次数</span><b>{{ r.attempts || 1 }}</b></div>
+                <div>
+                  <span class="gh-k">上下文</span>
+                  <b v-if="r.contextSummary">
+                    {{ r.contextSummary.tokens }} tokens · 预算 {{ r.contextSummary.budget }} ·
+                    丢弃层 {{ droppedText(r) }}
+                  </b>
+                  <b v-else>（旧记录未保存）</b>
+                </div>
+                <div><span class="gh-k">结束原因</span><b>{{ r.finishReason || '—' }}</b></div>
+              </div>
+              <div v-if="r.error" class="gh-detail-err">错误：{{ r.error }}</div>
+              <div v-if="r.contextSummary?.sources?.length" class="gh-sources">
+                上下文来源：{{ r.contextSummary.sources.join('、') }}
+              </div>
+            </td>
+          </tr>
+        </template>
       </tbody>
     </table>
+
+    <div v-if="hasMoreRows" class="gh-more">
+      <button class="btn sm" @click="loadMore">
+        加载更多（还有 {{ totalRows - visibleRows.length }} 条）
+      </button>
+    </div>
   </div>
 </template>
 
@@ -186,5 +249,53 @@ async function clearAll() {
 .gh-bad {
   color: var(--danger);
   font-size: 11px;
+}
+.gh-caret {
+  margin-left: 4px;
+  color: var(--text-3);
+  font-size: 10px;
+}
+.gh-row {
+  cursor: pointer;
+}
+.gh-row:hover {
+  background: var(--bg-muted);
+}
+.gh-detail td {
+  background: var(--bg-muted);
+  padding: 10px 12px;
+}
+.gh-detail-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 8px 16px;
+  font-size: 12px;
+}
+.gh-detail-grid > div {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.gh-detail-grid b {
+  font-weight: 500;
+  word-break: break-word;
+}
+.gh-detail-err {
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--danger);
+  word-break: break-word;
+}
+.gh-sources {
+  margin-top: 8px;
+  font-size: 11px;
+  line-height: 1.7;
+  color: var(--text-3);
+  word-break: break-word;
+}
+.gh-more {
+  display: flex;
+  justify-content: center;
+  padding: 4px 0;
 }
 </style>

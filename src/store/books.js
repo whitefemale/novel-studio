@@ -66,6 +66,9 @@ export function useBooks() {
       title: title || '未命名小说',
       intro,
       coverColor: BOOK_COLORS[store.books.length % BOOK_COLORS.length],
+      // 全书规划。空对象而不是 undefined：Context Builder 与规划面板都直接读
+      // `book.plan.xxx`，每个读取点各写一次空值保护早晚会漏。
+      plan: {},
       createdAt: now,
       updatedAt: now
     }
@@ -130,6 +133,24 @@ export function useBooks() {
       status: 'draft', // 'draft' | 'done'
       timelineStart: '', // 故事内时间，纯文本，如「第三天清晨」
       timelineEnd: '',
+      // 第四阶段的章节施工卡。全部可选（旧章节读出来是 undefined），
+      // 但在新建时给默认值，界面与 Context Builder 不必到处判空。
+      povCharacterId: null,
+      openingState: '',
+      coreConflict: '',
+      mustEvents: '',
+      threads: '',
+      stateChanges: '',
+      worldReveals: '',
+      foreshadowActions: '',
+      forbidden: '',
+      endingHook: '',
+      continuity: '',
+      acceptance: '',
+      targetWords: 0,
+      planStatus: 'none', // 'none' | 'draft' | 'confirmed'
+      planVersion: 0,
+      lockedBeats: '',
       wordCount: countWords(content).total,
       ...meta, // 见上：只有 summary / timelineEnd 这类元数据能从这里进来
       updatedAt: Date.now()
@@ -159,6 +180,36 @@ export function useBooks() {
     Object.assign(c, patch, { updatedAt: Date.now() })
     store.chapters = await db.upsertChapter(store.bookId, c)
     return c
+  }
+
+  /**
+   * 保存章节施工卡。
+   *
+   * - 只保存草稿时 `planStatus` 变 `draft`；
+   * - 点「确认施工卡」时变 `confirmed` 并**递增 planVersion**。
+   *
+   * planVersion 的用途不是显示版本史，而是让 Context Builder 能说清
+   * 「本章使用的是第几版已确认计划」——更新一次计划而版本号不动，
+   * 回看生成历史时就分不清那次生成用的是新计划还是旧计划。
+   */
+  async function saveChapterPlan(id, fields = {}, { confirm = false } = {}) {
+    const c = store.chapters.find((x) => x.id === id)
+    if (!c || !store.bookId) return null
+    const patch = {}
+    for (const [k, v] of Object.entries(fields)) {
+      if (['content', 'id', 'bookId', 'order'].includes(k)) continue
+      patch[k] = v
+    }
+    const hasAny = Object.entries(patch).some(([, v]) =>
+      typeof v === 'number' ? v > 0 : String(v ?? '').trim() !== ''
+    )
+    if (confirm) {
+      patch.planStatus = 'confirmed'
+      patch.planVersion = (Number(c.planVersion) || 0) + 1
+    } else if (hasAny) {
+      patch.planStatus = 'draft'
+    }
+    return updateChapter(id, patch)
   }
 
   async function renameChapter(id, title) {
@@ -312,6 +363,7 @@ export function useBooks() {
     addChapter,
     addChapterWithContent,
     updateChapter,
+    saveChapterPlan,
     renameChapter,
     setChapterContent,
     persistChapter,

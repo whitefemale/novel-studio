@@ -1,4 +1,4 @@
-import { ENTITY_SCHEMAS, entityTitle, ACTIVE_FORESHADOW_STATUS } from './schemas'
+import { ENTITY_SCHEMAS, entityTitle, ACTIVE_FORESHADOW_STATUS } from './schemas.js'
 
 /**
  * 时间线：把散落在各集合里的事件与伏笔摊到同一条轴上。

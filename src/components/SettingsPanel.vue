@@ -2,16 +2,19 @@
 import { ref } from 'vue'
 import { useSettings } from '../store/settings'
 import { chatStream } from '../services/llm'
+import { describeError } from '../services/ai/errors'
 import { isDesktop } from '../services/platform'
 import { toast } from '../store/toast'
+import { TASK_MODEL_KEYS, TASK_MODEL_LABELS } from '../services/ai/models'
 import SyncPanel from './SyncPanel.vue'
 
 const emit = defineEmits(['close'])
-const { settings, persist } = useSettings()
+const { settings, persist, persistApiKey, clearApiKey } = useSettings()
 
 const showKey = ref(false)
 const testing = ref(false)
 const pickingDir = ref(false)
+const confirmDeleteKey = ref(false)
 // 「保存与导出」整节只在桌面端有意义：移动端导出走系统分享面板，没有可配置的目录
 const desktop = isDesktop()
 
@@ -20,9 +23,27 @@ async function save() {
     toast('请填写接口地址', 'error')
     return
   }
-  await persist()
-  toast('设置已保存', 'success')
+  // API Key 的落点由平台决定：桌面端进 safeStorage 密文文件，其余平台进 IndexedDB。
+  // 失败时 persistApiKey 已回退明文并保存，这里只负责如实告知。
+  const keyRes = await persistApiKey()
+  if (!keyRes.ok) {
+    toast(`设置已保存，但 API Key 未能加密：${keyRes.message || '已改用明文存储'}`, 'error')
+  } else if (keyRes.secure) {
+    toast('设置已保存（API Key 已加密存储）', 'success')
+  } else {
+    toast('设置已保存', 'success')
+  }
   emit('close')
+}
+
+async function removeKey() {
+  if (!confirmDeleteKey.value) {
+    confirmDeleteKey.value = true
+    return
+  }
+  await clearApiKey()
+  confirmDeleteKey.value = false
+  toast('API Key 已删除', 'success')
 }
 
 async function chooseDir() {
@@ -58,8 +79,9 @@ async function testConnection() {
         testing.value = false
         toast('连接成功 ✓', 'success')
       },
-      onError: (msg) => {
+      onError: (info) => {
         testing.value = false
+        const msg = typeof info === 'string' ? info : describeError(info, { includeDetail: false })
         toast(`连接失败：${msg}`, 'error')
       },
       onAborted: () => {
@@ -104,11 +126,41 @@ async function testConnection() {
             autocomplete="off"
           />
           <button class="btn sm" @click="showKey = !showKey">{{ showKey ? '隐藏' : '显示' }}</button>
+          <button
+            class="btn sm danger"
+            :disabled="!settings.apiKey"
+            @click="removeKey"
+          >{{ confirmDeleteKey ? '确认删除？' : '删除' }}</button>
         </div>
+        <p v-if="desktop && settings.secureKeyAvailable" class="hint">
+          ✅ 已使用系统安全存储（Electron safeStorage）加密保存。密钥不会写入 IndexedDB、全量备份或局域网同步。
+        </p>
+        <p v-else-if="desktop" class="hint">
+          ⚠ 系统安全存储不可用{{ settings.secureKeyError ? `（${settings.secureKeyError}）` : '' }}，API Key 将以明文保存在本机 IndexedDB。若这是共用电脑，请改用其他机器的设置。
+        </p>
+        <p v-else class="hint">
+          ⚠ 浏览器 / Android 没有系统级安全存储，API Key 以明文保存在本机 IndexedDB（不会上传到任何服务器）。
+        </p>
 
         <div style="height: 14px"></div>
         <label class="label">模型名</label>
         <input v-model="settings.model" class="input" placeholder="deepseek-chat" />
+
+        <details class="model-split">
+          <summary>按任务分模型（可选）</summary>
+          <p class="hint">
+            留空 = 使用上面的「模型名」。写正文看重文笔，提取记忆看重严格输出 JSON，
+            审校看重长上下文 —— 想分开配就在这里逐项填。
+          </p>
+          <div v-for="key in TASK_MODEL_KEYS" :key="key" class="model-row">
+            <label class="label">{{ TASK_MODEL_LABELS[key] }}</label>
+            <input
+              v-model="settings.models[key]"
+              class="input"
+              :placeholder="settings.model || '继承通用模型'"
+            />
+          </div>
+        </details>
 
         <div style="height: 14px"></div>
         <!-- 手工改坏过的持久化数据可能是字符串或 undefined，先兜底再格式化 -->
@@ -144,7 +196,69 @@ async function testConnection() {
             <input v-model="settings.includeWorld" type="checkbox" />
             生成时携带世界观
           </label>
+          <label class="check">
+            <input v-model="settings.includeStyle" type="checkbox" />
+            生成时携带当前启用的文风档案
+          </label>
         </div>
+
+        <div class="divider"></div>
+        <h4 class="section-title">记忆与上下文</h4>
+        <label class="label">上下文预算：{{ settings.contextBudget }} tokens</label>
+        <input
+          v-model.number="settings.contextBudget"
+          type="range"
+          min="2000"
+          max="32000"
+          step="500"
+          class="range"
+        />
+        <p class="hint">
+          实际可用 = 预算 − 单次最大 Token（{{ settings.maxTokens }}）− 安全余量 256。
+          给输出预留空间是必需的，否则模型没有余量写正文。
+        </p>
+        <div class="checks" style="margin-top: 10px">
+          <label class="check">
+            <input v-model="settings.autoExtractMemory" type="checkbox" />
+            写完自动提取记忆
+          </label>
+          <label class="check">
+            <input v-model="settings.reviewHighRisk" type="checkbox" />
+            高风险变更必须人工确认
+          </label>
+          <label class="check">
+            <input v-model="settings.autoApplyLowRisk" type="checkbox" />
+            低风险变更直接入库
+          </label>
+        </div>
+        <p class="hint">
+          关掉「低风险直接入库」后，所有 AI 提取的变更都会进入控制台的「记忆审阅」；
+          每条变更都会记录原文依据，并可在「最近变更」里撤销。
+        </p>
+
+        <div class="divider"></div>
+        <h4 class="section-title">预算（可选）</h4>
+        <div class="budget-grid">
+          <label class="budget-field">
+            <span>单次上限（元）</span>
+            <input v-model.number="settings.budgetPerCall" class="input" type="number" min="0" step="0.1" />
+          </label>
+          <label class="budget-field">
+            <span>每日上限（元）</span>
+            <input v-model.number="settings.budgetDaily" class="input" type="number" min="0" step="0.1" />
+          </label>
+          <label class="budget-field">
+            <span>超出时</span>
+            <select v-model="settings.budgetAction" class="input">
+              <option value="warn">只提示，照常生成</option>
+              <option value="confirm">要求点「继续生成」</option>
+            </select>
+          </label>
+        </div>
+        <p class="hint">
+          0 = 不限制。金额按上面的本机价目表估算，不是服务商账单；价目表里没有的模型
+          会如实显示「价格未知」，不会按 0 元处理。每日上限只统计本书已载入的生成记录。
+        </p>
 
         <!--
           下面两节都在 v-if="desktop" **之外**：
@@ -340,6 +454,34 @@ async function testConnection() {
   border-color: var(--accent);
   color: var(--accent);
   font-weight: 600;
+}
+
+.model-split {
+  margin-top: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+}
+.model-split > summary {
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-2);
+}
+.model-row {
+  margin-top: 10px;
+}
+.budget-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 10px;
+}
+.budget-field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  font-size: 12px;
+  color: var(--text-2);
 }
 
 /* 触屏下把复选框与分段按钮放大到可点 */

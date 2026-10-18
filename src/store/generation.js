@@ -4,6 +4,7 @@ import { genId } from '../services/ids'
 import { computeCost, findPrice, estimateTokens, formatTokens, formatCost } from '../services/ai/tokenUsage'
 import { settings } from './settings'
 import { store as books } from './books'
+import { checkBudget, spentOnDay } from '../services/ai/budget'
 
 /**
  * 生成记录（generationRuns）：每一次 AI 调用一条。
@@ -15,6 +16,21 @@ import { store as books } from './books'
  *   - 「本章合计」只是按 chapterId 的聚合，用 computed 就能得到，
  *     反过来把合并后的数字存下来就再也拆不开了。
  */
+/**
+ * 生成记录里保存的提示词/输出最多留多少字符。
+ *
+ * 不存全文是刻意的：生成历史是一个**可回看**的列表，不是备份系统。
+ * 一份 6000 token 的上下文塞进每一条记录，几百章之后 IndexedDB 会被它撑爆，
+ * 而真正需要找回正文时应当去章节版本，不是这里。2 万字符足够看清
+ * 「当时让模型写了什么」，又不会让历史本身变成第二份正文库。
+ */
+export const RUN_TEXT_LIMIT = 20000
+
+function clipText(v, limit = RUN_TEXT_LIMIT) {
+  const s = String(v == null ? '' : v)
+  return s.length <= limit ? s : s.slice(0, limit)
+}
+
 export const generationStore = reactive({
   runs: [],
   loaded: false,
@@ -123,6 +139,15 @@ export function useGeneration() {
     const outputTokens = hasRealUsage ? Number(input.outputTokens) || 0 : estimateTokens(input.outputText)
     const price = findPrice(settings.pricing, input.model || settings.model)
     const cost = computeCost(inputTokens, outputTokens, price)
+    const priced = !!price && price.match !== '*'
+    // 超预算标记。这里用的是**本次之前**的今日合计（generationStore.runs 还没
+    // 加入本条），于是「这一条是否让当天越线」与其他记录如何排序无关。
+    // 预算只在当前书已载入的记录里统计，界面上必须写「本书今日」，不能暗示全局。
+    const budgetCheck = checkBudget({
+      estimate: { cost: cost ? cost.total : null },
+      settings,
+      spentToday: spentOnDay(generationStore.runs, now)
+    })
     const item = {
       id: input.id || genId(),
       bookId,
@@ -135,10 +160,29 @@ export function useGeneration() {
       outputTokens,
       cost: cost ? cost.total : 0,
       currency: cost ? cost.currency : 'CNY',
-      priced: !!price && price.match !== '*',
+      priced,
+      // 这一次调用发生时是否触及了用户设置的预算。事后在生成历史里能看出
+      // 「哪几笔是超预算的」，而不是只能凭记忆。
+      overBudget: !!budgetCheck.hit,
+      budgetLevel: budgetCheck.level || '',
       usageSource: hasRealUsage ? 'provider' : 'estimated',
       durationMs: Number(input.durationMs) || 0,
       status: input.status || 'done',
+      // 与流式草稿任务关联。事后能从生成历史追到「这一条对应哪次可能中断的生成」。
+      taskId: input.taskId || '',
+      // 失败原因与截断原因也要留痕。只记一个 status:'error' 的话，用户回头看
+      // 历史时只知道失败过，不知道是 Key 过期还是网络断了。
+      error: input.error ? String(input.error) : '',
+      finishReason: input.finishReason || '',
+      attempts: Number(input.attempts) || 1,
+      // 可复现三件套：提示词版本、请求参数、上下文摘要（层/token/丢弃/来源）。
+      // 没有它们，「上周生成得挺好、这周怎么变差了」只能靠猜。
+      promptVersion: input.promptVersion || '',
+      params: input.params || null,
+      contextSummary: input.contextSummary || null,
+      // 提示词与输出各截断到 2 万字符。存的是当时看到的东西，不是全文备份。
+      inputText: clipText(input.inputText),
+      outputText: clipText(input.outputText),
       createdAt: now,
       updatedAt: now
     }

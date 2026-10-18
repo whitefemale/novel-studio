@@ -39,6 +39,27 @@ export function registerBackButton(handler) {
 }
 
 /**
+ * 监听应用前后台切换。离开前台时调用 handler(false) —— 用它把编辑器防抖窗口
+ * 里的正文冲刷落库：安卓可能在切后台后被系统回收，那时 onBeforeUnmount 不会执行。
+ *
+ * 与 registerBackButton 一样动态导入：浏览器/Electron 产物里不会打进这个插件。
+ */
+export function registerAppStateChange(handler) {
+  if (!isNative()) return
+  import('@capacitor/app')
+    .then(({ App }) => {
+      App.addListener('appStateChange', ({ isActive }) => {
+        try {
+          handler(isActive === true)
+        } catch {
+          // 界面回调抛错不能影响原生事件分发
+        }
+      })
+    })
+    .catch(() => {})
+}
+
+/**
  * 复制文本到剪贴板。
  * WebView 里 navigator.clipboard 需要安全上下文，execCommand 已废弃且不可靠，
  * 因此原生端一律走 Clipboard 插件。

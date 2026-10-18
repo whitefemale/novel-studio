@@ -3,6 +3,8 @@ import { ref, computed, watch } from 'vue'
 import { useBooks } from '../store/books'
 import { useSettings } from '../store/settings'
 import { groupVersions, versionDelta, sourceLabel } from '../services/novel/versioning'
+import { diffText, collapsedDiff } from '../services/novel/diff'
+import { usePagedList } from '../composables/usePagedList'
 import { toast } from '../store/toast'
 
 /**
@@ -20,9 +22,9 @@ const props = defineProps({
   chapterId: { type: String, default: '' }
 })
 
-const emit = defineEmits(['restored'])
+const emit = defineEmits(['restored', 'content-changed'])
 
-const { store, restoreChapterVersion } = useBooks()
+const { store, restoreChapterVersion, addChapterWithContent } = useBooks()
 // 保留数写在提示里而不是写死：用户改了设置却不生效的话，这里就是最直接的证据
 const { settings } = useSettings()
 
@@ -65,10 +67,110 @@ const busyId = ref('')
 
 const total = computed(() => groups.value.reduce((n, g) => n + g.versions.length, 0))
 
+/*
+ * 按「章节组」分页，不按版本条数：用户的检索单位是「我第 12 章的历史」，
+ * 一次给半组版本没有意义。换书或切到编辑器的某一章时回到第一页。
+ */
+const {
+  visible: visibleGroups,
+  hasMore: hasMoreGroups,
+  total: totalGroups,
+  loadMore: loadMoreGroups
+} = usePagedList(() => groups.value, { watchKey: () => [props.chapterId, store.bookId] })
+
 const chapterContent = (chapterId) =>
   store.chapters.find((c) => c.id === chapterId)?.content ?? null
 
 const alive = (chapterId) => store.chapters.some((c) => c.id === chapterId)
+
+// ---------------- 版本对比 ----------------
+//
+// 对比范围**限定在一章之内**：跨章比两个版本没有意义（它们讲的是不同的内容），
+// 而「左版右版」两个下拉放在每组自己的展开区里，正是为了从结构上避免这种误用。
+const compareGroup = ref('') // 正在对比的章节 id
+const cmpA = ref('') // 左版：某个版本 id
+const cmpB = ref('current') // 右版：'current' 或某个版本 id
+const draftBusy = ref('')
+
+function groupOf(chapterId) {
+  return groups.value.find((g) => g.chapterId === chapterId)
+}
+
+function versionIn(group, id) {
+  return group?.versions.find((v) => v.id === id) || null
+}
+
+/** 打开某一组的对比面板；默认左版 = 点的那一版，右版 = 当前正文。 */
+function startCompare(g, v) {
+  compareGroup.value = g.chapterId
+  cmpA.value = v.id
+  cmpB.value = 'current'
+}
+
+function toggleCompare(g) {
+  if (compareGroup.value === g.chapterId) {
+    compareGroup.value = ''
+    return
+  }
+  compareGroup.value = g.chapterId
+  cmpA.value = g.versions[0]?.id || ''
+  cmpB.value = 'current'
+}
+
+const compareData = computed(() => {
+  const g = groupOf(compareGroup.value)
+  if (!g || !cmpA.value) return null
+  const a = versionIn(g, cmpA.value)
+  if (!a) return null
+  const b = cmpB.value === 'current' ? null : versionIn(g, cmpB.value)
+  if (cmpB.value !== 'current' && !b) return null
+  const after = b ? b.content || '' : (chapterContent(g.chapterId) ?? '')
+  const res = diffText(a.content || '', after)
+  return {
+    a,
+    b,
+    afterLabel: b ? `${fmtTime(b.createdAt)} 的那一版` : '当前正文',
+    rows: collapsedDiff(res.lines, 3),
+    stats: res.stats,
+    stale: !b && chapterContent(g.chapterId) == null
+  }
+})
+
+const cmpStatsText = computed(() => {
+  const d = compareData.value
+  if (!d) return ''
+  const { stats } = d
+  return `新增 ${stats.added} 行 · 删除 ${stats.removed} 行 · ${stats.beforeWords} → ${stats.afterWords} 字`
+})
+
+/**
+ * 复制为草稿：把旧版内容**新建一章**，不碰当前章。
+ *
+ * 这是「我想要的只是旧稿里的那一段，但不想把整章退回去」的出口。做成新章节
+ * 而不是覆盖当前章，是因为这是一次纯增量操作 —— 即使复制错了，删掉新章即可，
+ * 没有任何原有内容被改动。
+ */
+async function copyAsDraft(g, v) {
+  if (draftBusy.value) return
+  draftBusy.value = v.id
+  try {
+    const title = `【旧稿】${v.chapterTitle || g.chapterTitle || '未命名章节'}`
+    const ch = await addChapterWithContent(v.content || '', title, {
+      summary: `来自 ${fmtTime(v.createdAt)} 的旧版（${sourceLabel(v.source)}）`
+    })
+    if (!ch) {
+      toast('这本书已经关了，无法创建草稿', 'error')
+      return
+    }
+    toast(`已把旧版复制为第 ${ch.order} 章「${title}」`, 'success')
+    emit('content-changed')
+  } catch (e) {
+    console.error('[versions] 复制为草稿失败', e)
+    toast('复制失败：' + String((e && e.message) || e), 'error')
+  } finally {
+    draftBusy.value = ''
+  }
+}
 
 function toggleGroup(id) {
   const next = new Set(openGroups.value)
@@ -139,7 +241,12 @@ async function restore(v) {
       还没有任何版本。点编辑器工具栏的「存档」可以先留一个点。
     </div>
 
-    <div v-for="g in groups" :key="g.chapterId" class="cv-group" :class="{ dead: !g.alive }">
+    <div
+      v-for="g in visibleGroups"
+      :key="g.chapterId"
+      class="cv-group"
+      :class="{ dead: !g.alive }"
+    >
       <button class="cv-ghead" @click="toggleGroup(g.chapterId)">
         <span class="cv-caret">{{ openGroups.has(g.chapterId) ? '▾' : '▸' }}</span>
         <span class="cv-gtitle">
@@ -149,13 +256,79 @@ async function restore(v) {
       </button>
 
       <div v-if="openGroups.has(g.chapterId)" class="cv-list">
+        <div class="cv-cmp-toggle">
+          <button class="btn ghost sm" @click="toggleCompare(g)">
+            {{ compareGroup === g.chapterId ? '收起版本对比' : '版本对比' }}
+          </button>
+        </div>
+
+        <!-- 对比面板限定在本组之内：跨章比两个版本没有意义 -->
+        <div v-if="compareGroup === g.chapterId" class="cv-cmp">
+          <div class="cv-cmp-picks">
+            <label>
+              左版
+              <select v-model="cmpA" class="select">
+                <option v-for="v in g.versions" :key="v.id" :value="v.id">
+                  {{ fmtTime(v.createdAt) }} · {{ sourceLabel(v.source) }} · {{ v.wordCount }} 字
+                </option>
+              </select>
+            </label>
+            <label>
+              右版
+              <select v-model="cmpB" class="select">
+                <option v-if="alive(g.chapterId)" value="current">当前正文</option>
+                <option v-for="v in g.versions" :key="v.id" :value="v.id">
+                  {{ fmtTime(v.createdAt) }} · {{ sourceLabel(v.source) }} · {{ v.wordCount }} 字
+                </option>
+              </select>
+            </label>
+          </div>
+
+          <template v-if="compareData">
+            <div class="cv-cmp-stats">
+              {{ cmpStatsText }}
+              <span v-if="compareData.stats.truncated" class="cv-cmp-warn">
+                · 文本过长，按整块替换显示（精确行数未计算）
+              </span>
+            </div>
+            <div class="cv-diff">
+              <div
+                v-for="(row, i) in compareData.rows"
+                :key="i"
+                class="dline"
+                :class="row.type"
+              >
+                <template v-if="row.type === 'skip'">
+                  <span class="dskip">… 省略 {{ row.count }} 行未变化的内容 …</span>
+                </template>
+                <template v-else>
+                  <span class="dno">{{ row.type === 'add' ? (row.bLine ?? '') : (row.aLine ?? '') }}</span>
+                  <span class="dmark">{{ row.type === 'add' ? '+' : row.type === 'del' ? '−' : ' ' }}</span>
+                  <span class="dtext">{{ row.text }}</span>
+                </template>
+              </div>
+            </div>
+            <p class="cv-hint">
+              左版：{{ fmtTime(compareData.a.createdAt) }}（{{ sourceLabel(compareData.a.source) }}）→
+              右版：{{ compareData.afterLabel }}。
+              <span v-if="compareData.stale" class="cv-cmp-warn">章节已删除，右版按空正文计算。</span>
+            </p>
+          </template>
+          <p v-else class="cv-hint">选择两个版本开始对比；右版可以选「当前正文」。</p>
+        </div>
+
         <div v-for="v in g.versions" :key="v.id" class="cv-item">
           <div class="cv-row">
             <span class="cv-time">{{ fmtTime(v.createdAt) }}</span>
             <span class="cv-src" :class="`src-${v.source}`">{{ sourceLabel(v.source) }}</span>
             <span class="cv-wc">{{ v.wordCount }} 字</span>
             <span v-if="alive(g.chapterId)" class="cv-delta">{{ deltaText(v) }}</span>
+            <span v-if="v.note" class="cv-note" :title="v.note">{{ v.note }}</span>
             <span class="cv-ops">
+              <button class="btn ghost sm" @click="startCompare(g, v)">对比</button>
+              <button class="btn ghost sm" @click="copyAsDraft(g, v)" :disabled="draftBusy === v.id">
+                {{ draftBusy === v.id ? '复制中…' : '复制为草稿' }}
+              </button>
               <button
                 class="btn ghost sm"
                 @click="openVersion = openVersion === v.id ? '' : v.id"
@@ -175,6 +348,12 @@ async function restore(v) {
           <pre v-if="openVersion === v.id" class="cv-text">{{ v.content }}</pre>
         </div>
       </div>
+    </div>
+
+    <div v-if="hasMoreGroups" class="cv-more">
+      <button class="btn sm" @click="loadMoreGroups">
+        加载更多章节（还有 {{ totalGroups - visibleGroups.length }} 章有历史版本）
+      </button>
     </div>
   </div>
 </template>
@@ -209,6 +388,11 @@ async function restore(v) {
   color: var(--text-3);
   font-size: 13px;
   padding: 16px 0;
+}
+.cv-more {
+  display: flex;
+  justify-content: center;
+  padding: 4px 0;
 }
 .cv-group {
   border: 1px solid var(--border);
@@ -307,5 +491,95 @@ async function restore(v) {
   word-break: break-word;
   font-family: inherit;
   color: var(--text-2);
+}
+.cv-note {
+  color: var(--text-3);
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cv-cmp-toggle {
+  padding: 6px 12px;
+  border-bottom: 1px dashed var(--border);
+}
+.cv-cmp {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-muted);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.cv-cmp-picks {
+  display: flex;
+  gap: 14px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  color: var(--text-2);
+}
+.cv-cmp-picks label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.cv-cmp-picks .select {
+  max-width: 260px;
+}
+.cv-cmp-stats {
+  font-size: 12px;
+  color: var(--text-2);
+  font-variant-numeric: tabular-nums;
+}
+.cv-cmp-warn {
+  color: #b8860b;
+}
+.cv-diff {
+  max-height: 360px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.7;
+}
+.dline {
+  display: flex;
+  gap: 8px;
+  padding: 0 8px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.dline.add {
+  background: rgba(46, 160, 67, 0.12);
+  color: var(--success);
+}
+.dline.del {
+  background: rgba(248, 81, 73, 0.1);
+  color: var(--danger);
+}
+.dline.equal {
+  color: var(--text-2);
+}
+.dno {
+  flex-shrink: 0;
+  width: 34px;
+  text-align: right;
+  color: var(--text-3);
+  user-select: none;
+}
+.dmark {
+  flex-shrink: 0;
+  width: 10px;
+  user-select: none;
+}
+.dtext {
+  flex: 1;
+  min-width: 0;
+}
+.dskip {
+  color: var(--text-3);
+  padding: 2px 0;
 }
 </style>

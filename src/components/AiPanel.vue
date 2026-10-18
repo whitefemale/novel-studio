@@ -1,15 +1,34 @@
 <script setup>
-import { ref, computed, watch, nextTick } from 'vue'
+import { ref, computed, watch, nextTick, onBeforeUnmount } from 'vue'
 import { useBooks } from '../store/books'
 import { useSettings } from '../store/settings'
 import { useGeneration, describeRun, aggregateRuns } from '../store/generation'
 import { useNovelMemory } from '../store/novelMemory'
 import { useStoryStructure } from '../store/storyStructure'
-import { chatStream } from '../services/llm'
+import { chatStreamReliable } from '../services/ai/request'
+import { describeError } from '../services/ai/errors'
 import { buildMessages } from '../services/prompts'
 import { runChapterWorkflow, DEFAULT_STAGES, STAGE_LABELS } from '../services/ai/orchestrator'
+import {
+  startTask,
+  saveDraft,
+  finishTask,
+  discardTask,
+  settleOnOpen,
+  appendDraft,
+  shouldFlushDraft,
+  taskSummary
+} from '../services/ai/taskStore'
 import { ACTIONS, WORKFLOW_ACTIONS } from '../services/novel/actions'
-import { providerFromUrl, formatTokens, formatCost } from '../services/ai/tokenUsage'
+import {
+  providerFromUrl,
+  formatTokens,
+  formatCost,
+  estimateTokens
+} from '../services/ai/tokenUsage'
+import { settingsForStage, modelForStage } from '../services/ai/models'
+import { estimateCall, checkBudget, spentOnDay } from '../services/ai/budget'
+import { buildContext } from '../services/novel/contextBuilder'
 import { copyToClipboard } from '../services/native'
 import { toast } from '../store/toast'
 
@@ -51,6 +70,15 @@ const useWorkflow = computed(() => WORKFLOW_ACTIONS.includes(mode.value))
 // 编排器一次跑两个阶段，所以这里是数组而不是单条 —— 只显示合计会让
 // 「提取记忆也花钱」这件事看不见。
 const sessionRuns = ref([])
+// 预算提示。两种形态刻意分开：
+//   budgetGate   —— 必须点「继续生成」（budgetAction='confirm'）
+//   budgetNotice —— 只提示，生成照常进行（budgetAction='warn'）
+// 都不用 window.confirm：Electron 与 Android WebView 都不实现它（坑 #12）。
+const budgetGate = ref(null)
+const budgetNotice = ref('')
+// 用户已经对当前这次生成点过「继续」。放在组件级而不是传给 generate()，
+// 因为确认后会重新走一遍 generate 的校验与预检。
+let budgetAcknowledged = false
 const memoryNote = ref('')
 const stageLabel = ref('')
 const showUsageDetail = ref(false)
@@ -60,6 +88,169 @@ const lastMeta = ref(null)
 // 最近一次编排器运行的 id。用来把「AI 覆盖前」那一版正文与生成历史里的那次调用
 // 对上号 —— 用户事后能看出「这一版是被哪一次生成、花了多少钱覆盖掉的」。
 const lastRunId = ref(null)
+
+// ---------------- 流式草稿与崩溃恢复 ----------------
+// currentTask 是本次生成对应的任务记录（落库在 generationTasks）。它只在本组件
+// 存活期间有意义；应用重启后靠 settleOnOpen 把遗留的 running 标成 interrupted。
+const currentTask = ref(null)
+const recovery = ref(null)
+const recoveryText = computed(() => (recovery.value ? taskSummary(recovery.value) : ''))
+
+// 草稿节流的「上一次真正写库」的口径。改成上一次**调用**的时间会让每来一个字
+// 就重置窗口，节流永远不会触发。
+let draftLastFlushAt = 0
+let draftLastFlushLength = 0
+let draftChain = Promise.resolve()
+
+/**
+ * 打开书时扫描上次遗留的任务。
+ *
+ * 只改「running 且不是本会话正在跑的那条」——如果这里无条件把 running 全标成
+ * interrupted，正在生成的请求会在某次 bookId 变化时被误标为中断。
+ */
+watch(
+  () => store.bookId,
+  async (id) => {
+    if (!id) {
+      recovery.value = null
+      return
+    }
+    try {
+      const res = await settleOnOpen(id, { activeTaskId: currentTask.value?.id || null })
+      if (res.recoverable && !currentTask.value) recovery.value = res.recoverable
+    } catch (e) {
+      // 草稿扫描失败不能阻断写作：最坏的结果只是这次没有恢复条。
+      console.error('[ai] 草稿任务扫描失败', e)
+    }
+  },
+  { immediate: true }
+)
+
+/** 生成开始时建一条任务。建失败不阻断生成，只是少了崩溃恢复这一层。 */
+async function beginTask() {
+  const bookId = store.bookId
+  if (!bookId) return ''
+  const stages = useWorkflow.value
+    ? settings.autoExtractMemory === false
+      ? ['write']
+      : DEFAULT_STAGES
+    : ['write']
+  try {
+    const task = await startTask(bookId, {
+      chapterId: currentChapter.value?.id || '',
+      action: mode.value,
+      stages,
+      model: modelForStage(settings, useWorkflow.value ? 'write' : 'outline') || ''
+    })
+    currentTask.value = task
+    draftLastFlushAt = 0
+    draftLastFlushLength = 0
+    return task?.id || ''
+  } catch (e) {
+    console.error('[ai] 草稿任务创建失败', e)
+    currentTask.value = null
+    return ''
+  }
+}
+
+/** 流式增量：先更新界面，再节流落草稿。 */
+function handleDelta(t) {
+  output.value += t
+  scrollOut()
+  if (!currentTask.value || !t) return
+  currentTask.value = appendDraft(currentTask.value, t)
+  if (
+    shouldFlushDraft({
+      text: currentTask.value.outputText,
+      lastFlushAt: draftLastFlushAt,
+      lastFlushLength: draftLastFlushLength
+    })
+  ) {
+    flushDraft()
+  }
+}
+
+/**
+ * 写一次草稿。用一条链串起来，保证后一次写不会先于前一次落库 ——
+ * 否则 finishTask 之后还可能有一条旧草稿把任务状态改回 running。
+ */
+function flushDraft() {
+  const task = currentTask.value
+  const bookId = store.bookId
+  if (!task || !bookId) return draftChain
+  const snapshot = task
+  draftChain = draftChain
+    .then(() => saveDraft(bookId, snapshot))
+    .then(() => {
+      draftLastFlushAt = Date.now()
+      draftLastFlushLength = snapshot.outputText.length
+    })
+    .catch((e) => {
+      // 写失败时**不**更新时间戳，下一个增量会立刻再试一次。
+      console.error('[ai] 草稿落库失败', e)
+    })
+  return draftChain
+}
+
+/** 收尾：先等草稿链清空，再写最终状态，避免旧草稿把状态覆盖回 running。 */
+async function settleCurrentTask(status, opts = {}) {
+  const task = currentTask.value
+  const bookId = store.bookId
+  if (!task || !bookId) return
+  await draftChain
+  try {
+    await finishTask(bookId, { ...task, outputText: output.value }, { status, ...opts })
+  } catch (e) {
+    console.error('[ai] 草稿任务收尾失败', e)
+  }
+  currentTask.value = null
+  draftLastFlushAt = 0
+  draftLastFlushLength = 0
+}
+
+function loadRecovery() {
+  const task = recovery.value
+  if (!task) return
+  output.value = task.outputText
+  if (MODES.some((m) => m.key === task.action)) mode.value = task.action
+  error.value = ''
+  recovery.value = null
+  toast('已载入上次中断的草稿；可检查后插入正文', 'info')
+}
+
+async function insertRecovery() {
+  const task = recovery.value
+  if (!task) return
+  recovery.value = null
+  output.value = task.outputText
+  await insertToChapter()
+  await discardTask(store.bookId, task.id)
+}
+
+async function discardRecovery() {
+  const task = recovery.value
+  if (!task) return
+  recovery.value = null
+  try {
+    await discardTask(store.bookId, task.id)
+  } catch (e) {
+    console.error('[ai] 丢弃草稿失败', e)
+  }
+  toast('已丢弃中断的草稿', 'info')
+}
+
+function regenerateRecovery() {
+  // 「重新生成」是一次**新的调用**，会重新计费。旧草稿留着不删：
+  // 新调用失败时用户还能回到恢复条重新选择。
+  recovery.value = null
+  generate()
+}
+
+onBeforeUnmount(() => {
+  // 卸载前尽力把最后一段草稿写下去。这是即发即忘的路径：组件已经卸载，
+  // 写失败也没有地方报错，但节流窗口最长只有 1.5 秒，代价是有界的。
+  flushDraft()
+})
 
 const usageLine = computed(() => {
   const runs = sessionRuns.value
@@ -143,6 +334,104 @@ function pushRun(record) {
   if (record) sessionRuns.value = [...sessionRuns.value, record]
 }
 
+/** 编排器与预算预检共用的输入。每次都现取，避免持有过期的章节快照。 */
+function workflowInput(taskId) {
+  return {
+    book: store.book,
+    bookId: store.bookId,
+    chapter: currentChapter.value,
+    chapters: store.chapters,
+    outlines: store.outlines,
+    memory: memory.store,
+    structure: structure.store,
+    styleProfiles: structure.store.styleProfiles || [],
+    settings,
+    action: mode.value,
+    instruction: instruction.value,
+    selection: targetText.value,
+    taskId
+  }
+}
+
+/** 记忆与剧情结构可能还没载入 —— 用户这一轮可能压根没开过控制台。 */
+async function ensureContextLoaded(bookId) {
+  await Promise.all([
+    memory.store.loaded ? null : memory.loadForBook(bookId),
+    structure.store.loaded ? null : structure.loadForBook(bookId)
+  ])
+}
+
+function budgetText(check, estimate, spentToday) {
+  const money = (n) =>
+    formatCost({ total: Number(n) || 0, currency: estimate?.currency || 'CNY' }) || '¥0'
+  if (estimate?.cost == null) {
+    return (
+      '价目表里没有当前模型的价格，本次金额无法估算（这不代表免费）。' +
+      '你设置了预算上限，继续前请确认。'
+    )
+  }
+  const parts = [
+    `本次预计 ${money(estimate.cost)}（约 ${formatTokens(estimate.inputTokens)} 输入 + ` +
+      `${formatTokens(estimate.outputTokens)} 输出 tokens）。`
+  ]
+  if (check.level === 'per-call' || check.level === 'both') {
+    parts.push(`超过单次上限 ${money(check.perCallLimit)}。`)
+  }
+  if (check.level === 'daily' || check.level === 'both') {
+    parts.push(
+      `本书今日已用 ${money(spentToday?.total)}，本次后约 ${money(check.projected)}，` +
+        `超过每日上限 ${money(check.dailyLimit)}。`
+    )
+  }
+  if (check.level === 'unknown') {
+    parts.push('本书今日有未定价的调用，合计不完整，无法判断是否超过每日上限。')
+  }
+  parts.push('金额按设置里的本机价目表估算，不是服务商账单。')
+  return parts.join('')
+}
+
+/**
+ * 请求前的预算检查。唯一真相来源是设置里的两个上限 —— 都为 0 时整段跳过，
+ * 不读库、不组装上下文（预算功能关闭时不该给每次生成增加开销）。
+ *
+ * 估算失败一律放行：预算是提示，不是安全边界，不能因为预检自身出错就把
+ * 写作按钮变成不可用。
+ */
+async function preflightBudget() {
+  const perCall = Number(settings.budgetPerCall) || 0
+  const daily = Number(settings.budgetDaily) || 0
+  if (!perCall && !daily) return null
+  const bookId = store.bookId
+  if (!bookId) return null
+  try {
+    let inputTokens = 0
+    if (useWorkflow.value) {
+      await ensureContextLoaded(bookId)
+      inputTokens = buildContext(workflowInput('')).metadata.totalTokens
+    } else {
+      const messages = buildMessages(mode.value, {
+        book: store.book,
+        chapter: currentChapter.value,
+        chapters: store.chapters,
+        outlines: store.outlines,
+        settings,
+        selection: targetText.value,
+        instruction: instruction.value
+      })
+      inputTokens = estimateTokens(messages.map((m) => m.content).join('\n'))
+    }
+    const model = modelForStage(settings, useWorkflow.value ? 'write' : 'outline')
+    const estimate = estimateCall({ settings, inputTokens, outputTokens: settings.maxTokens, model })
+    const spentToday = spentOnDay(gen.store.runs, Date.now())
+    const check = checkBudget({ estimate, settings, spentToday })
+    if (!check.hit) return null
+    return { ...check, mode: mode.value, estimate, text: budgetText(check, estimate, spentToday) }
+  } catch (e) {
+    console.warn('[budget] 预算预检失败，已跳过', e)
+    return null
+  }
+}
+
 async function generate() {
   if (generating.value) return
   if (!settings.apiKey) {
@@ -151,23 +440,64 @@ async function generate() {
   }
 
   error.value = ''
+  budgetNotice.value = ''
+  if (!budgetAcknowledged) {
+    const gate = await preflightBudget()
+    if (gate) {
+      if (gate.action === 'confirm') {
+        budgetGate.value = gate
+        return
+      }
+      budgetNotice.value = gate.text
+    }
+  }
+  budgetAcknowledged = false
+  budgetGate.value = null
+  await runGeneration()
+}
+
+/** 用户点「继续生成」。模式在确认框打开期间被改过时，按新模式下重新估一次。 */
+async function confirmBudget() {
+  const gate = budgetGate.value
+  budgetGate.value = null
+  if (gate && gate.mode !== mode.value) {
+    budgetAcknowledged = false
+    await generate()
+    return
+  }
+  budgetAcknowledged = true
+  await generate()
+}
+
+function cancelBudget() {
+  budgetGate.value = null
+  budgetAcknowledged = false
+}
+
+async function runGeneration() {
   output.value = ''
   sessionRuns.value = []
   memoryNote.value = ''
   stageLabel.value = ''
   showUsageDetail.value = false
   lastMeta.value = null
+  recovery.value = null
   generating.value = true
 
   try {
-    if (useWorkflow.value) await generateViaWorkflow()
-    else await generateViaLegacy()
+    const taskId = await beginTask()
+    if (useWorkflow.value) await generateViaWorkflow(taskId)
+    else await generateViaLegacy(taskId)
   } catch (e) {
     // 走到这里说明是流程本身出错，而不是模型返回了错误。必须兜住：
     // 漏出去会让 generating 永远停在 true，按钮再也点不动。
     error.value = String((e && e.message) || e)
+    await settleCurrentTask('error', { error: error.value })
     console.error('[ai] 生成流程异常', e)
   } finally {
+    // 正常路径已经在各自回调里收尾；这里兜住「回调没被调用就退出」的残余情况，
+    // 否则任务会永远停在 running，下次开书被误报成「上次生成中断」。
+    if (currentTask.value) await settleCurrentTask('error', { error: error.value || '生成流程异常结束' })
     generating.value = false
     abortFn = null
     stageLabel.value = ''
@@ -181,7 +511,7 @@ async function generate() {
  * 世界规则、时间线与伏笔，它们本就不该触发记忆提取；而且一次改五个入口会让
  * 回归面失控。编排器只接「续写」与「生成章节」。
  */
-function generateViaLegacy() {
+function generateViaLegacy(taskId) {
   const messages = buildMessages(mode.value, {
     book: store.book,
     chapter: currentChapter.value,
@@ -191,6 +521,10 @@ function generateViaLegacy() {
     selection: targetText.value,
     instruction: instruction.value
   })
+  // 扩写 / 改写 / 大纲共用一个模型槽：它们都是「对已有文字或规划动笔」，
+  // 与逐章续写的要求不同，但彼此之间的要求相近。未配置时回退到通用模型。
+  const legacySettings = settingsForStage(settings, 'outline')
+  const legacyModel = modelForStage(settings, 'outline')
 
   // 三点都记下来供结算用：起点时间、提示词原文（端点不回 usage 时按它估算）、
   // 以及端点返回的真实用量。
@@ -208,13 +542,15 @@ function generateViaLegacy() {
             action: mode.value,
             stage: 'write',
             provider: providerFromUrl(settings.baseUrl),
-            model: settings.model,
+            model: legacyModel,
             inputTokens: usage?.inputTokens,
             outputTokens: usage?.outputTokens,
             inputText: promptText,
             outputText: output.value,
             durationMs: Date.now() - startedAt,
-            status
+            status,
+            taskId: taskId || '',
+            error: status === 'error' ? error.value : ''
           })
         )
       } catch (e) {
@@ -224,26 +560,45 @@ function generateViaLegacy() {
       resolve()
     }
 
-    const { abort } = chatStream({
-      settings,
+    // 可靠封装：仅在还没收到正文时对 network/timeout/429/5xx 自动重试，
+    // 最多两次，每次经 onRetry 告诉界面。收到正文后绝不自动重发（会再次计费）。
+    const { abort } = chatStreamReliable({
+      settings: legacySettings,
       messages,
       callbacks: {
-        onDelta: (t) => {
-          output.value += t
-          scrollOut()
-        },
+        onDelta: handleDelta,
         onUsage: (u) => {
           usage = u
         },
         onDone: async () => {
+          stageLabel.value = ''
+          await settleCurrentTask('done')
           await settle('done')
           toast('生成完成', 'success')
         },
-        onError: async (msg) => {
+        onTruncated: async (info) => {
+          stageLabel.value = ''
+          error.value = describeError(info, { includeDetail: false })
+          await settleCurrentTask('truncated', {
+            error: error.value,
+            finishReason: info?.finishReason || 'length'
+          })
+          await settle('truncated')
+          toast('已达到输出上限，正文被截断：已收到的内容已保留', 'error')
+        },
+        onError: async (info) => {
+          stageLabel.value = ''
+          const msg = typeof info === 'string' ? info : describeError(info, { includeDetail: false })
+          error.value = msg || '请求失败'
+          await settleCurrentTask('error', { error: error.value })
           await settle('error')
-          error.value = msg
+        },
+        onRetry: ({ attempt, delayMs, category }) => {
+          stageLabel.value = `请求失败（${category}），${Math.round((delayMs || 0) / 1000)} 秒后进行第 ${attempt} 次重试…`
         },
         onAborted: async () => {
+          stageLabel.value = ''
+          await settleCurrentTask('aborted', { abortedByUser: true })
           await settle('aborted')
           toast('已停止生成', 'info')
         }
@@ -260,7 +615,7 @@ function generateViaLegacy() {
  * 组装（人物状态、世界规则、伏笔、近期摘要都在里面），而不是「最近三章 +
  * 几段扁平设定」。
  */
-async function generateViaWorkflow() {
+async function generateViaWorkflow(taskId) {
   const bookId = store.bookId
   if (!bookId) {
     error.value = '请先打开一本书'
@@ -269,41 +624,27 @@ async function generateViaWorkflow() {
 
   // 记忆与剧情结构可能还没载入 —— 用户这一轮可能压根没开过控制台。
   // 不载的话 Context Builder 只剩「最近几章」可用，那正是 V2 要治的病。
-  await Promise.all([
-    memory.store.loaded ? null : memory.loadForBook(bookId),
-    structure.store.loaded ? null : structure.loadForBook(bookId)
-  ])
+  // 文风档案也随 storyStructure 一起载入（见 STRUCTURE_COLLECTIONS）。
+  await ensureContextLoaded(bookId)
 
   const wf = await runChapterWorkflow({
-    input: {
-      book: store.book,
-      bookId,
-      chapter: currentChapter.value,
-      chapters: store.chapters,
-      outlines: store.outlines,
-      memory: memory.store,
-      structure: structure.store,
-      settings,
-      action: mode.value,
-      instruction: instruction.value,
-      selection: targetText.value
-    },
+    input: workflowInput(taskId),
     settings,
     // 「写 + 提取」是默认档。关掉自动提取后这条链只剩写正文一次调用，
     // 用户仍可随时在控制台里手动触发提取。
     stages: settings.autoExtractMemory === false ? ['write'] : DEFAULT_STAGES,
     recordRun,
     callbacks: {
-      onDelta: (t) => {
-        output.value += t
-        scrollOut()
-      },
+      onDelta: handleDelta,
       onStage: ({ stage, status, record }) => {
         if (status === 'start') stageLabel.value = STAGE_LABELS[stage] || stage
         else {
           pushRun(record)
           stageLabel.value = ''
         }
+      },
+      onRetry: ({ attempt, delayMs, category }) => {
+        stageLabel.value = `请求失败（${category}），${Math.round((delayMs || 0) / 1000)} 秒后进行第 ${attempt} 次重试…`
       },
       // 中止句柄是**同步**回调出来的。等 runChapterWorkflow 返回再拿，
       // 生成早就结束了，「停止」按钮等于摆设。
@@ -316,16 +657,30 @@ async function generateViaWorkflow() {
   lastMeta.value = wf.chapterMeta || null
   lastRunId.value = wf.run.id || null
   const writeStage = wf.run.stages.find((s) => s.id === 'write')
-  if (writeStage && writeStage.status === 'error') {
+  if (wf.truncated || (writeStage && writeStage.status === 'truncated')) {
+    // 截断**保留**已收到的正文，但不算完整成功：后续的记忆提取也刻意没有跑，
+    // 拿半章去提取会得到半章的事实。
+    error.value = wf.truncatedMessage || writeStage?.note || '输出达到上限被截断'
+    await settleCurrentTask('truncated', {
+      error: error.value,
+      finishReason: 'length'
+    })
+    toast('已达到输出上限，正文被截断：已收到的内容已保留', 'error')
+  } else if (writeStage && writeStage.status === 'error') {
     error.value = writeStage.error || '生成失败'
-  } else if (wf.run.status === 'aborted') {
+    await settleCurrentTask('error', { error: error.value })
+  } else if (wf.run.status === 'aborted' || (writeStage && writeStage.status === 'aborted')) {
+    await settleCurrentTask('aborted', { abortedByUser: true })
     toast('已停止生成', 'info')
-  } else if (wf.error) {
-    // 提取失败**不算**这一章失败：正文已经拿到手了。把它显示成红色报错会让
-    // 用户以为这一章白写了。
-    toast(`记忆提取未完成：${wf.error}`, 'error')
   } else {
-    toast('生成完成', 'success')
+    // 提取失败**不算**这一章失败：正文已经拿到手了，草稿也是完整的。
+    await settleCurrentTask('done')
+    if (wf.error) {
+      // 把它显示成红色报错会让用户以为这一章白写了。
+      toast(`记忆提取未完成：${wf.error}`, 'error')
+    } else {
+      toast('生成完成', 'success')
+    }
   }
 
   const { applied, queued } = wf
@@ -444,6 +799,21 @@ function clearOutput() {
     </div>
 
     <div class="ai-body">
+      <div v-if="recovery && !generating" class="recovery-bar" :title="recoveryText">
+        <div class="recovery-text">
+          <b>上次生成中断</b>，已保留 {{ recovery.outputText.length }} 字草稿。
+          <span class="recovery-sub">
+            只恢复了已经收到的内容；中断的服务端请求不会恢复。
+          </span>
+        </div>
+        <div class="recovery-ops">
+          <button class="btn sm primary" @click="loadRecovery">载入到输出框</button>
+          <button class="btn sm" @click="insertRecovery">插入正文</button>
+          <button class="btn sm" @click="regenerateRecovery">重新生成</button>
+          <button class="btn sm ghost" @click="discardRecovery">丢弃</button>
+        </div>
+      </div>
+
       <div v-if="hints" class="hint" :class="{ warn: mode === 'chapter' && !hasOutline }">
         <template v-if="needTarget && props.selectionText">
           已选中 {{ props.selectionText.length }} 字
@@ -467,6 +837,18 @@ function clearOutput() {
         :placeholder="placeholders"
         rows="2"
       ></textarea>
+
+      <div v-if="budgetGate" class="budget-gate" role="alert">
+        <div class="budget-text">⚠ {{ budgetGate.text }}</div>
+        <div class="budget-ops">
+          <button class="btn sm primary" @click="confirmBudget">继续生成</button>
+          <button class="btn sm ghost" @click="cancelBudget">取消</button>
+        </div>
+      </div>
+      <div v-else-if="budgetNotice" class="budget-note" role="status">
+        <span>⚠ {{ budgetNotice }}</span>
+        <button class="btn ghost sm" title="关闭提示" @click="budgetNotice = ''">关闭</button>
+      </div>
 
       <button
         class="btn lg block gen-btn"
@@ -587,6 +969,29 @@ function clearOutput() {
   flex-direction: column;
   gap: 10px;
 }
+.recovery-bar {
+  border: 1px solid var(--accent);
+  background: var(--accent-soft);
+  border-radius: var(--radius-sm);
+  padding: 9px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.recovery-text {
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--text-2);
+}
+.recovery-sub {
+  display: block;
+  color: var(--text-3);
+}
+.recovery-ops {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
 .hint {
   font-size: 12px;
   color: var(--text-3);
@@ -606,6 +1011,36 @@ function clearOutput() {
 .gen-btn {
   border-radius: 10px;
   font-weight: 600;
+}
+.budget-gate {
+  border: 1px solid var(--warn, #b7791f);
+  background: var(--warn-soft, #fffaf0);
+  border-radius: var(--radius-sm);
+  padding: 9px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.budget-text {
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--text-2);
+}
+.budget-ops {
+  display: flex;
+  gap: 6px;
+}
+.budget-note {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+  border: 1px dashed var(--warn, #b7791f);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--text-2);
 }
 .error {
   background: var(--danger-soft);

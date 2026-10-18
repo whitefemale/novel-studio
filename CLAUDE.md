@@ -26,11 +26,17 @@ npx cap sync android && (cd android && JAVA_HOME="C:/Android/jdk21" ./gradlew as
 git tag -a v1.0.1 -m "Novel Studio v1.0.1" && git push origin v1.0.1
 ```
 
-自动化测试（Electron 冒烟测试）：
+自动化测试：
 
 ```bash
-npm run build && SMOKE_TEST=1 npx electron .
+npm test                                           # Node 内置 node:test，156 项，秒级
+npm run build && SMOKE_TEST=1 npx electron .       # Electron 端到端冒烟，180 项断言
 ```
+
+`npm test` 只跑 `tests/unit/*.test.mjs` 里的纯函数与内存态断言，不碰 IndexedDB / Electron，
+CI 的 windows 与 android job 都会执行。`src/package.json` 里的 `"type": "module"` 是必需项：
+根目录 `package.json` 不能加（`electron/main.js` 是 CommonJS），但那会让 Node 把 `src/` 下的
+`.js` 当成 CommonJS，而它们全是 ESM。测试 import 时显式写 `.js` 扩展名。
 
 冒烟测试全自动驱动核心逻辑并在主进程 stdout 打印结果，无交互、自动退出。成功时输出 `SMOKE_MOUNT ...`、`SMOKE_DETAIL {... "pass": true}`；失败时打印 `SMOKE_EVAL_ERROR` / `SMOKE_TEST_ERROR` / `SMOKE_FAIL`（见「冒烟测试机制」）。
 
@@ -40,8 +46,9 @@ npm run build && SMOKE_TEST=1 npx electron .
 
 - **渲染层** `src/`：Vue 3 单 SPA（`App.vue` 顶层切换 书库/写作 两个视图）。无路由、无 UI 框架，纯 `styles.css` 白底变量 + 组件内样式。弹窗（设置 / 导出 / **小说控制台** / 全量备份）都是 `v-if` 渲染的层，**不新增第三层视图**。
   - `store/`（Composables）：`books.js` 持有全部领域状态（`store` 为模块级 `reactive` 单例：books/bookId/chapters/outlines），`settings.js` 持有全部持久化设置（AI 接口 + 保存与导出），`toast.js` 是全局轻提示队列。跨组件共享一律通过这三处，不另起本地副本。V2 又加了五个：`collectionSet.js`（一组按书隔离的集合的通用工厂）、`novelMemory.js` / `storyStructure.js`（记忆层与剧情骨架两族）、`novel.js`（按集合名路由到对应那族）、`generation.js`（生成记录与成本聚合）。它们同样是模块级 `reactive` 单例。
-  - `services/`：纯函数/无状态模块，供 store 与组件调用。`storage.js` 封装 idb-keyval；`llm.js` 是 LLM 客户端（见下）；`prompts.js` 组装 `messages`；`export.js` 生成 TXT/MD 文本与落盘分发；`autosave.js` 是自动保存调度器；`backup.js` 定时备份；`platform.js` 统一平台判定；`native.js` 是 Capacitor 插件薄封装。V2 新增两个子目录（规格书 02 要求，既有扁平文件**不移动**）：`services/ai/`（`orchestrator.js` 多阶段工作流、`tokenUsage.js` 计量与成本）、`services/novel/`（`schemas.js` 实体定义、`contextBuilder.js` 分层上下文、`snapshot.js` 全量快照，第二阶段又加了 `versioning.js` 章节版本、`timeline.js` 时间线与断链、`consistency.js` 一致性规则）。另有根级的 `services/migration.js`（V1→V2 迁移）、`services/sync.js`（局域网同步的渲染层一半，见「V2 第二阶段」）、`services/ids.js`、`services/wordCount.js`。
-  - `main.js` 额外挂 `window.__ns` 测试钩子（db / store 工厂 / buildMessages / chatStream / 导出与自动保存的纯函数等），供冒烟测试注入脚本使用。
+  - `services/`：纯函数/无状态模块，供 store 与组件调用。`storage.js` 封装 idb-keyval；`llm.js` 是 LLM 客户端（见下）；`prompts.js` 组装 `messages`；`export.js` 生成 TXT/MD 文本与落盘分发；`autosave.js` 是自动保存调度器（状态机 `idle/dirty/saving/saved/failed` + 失败重试）；`backup.js` 定时备份；`platform.js` 统一平台判定；`native.js` 是 Capacitor 插件薄封装；`secret.js` 是 safeStorage 的薄封装（浏览器回退明文并如实标记）。V2 新增两个子目录（规格书 02 要求，既有扁平文件**不移动**）：`services/ai/`（`orchestrator.js` 多阶段工作流、`tokenUsage.js` 计量与成本，V3 又加了 `errors.js` 错误分类与脱敏、`request.js` 可靠流式请求（超时/重试/退避）、`taskStore.js` 生成任务与增量草稿、`models.js` 按任务分模型、`budget.js` 花费预算）、`services/novel/`（`schemas.js` 实体定义、`contextBuilder.js` 分层上下文、`snapshot.js` 全量快照与校验和，第二阶段又加了 `versioning.js` 章节版本、`timeline.js` 时间线与断链、`consistency.js` 一致性规则；V3 又加了 `diff.js` 版本差异、`planCheck.js` 施工卡完成度、`planning.js` 锁定节点与提案、`reviewIssues.js` 审校问题状态、`retrieval.js` 检索/反向查找/全书搜索、`stats.js` 统计、`style.js` 文风、`actions.js` 动作清单）。另有根级的 `services/migration.js`（V1→V2 迁移，schemaVersion 3）、`services/sync.js`（局域网同步的渲染层一半，见「V2 第二阶段」）、`services/sync/conflicts.js`（冲突检测与确定性副本 id）、`services/ids.js`、`services/wordCount.js`。
+  - `composables/usePagedList.js`：所有大列表的「每页 100 条 + 加载更多」。**不要引入虚拟列表依赖**；`watchKey` 负责在换书 / 换集合 / 换排序时回到第一页，漏掉它的表现是「换了书仍停在第 5 页」。
+  - `main.js` 额外挂 `window.__ns` 测试钩子（db / store 工厂 / buildMessages / chatStream / 导出与自动保存的纯函数等），供冒烟测试注入脚本使用。**新增纯函数不加进去等于没被测试。**
 - **Electron 壳** `electron/`：`main.js` 创建窗口 + IPC + **局域网同步的 HTTP 服务**（见「V2 第二阶段」）；`preload.js` 通过 `contextBridge` 暴露 `window.electronAPI`。`contextIsolation: true`、`nodeIntegration: false`、`webSecurity: true`（LLM 请求必须走主进程代理，规避 CORS）。**所有 `fs` / `shell` / `dialog` 调用只在主进程**，这三个安全开关不得放开。
 
   **窗口加载哪一份前端，由 `VITE_DEV_SERVER_URL` 决定**（`main.js` 顶部二选一）：
@@ -68,8 +75,16 @@ npm run build && SMOKE_TEST=1 npx electron .
   | `sync:start` / `sync:stop` / `sync:status` / `sync:rotateCode` | invoke | 局域网同步服务的开关、状态、换码 |
   | `sync:respond` | invoke（渲染→主） | 唤醒一个挂起的 HTTP 请求（见下） |
   | `sync:incoming` | 主→渲染 推送 | 有设备来同步，把远端快照交给渲染层 |
+  | `secret:set` / `secret:get` / `secret:delete` | invoke | API Key 的 safeStorage 加密读写。`isEncryptionAvailable()` 为假时返回 `unsupported`，**绝不回退成明文落盘** |
+  | `app:before-close` | 主→渲染 推送 | 用户点了关窗，主进程先让渲染层 `flush()` 再关 |
+  | `app:close-ready` | send（渲染→主） | 冲刷完成，可以关窗。主进程另有 2 秒超时兜底 |
 
   `export:saveFile` 与 `export:writeToDir` **刻意不合并**：返回契约不同（前者是 UI 结果，后者是 I/O 结果）。
+
+  `secret:*` 的明文只在两处短暂出现：用户输入框与主进程加密前的内存。**不要给这些
+  通道加日志**；`redactSecrets` 是错误路径的最后一道防线。`app:before-close` /
+  `app:close-ready` 是关窗冲刷握手——主进程 `win.on('close')` 若不先问一句，
+  防抖窗口里的几百字会随着窗口消失。
 
   `sync:*` 是第二阶段新增的，**默认关闭**：`syncAutoStart` 为 false 时主进程不创建任何
   server 对象，端到端零监听（`syncServerUpOk` 断言 `syncStatus().running === false && port === 0`）。
@@ -85,6 +100,10 @@ npm run build && SMOKE_TEST=1 npx electron .
 - **桌面端**：`window.electronAPI.isDesktop` 为真 → 渲染进程把 `{requestId, url, headers, body}` 交给主进程 `net.fetch` 代理，服务端 SSE 行经 `webContents.send('llm:delta', {requestId, line})` 逐行回传 → `parseSseLine` 提取增量文本 → `callbacks.onDelta`。
 - **浏览器 / Android WebView**：渲染进程直接 `fetch` + `ReadableStream` 逐行解析（CORS 由服务端放行）。
 - `buildChatUrl(baseUrl)` 自动补 `/chat/completions`；`parseSseLine(line)` 解析 `data:` 行，`[DONE]`/非 SSE 返回空串。
+- **`onError` 的参数是对象**（`{ message, category, status, retryable, retryAfterMs }`），不再是字符串。分类由 `services/ai/errors.js` 做，文案经过 `redactSecrets`。
+- **空闲超时**：每次收到数据重置计时，默认 60 秒（`requestIdleTimeoutSec`），超时用 `AbortController` 中止并标记为 `timeout`，与用户主动中止区分。
+- **重试在上层**：`services/ai/request.js` 的可靠封装只对 network/timeout/429/5xx 重试（最多 `maxRetries=2`），指数退避 + 抖动并尊重 `Retry-After`；**已经收到任何正文之后绝不自动重试**——重发会重复计费，且两段文字拼不到一起。401/403/400/404 不重试。
+- **截断**：`finish_reason === 'length'` 时阶段标 `truncated` 并保留正文，界面提示「达到输出上限」，不当成完整成功。
 
 ### 重要约定与坑（改代码前必读）
 
@@ -107,18 +126,23 @@ npm run build && SMOKE_TEST=1 npx electron .
 12. **渲染进程不得使用 `window.prompt` / `window.confirm`**：Electron 与 Android WebView **都不实现**它们，在三个目标平台中有两个必然静默 no-op。需要输入就做弹窗组件（参见 `BookShelf.vue` 的编辑弹窗）。
 13. **Capacitor 插件一律 `await import('@capacitor/xxx')` 动态导入，且只在 native 分支内调用**（`native.js`）。这样 Electron 与浏览器产物里不会打进用不到的插件代码，构建产物会自然 code-split 出若干小 chunk——**`npm run build` 的模块数从 36 涨到 57 是预期结果**，不是异常。
 14. **Vue 会吞掉 watcher / 生命周期回调里抛出的错误**：它把事情 `console.error` 出去，然后**继续渲染**——组件照常挂载，界面照常出现。所以这类 bug 的症状不是白屏，而是「控制台一条报错 + 那个回调的后半段被静默跳过」，非常容易被漏掉。实例：`Editor.vue` 的 immediate watcher 回调里重置了 `findCursor`，而 `const findCursor` 当时声明在 watcher 下面（setup 自上而下执行，命中的是 TDZ `ReferenceError`）；因为不白屏，`npm run build`（只编译）、纯 store 层断言、以及「元素是否存在」的断言**全都发现不了**。两道防线：**相关状态声明一律排在 immediate watcher 之前**；冒烟测试的 `uiNoSwallowedErrors` 会劫持 `console.error` 并在整轮结束时断言没有 `ReferenceError`/`TypeError` 一类的被吞错误——**这条断言的价值高于任何「元素在不在」的检查**，改动组件后请留意它。
+15. **审校报告不落库、只落问题状态**：`reviewIssueStates` 存的是`{id, chapterId, contentHash, status}`，完整报告仍只在内存里。报告针对某一版正文，正文一改就过期；状态是用户做出的决定，值得保留。**任何读取状态的地方都必须先比对 `contentHash`**，不一致就标「报告已过期」，不能拿旧结论去吓用户。
+16. **`usePagedList` 的 `watchKey` 与「当前项可见」**：章节 / 实体 / 版本 / 历史 / 时间线的列表都分页，换书、换集合、换排序必须回到第一页（`watchKey`）；从搜索或时间线跳到远处章节时，侧栏要 `ensureChapterVisible` 展开到它，否则高亮会落在「看不见的地方」。
+17. **`src/package.json` 的 `"type": "module"` 不可删**：它让 Node 把 `src/` 下的 `.js` 当 ESM 加载（`npm test` 依赖这一点）。根 `package.json` 不能加 `"type": "module"`——`electron/main.js` 是 CommonJS。测试 import 一律写完整 `.js` 扩展名。
+18. **同步冲突副本的 id 必须确定性**：`conflict_<fnv1a32(chapterId, remoteDeviceId, remoteUpdatedAt)>`。用随机 id 的话，同一次同步重试会不断堆出副本；确定性 id 让重复提交幂等。首次同步只建基线、不判冲突——否则两台设备第一次握手就会因为「时间戳不同」造出一堆假副本。
+19. **API Key 的明文只允许出现在两处**：输入框与主进程加密前的内存。`secret:*` 不加日志；迁移旧明文时必须**先写加密成功、再清 IndexedDB**，反过来一旦加密失败用户的 Key 就没了。`redactSecrets` 覆盖错误路径，但不要依赖它来「顺便」打印调试信息。
 
 ### 冒烟测试机制
 
 - 触发：`SMOKE_TEST=1` 环境变量。`electron/main.js` 会：启动本地 SSE mock 服务器（端口 `18765`，含 `带CORS` / `不带CORS` / `HTTP 500` 三条路径）→ 监听 `did-finish-load` → 先打印挂载状态 `SMOKE_MOUNT` → 建好临时目录 `%TEMP%\novel-studio-smoke` 并 `executeJavaScript('window.__nsSmokeDir = …')` 注入给渲染层 → 读 `tests/smoke-inject.js`，`replaceAll('__PORT__', 18765)` 后 `executeJavaScript` 执行 → 打印 `SMOKE_DETAIL` → 清理临时目录并退出。
 - **渲染进程没有 `node:path`**，算不出临时目录，所以目录必须由主进程注入——这是 `window.__nsSmokeDir` 存在的唯一原因。
 - **`tests/smoke-inject.js` 是运行时从磁盘读的**（`electron/main.js` 的 `fs.readFileSync`），不是打包进 `dist/` 的。所以**只改断言时不需要 `npm run build`**——直接 `SMOKE_TEST=1 npx electron .` 即可，迭代一轮只要几秒；只有改了 `src/` 才必须重新 build。
-- `tests/smoke-inject.js` 共 140 项断言，沿用「扁平 `out` 对象 + `out.pass` 全部取 AND」的写法（**不要嵌套子对象**，`pass` 里漏掉一项就等于没有这项测试）。覆盖：设置默认值与旧记录回填、文件名净化、自动保存的防抖/冲刷/不串目标、多条大纲注入、目录直写的字节数与同名冲突、越界路径拒绝（含删除诱饵验证）、改名、关书守卫、**真实点击路径的组件挂载**、集合工厂的串行化与墓碑、迁移的幂等与非破坏、Context Builder 的预算与去重、usage 两种形状、编排器的提取/风险/中止/重试、快照合并与整库往返、章节版本的四类来源/裁剪无墓碑/回滚可撤销/删章可恢复、时间线两种排序与断链、七条一致性规则（**含「干净数据必须 0 条」这条反向断言**）、局域网同步的 HTTP 契约（预检/鉴权/冷却/体积/路由/停止）与一次真实的合并往返（含幂等、生成中 409、快照无 API Key），以及 3 条流式管线。
+- `tests/smoke-inject.js` 共 **180 项断言**，沿用「扁平 `out` 对象 + `out.pass` 全部取 AND」的写法（**不要嵌套子对象**，`pass` 里漏掉一项就等于没有这项测试）。覆盖：设置默认值与旧记录回填、safeStorage 密钥迁移/读取、文件名净化、自动保存的防抖/冲刷/不串目标、生命周期冲刷（pagehide）、多条大纲注入、目录直写的字节数与同名冲突、越界路径拒绝（含删除诱饵验证）、改名、关书守卫、**真实点击路径的组件挂载**、集合工厂的串行化与墓碑、迁移的幂等与非破坏、Context Builder 的预算与去重、usage 两种形状、编排器的提取/风险/中止/重试、错误分类/重试/退避/截断、快照校验和/副本重映射/恢复前快照/排除生成任务、章节版本的四类来源/裁剪无墓碑/回滚可撤销/删章可恢复、版本对比、施工卡与锁定提案、AI 计划草案、审校修复草案不自动覆盖与接受后落版本、时间线两种排序与断链、一致性规则（**含「干净数据必须 0 条」这条反向断言**）、全书搜索（章节命中/Enter 切章/实体跳转到正确标签）、草稿崩溃恢复、局域网同步的 HTTP 契约（预检/鉴权/冷却/体积/路由/停止/schema 拒绝）与一次真实的合并往返（含幂等、冲突副本、冲突副本幂等、生成中 409、快照无 API Key），以及 3 条流式管线与错误路径。
 - **同步相关的断言从渲染进程发真实 `fetch`**，不是直接调主进程的函数：手机端能不能连上全取决于 CORS 头与预检有没有发对，而那两样只有真发一次请求才验证得到。渲染层从 `file://`（不透明 origin）向 `http://127.0.0.1:<port>` 发请求是通的——本机回环豁免混合内容规则，加上服务端本来就发 `Access-Control-Allow-Origin: *`。所以计划里那条「退路」（主进程自己探 HTTP 再把结论注入渲染层）没有用到。
 - **同步段落的客户端与服务端是同一个渲染进程**，因此「本机应用远端返回的合并结果」必然报 `diff = {0,0,0}` —— 那是**收敛（幂等）**，不是测试没生效。有意义的差集在 `syncState.lastIncoming.diff`（主进程那一侧的合并结果，也就是「手机的对手」那一侧）。
 - `out.syncBigStatus` 是**诊断项，不进取 AND 链**：它记录客户端实际看到了什么（本机是 `'reset'` 而不是 `413`，见上面「V2 第二阶段」第 4 节第 1 条）。留着它是为了下一次有人问「413 到底有没有生效」时不必重新跑一遍才知道。
 - 组件挂载段里的 `syncPanelToggleOk` **真的把服务开关点了一次**：`.sync-code` 只在服务运行时才渲染，它出现就说明「面板 → sync.js → 主进程 → HTTP 监听」整条链路是通的。点完要**再点一次关掉**，否则会给整轮留下一台没人管的服务（后面的 M 段还会自己开一台）。
-- **没有「只跑某一项」的运行器——这是有意的，别去补**：102 项挤在一次 `executeJavaScript` 里，`SMOKE_TEST=1` 要么全跑要么不跑。要单独验证某一项时，两条更省事的路子：
+- **没有「只跑某一项」的运行器——这是有意的，别去补**：180 项挤在一次 `executeJavaScript` 里，`SMOKE_TEST=1` 要么全跑要么不跑。要单独验证某一项时，两条更省事的路子：
   1. **在 DevTools 里手敲**（首选）：跑 `npm run dev` 或 `npm run electron`，控制台里用 `window.__ns`——它已挂好 db、store 工厂、`buildMessages`、`chatStream`、导出与自动保存的纯函数，绝大多数单项验证压根不需要碰测试脚本；
   2. 临时把其余断言短路（`if (false)` 掉），跑完**记得还原**——`out.pass` 是全体取 AND，忘了还原等于留了个永远不报错的口子。
 - **组件挂载那一节必须点真实的 `.book-card`**，不能只调 store：它是唯一能覆盖「组件 setup 期抛错」的手段（见「重要约定与坑」#14）。配套的 `uiNoSwallowedErrors` 会在脚本开头劫持 `console.error`，收集整轮的被吞错误，末尾断言没有 `ReferenceError`/`TypeError` 之类——**只断言元素存在是不够的，出错的组件照样渲染**。这条断言经过反向验证：把 `Editor.vue` 的 TDZ 缺陷还原后它会失败并打印出 `at watch.immediate ...`，修好后转绿。
@@ -127,6 +151,7 @@ npm run build && SMOKE_TEST=1 npx electron .
   2. **不要测会弹原生对话框的通道**（`dialog:chooseDirectory`、`export:saveFile`）——它们会挂到超时。只断言 preload 函数存在 + 非法入参返回类型化错误。也**不要测** `openFolder({dir: <存在的目录>})`，那会在开发机上真的弹出资源管理器窗口。
   3. 判断「某个 key 存不存在」必须用 `db.rawGet` / `db.rawDelete`，**不能走 `getChapters(null)`**——守卫让它恒返回 `[]`，键不存在时也是 `[]`，断言恒真、毫无价值。同理，测关书守卫要**直调 storage 层**：`persistChapter('不存在的id')` 在 `store.chapters` 里找不到就直接返回了，根本到不了存储层。
 - mock 服务器仅在 `SMOKE_TEST` 模式启动，生产代码不含测试痕迹。
+- **单元测试是另一套、不要混**：`tests/unit/*.test.mjs` 用 Node 内置 `node:test`，只 import 纯函数与内存对象，**不碰 IndexedDB / Electron / DOM**；跑法是 `npm test`。新增纯函数时同时补单测并挂进 `window.__ns`——前者验证逻辑，后者让冒烟能调用它。**不要把需要 IndexedDB 的断言塞进单测**（`idb-keyval` 在 Node 里没有 indexedDB 全局）。
 - **Android 侧无法用冒烟测试覆盖**：它是 Electron 专属机制，且 `tests/` 不在 electron-builder 的 `files` 里。Android 只能靠构建产物校验（见「Android」章节）。
 
 ## 发布与 CI（GitHub Actions）
@@ -134,6 +159,10 @@ npm run build && SMOKE_TEST=1 npx electron .
 `.github/workflows/release.yml`：推送 `v*` tag 时，`windows-latest` 与 `ubuntu-latest` 两个 job
 并行出产物（安装版/便携版 exe、Android debug APK），第三个 job 合并并发布 Release。
 `workflow_dispatch` **只构建、不发布**，产物在 Actions 页面的 Artifacts 里，用于上线前干跑。
+
+两个构建 job 都会在构建前跑 **`npm test`**（156 项单元测试）。它们不跑 Electron 冒烟测试：
+CI runner 没有可靠的 GUI 会话，且冒烟会读写真实 `novel-studio-db`；发版前请在本机手工跑一次
+`SMOKE_TEST=1 npx electron .`，把 `assertionCount` 与 `pass` 写进验收记录。
 
 发版顺序：改 `package.json` 的 `version`（决定 exe 内部版本号）→ 改 `android/app/build.gradle`
 的 `versionCode` / `versionName`（**Capacitor 不会自动同步它**，不改的话 APK 里显示的仍是旧版本号）
@@ -197,16 +226,17 @@ curl -s "https://api.github.com/repos/<owner>/<repo>/actions/runs/<run_id>/jobs"
 3. **`.gitattributes` 固定了换行符**：`* text=auto`（仓库内存 LF）、`gradlew`/`*.sh` 强制 LF、`*.bat` 强制 CRLF。`gradlew` 那条是必需的——它带 CRLF 时在 Unix 上会报 `sh\r: No such file or directory`。新增二进制类型记得加进 `binary` 列表。
 4. **以下三类文件永远不要提交**（前两类已在 `.gitignore` 里，第三类只能靠自觉）：
    - 本机与个人偏好：`.claude/settings.local.json`、`android/local.properties`（含本机 SDK 路径）
-   - 密钥：`*.jks` / `*.keystore` / `.env*`（本项目 API Key 存在用户本机 IndexedDB，仓库里本就没有）
+   - 密钥：`*.jks` / `*.keystore` / `.env*`（桌面版 API Key 在用户本机的 safeStorage 加密文件里，浏览器/Android 在本机 IndexedDB 里；仓库里本就没有。**调试日志、截图、错误报告里也不许出现它**）
    - **`android/gradle.properties` 里被注释掉的 `org.gradle.java.home`**：本机图省事取消注释后，**改完不要 commit**（理由见「Android」章节）
 5. 中间产物均已忽略，克隆后 `npm run build` 即可重新生成：`dist/`、`release/`、`node_modules/`、`android/build/`、`android/app/build/`、`android/.kotlin/`、`android/app/src/main/assets/public/`（`cap sync` 的产物）。
 
 ## 数据模型（IndexedDB）
 
-- `books`（键 `books`）：`{ id, title, intro, coverColor, createdAt, updatedAt }`
-- `chapters`（键 `chapters:{bookId}`）：`{ id, bookId, title, content, order, updatedAt }`，按 `order` 排序。V2 追加的字段**全部可选**：`arcId`、`summary`、`purpose`、`status`、`wordCount`、`timelineStart`、`timelineEnd`。
+- `books`（键 `books`）：`{ id, title, intro, coverColor, plan, createdAt, updatedAt }`。`plan` 是 V3 追加的全书规划（`premise/theme/mainConflict/coreMystery/finalGoal/hardRules/endingConstraint`），旧书记录里是 `undefined`，读取处一律 `book.plan?.x || ''`；新建书时给 `{}`。
+- `chapters`（键 `chapters:{bookId}`）：`{ id, bookId, title, content, order, updatedAt }`，按 `order` 排序。V2 追加的字段**全部可选**：`arcId`、`summary`、`purpose`、`status`、`wordCount`、`timelineStart`、`timelineEnd`。V3 追加章节施工卡（同样全部可选）：`povCharacterId/openingState/coreConflict/mustEvents/threads/stateChanges/worldReveals/foreshadowActions/forbidden/endingHook/continuity/acceptance/targetWords/planStatus('none'|'draft'|'confirmed')/planVersion/lockedBeats`。
 - `outlines`（键 `outlines:{bookId}`）：`{ id, bookId, type: 'outline'|'character'|'world', title, content, updatedAt }`。迁移会在行上**追加** `migratedTo: [newId]`，其余字段一字不改。
-- `meta`（键 `meta`）：`{ schemaVersion, updatedAt }`。**刻意不放 settings**：`settings.load()` 会把缺失的键回填成默认值，被回填出来的 `schemaVersion` 恒假，而它恰恰用来判断要不要升级。
+- `meta`（键 `meta`）：`{ schemaVersion: 3, updatedAt, migrations }`。**刻意不放 settings**：`settings.load()` 会把缺失的键回填成默认值，被回填出来的 `schemaVersion` 恒假，而它恰恰用来判断要不要升级。V3 的 schemaVersion 只表示「新字段可用」，**不重写任何旧记录**（新字段全可选）。
+- 根级辅助键（都**不进快照**）：`deviceId`（本机身份）、`syncPeers`（每台对端上次同步后的章节基线）、`preRestoreSnapshot`（恢复全量备份前的自动留底，只保留最近一份）。
 - `settings`（键 `settings`）：单条，字段见 `src/store/settings.js` 的 `defaultSettings`。默认 `baseUrl: 'https://api.deepseek.com'`（不带 `/v1`，由 `buildChatUrl` 补路径）。
 
   「保存与导出」七个键（仅桌面端生效；Android 上设置面板整节隐藏）：
@@ -238,14 +268,32 @@ curl -s "https://api.github.com/repos/<owner>/<repo>/actions/runs/<run_id>/jobs"
   | `syncAutoStart` | `false` | 下次启动自动开启同步服务。**默认 false 是安全默认**，且它是用户「我知道这会在局域网上开一个端口」的明确表示 |
   | `syncUrl` | `''` | 手机端：电脑地址，如 `192.168.1.5:8787` |
   | `syncCode` | `''` | 手机端：6 位配对码（**电脑端的码不在这里**，它只存在主进程内存里） |
+  | `syncConflictCopies` | `true` | 同一章两端都改过时保留远端为「冲突副本」。**正文是唯一不可再生的内容，默认开** |
 
-  **坑**：`load()` 是**浅合并**，而 `pricing` 是数组——存储里的旧数组会整体替换默认值，以后给默认条目加字段时老用户那里就缺字段。故 `load()` 之后必须跑一次 `normalizePricing(settings.pricing)` 补齐，由 `pricingNormalizeOk` 钉死。**给 `DEFAULT_PRICING` 的条目加字段时，必须同步改 `normalizePricing`。**
+  V3 追加的键（同样由 `settingsBackfill` 与 `NEW_KEYS` 复位清单覆盖）：
+
+  | 键 | 默认 | 含义 |
+  |---|---|---|
+  | `models` | `defaultTaskModels()` | 按任务分模型：`write/extract/review/plan/outline`。空串回退 `model`；`load()` 必须跑 `normalizeTaskModels`（浅合并坑，同 `pricing`） |
+  | `includeStyle` | `true` | 生成时是否携带当前启用的文风档案 |
+  | `autoApplyLowRisk` | `true` | 低风险记忆变更直接入库；关掉后连低风险也进审阅 |
+  | `budgetPerCall` | `0` | 单次调用金额上限（元，0 = 不限） |
+  | `budgetDaily` | `0` | 每日累计上限（元，0 = 不限） |
+  | `budgetAction` | `'warn'` | `'warn'` 只提示 \| `'confirm'` 必须点「继续」 |
+  | `requestIdleTimeoutSec` | `60` | 流式空闲超时（秒，0 = 关闭） |
+  | `maxRetries` | `2` | 仅在**尚未收到正文**时对 network/timeout/429/5xx 重试 |
+  | `secureKeyAvailable` | `false` | **运行时状态，不持久化**：桌面端 safeStorage 是否可用 |
+  | `secureKeyError` | `''` | 同上，安全存储不可用时的原因（不含密钥） |
+
+  **坑**：`load()` 是**浅合并**，而 `pricing` 是数组、`models` 是对象——存储里的旧值会整体替换默认值，以后给默认条目加字段时老用户那里就缺字段。故 `load()` 之后必须跑 `normalizePricing(settings.pricing)` 与 `normalizeTaskModels(settings.models)` 补齐，由 `pricingNormalizeOk` 与单测钉死。**给 `DEFAULT_PRICING` 的条目或 `TASK_MODEL_KEYS` 加字段时，必须同步改对应的 normalize。**
 
 ### V2 领域集合（键 `{集合名}:{bookId}`）
 
-`storage.js` 的 `COLLECTIONS` 清单即唯一事实来源，`coll.xxx` 由 `makeCollection(name)` 工厂生成：`volumes`（卷）、`arcs`（篇）、`characters`、`locations`、`factions`、`worldRules`、`events`（时间线）、`foreshadowing`、`generationRuns`、`reviewQueue`、`chapterVersions`（章节历史版本）、`tombstones`。
+`storage.js` 的 `COLLECTIONS` 清单即唯一事实来源，`coll.xxx` 由 `makeCollection(name)` 工厂生成：`volumes`（卷）、`arcs`（篇）、`characters`、`locations`、`factions`、`worldRules`、`events`（时间线）、`foreshadowing`、`generationRuns`、`reviewQueue`、`chapterVersions`（章节历史版本）、`generationTasks`（流式草稿/崩溃恢复）、`memoryChangeLog`（记忆变更与撤销）、`syncConflicts`（同步冲突记录）、`scenes`（场景）、`planProposals`（锁定节拍的变更提案）、`reviewIssueStates`（审校问题状态）、`styleProfiles`（文风档案）、`tombstones`。
 
 **加一条集合名就在这里加一行，别处都不用动**：`serialize` / `toPlain` / `!bookId` 守卫由工厂保证，`deleteBook` 的级联删键自动覆盖，`snapshot.js` 的 `DATA_COLLECTIONS` 由这份清单派生因而新集合**自动进全量备份与设备同步**。第二阶段加 `chapterVersions` 就是这一条的最好例子——数据层只写了一行。
+
+**唯一的例外是 `generationTasks`**：它在 `COLLECTIONS` 里（拿到工厂的全部保证），但被 `snapshot.js` 的 `DATA_COLLECTIONS` 显式排除——草稿描述的是「这台机器上一次没跑完的调用」，同步到另一台设备毫无意义且内容易失。新增本地态集合时照这个做法：先进 `COLLECTIONS`，再从快照里排除，并把理由写在两处注释里。
 
 字段定义**只看 `src/services/novel/schemas.js` 的 `ENTITY_SCHEMAS`**——它同时驱动三件事：控制台的表单/表格渲染（`EntityTable.vue` 一个组件通吃八个实体）、Context Builder 的层文本（`renderEntity`）、记忆提取的 JSON 约束（`extractionSpec`）。加字段只改 schema，三处自动跟上；反过来，**在别处硬编码实体字段名一定会与它分叉**。
 
@@ -326,6 +374,14 @@ V2 起它被 `services/novel/contextBuilder.js` 复用（导出后导入，不�
 
 `applySnapshot` 写回**一律走 storage 的公开写函数**，于是 `toPlain` / `serialize` 自动生效；**不要自己 `set(key, obj)`**，那会绕过写队列，与正在进行的自动保存互相覆盖。恢复是**合并不是替换**，且落盘前必须由 `diffSnapshots` 先报出「新增 / 覆盖 / 删除」各多少条——删除也必须报，报喜不报忧的确认框是在骗人。
 
+V3 加固（**读旧文件必须继续兼容**）：
+
+- 快照头新增可选字段 `appVersion / counts / checksum / deviceId`。`checksum` 是对 `books + data + bookTombstones` 的规范化 JSON 做 FNV-1a 32 位；**有才校验**，没有的老文件照常可用。校验失败给出「文件损坏或被改动」并**拒绝写库**。
+- `snapshotVersion > 本地` 拒绝，`schemaVersion > SCHEMA_VERSION` 拒绝；同步两端 `schemaVersion` 不同则直接报错让用户升级——**不做未知字段的半懂合并**。
+- 恢复前 `BackupModal` 先把当前整库写进 `preRestoreSnapshot` 并告诉用户；「作为副本导入」走 `cloneSnapshotAsNewBooks`（重新映射每个 bookId，标题加「（导入副本）」），**不碰现有书**。
+- `QuotaExceededError` 要翻译成「存储空间不足，原数据未改动」，不能把 IndexedDB 的原始英文错误抛给用户。
+- `DATA_COLLECTIONS` 排除 `tombstones`（单独处理）与 `generationTasks`（设备本地）。
+
 ### 8. 控制台 UI 的形态约束
 
 `NovelConsole.vue` 是**全屏弹窗**（`.modal.console` 修饰类覆盖既有 `.modal` 的 `max-width:460px` + 整框滚动），**不是** WritingView 的第四栏：三栏在窄屏上已经要靠底部标签切换，再加一栏会让移动端彻底不可用。`App.vue` 的 `handleBack()` 里控制台必须排在**最前**——它盖住了设置与导出，排在后面会先把看不见的弹窗关掉，表现为「返回键坏了」。
@@ -338,12 +394,14 @@ V2 起它被 `services/novel/contextBuilder.js` 复用（导出后导入，不�
 
 `services/migration.js`：非破坏、幂等、只增不减、**不静默执行**。只有在控制台里点「一键升级」才会跑——静默改写用户的真实数据正是本项目一贯避免的；且不开控制台的 V1 用户因此保持 100% 旧行为。
 
+`SCHEMA_VERSION` 在 V3 是 **3**，但升级本身**不改写任何记录**：新字段全可选，旧书打开后的行为与之前完全一致。启动时只做「无数据改写」的版本标记（`meta.migrations` 留报告）；真正会写数据的 V1→V2 迁移仍必须由用户点击。任何写数据的迁移执行前先落 `preMigrationSnapshot`，失败就停下并保留报告，不继续后续迁移。
+
 「故事大纲」**不自动转换**：一整段自由文本映射成卷/篇必然丢信息又猜错结构，由用户在控制台里手建。两道幂等护栏：源行上的 `migratedTo`，以及规范化标题比对（防「实体建好了但源行没标记」那一半失败）。Context Builder 同时读旧 `outlines` 与新实体，靠同样两道去重（`contextNoDupOk`）。
 
 ### 10. 调试入口
 
 - 控制台「上下文与迁移」标签 = Context Preview：每层 token / 截断 / 丢弃 + 最终提示词全文。
-- `window.__ns` 已挂上全部 V2 纯函数（`buildContext` / `allocate` / `extractJson` / `classifyRisk` / `mergeSnapshot` / `planMigration` / `parseSseUsage` / `captureVersion` / `pruneVersions` / `buildTimeline` / `runRuleChecks` / `CONSISTENCY_RULES` / `normalizeSyncUrl` / `handleIncomingSnapshot` / `reloadAfterSync` / `pushSnapshot` / `syncStatus` …）。**新增纯函数不加进去等于没被测试。**
+- `window.__ns` 已挂上全部 V2/V3 纯函数（`buildContext` / `allocate` / `extractJson` / `classifyRisk` / `mergeSnapshot` / `planMigration` / `parseSseUsage` / `captureVersion` / `pruneVersions` / `buildTimeline` / `runRuleChecks` / `CONSISTENCY_RULES` / `normalizeSyncUrl` / `handleIncomingSnapshot` / `reloadAfterSync` / `pushSnapshot` / `syncStatus` / `TASK_MODEL_KEYS` / `modelForStage` / `settingsForStage` / `dayStart` / `spentOnDay` / `estimateCall` / `checkBudget` / `activeStyleProfile` / `renderStyleProfile` / `styleProfileText` / `describeStyleProfile` / `buildStats` / `DENSITY_BUCKET` …）。**新增纯函数不加进去等于没被测试。**
 - 局域网同步在 DevTools 里调：`await __ns.syncStatus()` 看开着没、`await __ns.testConnection('192.168.1.5:8787')` 打一发 `/hello`、`await __ns.pushSnapshot(url, code)` 走一次真实合并（在电脑上对自己发也能跑，两侧同库时 diff 恒为 0）。
 - 手工验收清单见 README「长篇写作怎么用」与「小说控制台」两节。
 
@@ -355,8 +413,8 @@ V2 起它被 `services/novel/contextBuilder.js` 复用（导出后导入，不�
 
 ```
 chapterVersions:{bookId}
-{ id, bookId, chapterId, chapterTitle, content, wordCount, source, generationRunId, createdAt }
-// source ∈ 'ai' | 'manual' | 'rollback' | 'delete'
+{ id, bookId, chapterId, chapterTitle, content, wordCount, source, generationRunId, note, model, createdAt }
+// source ∈ 'ai' | 'manual' | 'rollback' | 'delete' | 'review' | 'import'
 ```
 
 **没有 `updatedAt`，这是刻意的**：版本是不可变的，改一个历史版本没有任何意义。同步靠 `mergeRecords` 的 `tstamp()` 回退到 `createdAt`（`snapshot.js`），所以不可变记录天然能正确合并——**别顺手给它补一个 `updatedAt`**，那会让「同一版在两端各自被刷过时间戳」变成一次无意义的覆盖。
@@ -369,6 +427,7 @@ chapterVersions:{bookId}
 | 用户点编辑器工具栏的「存档」 | `'manual'` | `Editor.vue` |
 | 恢复某一版之前 | `'rollback'` | 版本面板的 `restore()`——**先存当前再覆盖**，回滚因此可撤销 |
 | 删章之前 | `'delete'` | `books.js` 的 `removeChapter`。章节走硬删除，版本留下来，按「已删除章节」分组可恢复成新章——这是误删唯一的救回入口 |
+| 接受 AI 定向修复、写回正文之前 | `'review'` | `ConsistencyReport.vue`。**先存后写**，所以修复也能当作一次可回滚的改动 |
 
 **裁剪（`versionKeep`，默认 10）用 `saveAll` 整组回写，刻意不写墓碑**。裁剪是本地整理，不是用户删除：写墓碑会让它传播到另一台设备、把对方**故意**保留的更多版本也删掉，而且墓碑表会无限膨胀。代价是另一台设备下次同步可能把多出来的版本送回来——无害，版本不可变，多留几版不是数据丢失。
 
@@ -382,7 +441,7 @@ chapterVersions:{bookId}
 
 ### 3. 一致性（`services/novel/consistency.js`）
 
-`runRuleChecks({chapters, memory, structure, tombstones})` → `{ issues, stats }`，纯函数、**规则常开**（打开控制台即算）、零成本、零误报。七条：
+`runRuleChecks({chapters, memory, structure, tombstones})` → `{ issues, stats }`，纯函数、**规则常开**（打开控制台即算）、零成本、零误报。十二条：
 
 | # | 规则 | severity |
 |---|---|---|
@@ -393,6 +452,13 @@ chapterVersions:{bookId}
 | 5 | 重复事件（同章同标题） | low |
 | 6 | 章节缺摘要（正文非空但 `summary` 为空） | low |
 | 7 | 记忆陈旧（`characters.lastUpdatedChapterId` 距今超过 30 章） | low |
+| 8 | 主线停滞（施工卡标了「主线」之后连续多章未推进） | medium |
+| 9 | 关键人物过度密集出场（最近 10 章超过 70%） | low |
+| 10 | 支线长期无进展（进行中的篇连续多章无对应章节） | low |
+| 11 | 相邻章节目标重复（规范化 `purpose`） | low |
+| 12 | 连续章节没有有效变化（已确认施工卡里无事件/伏笔动作/状态变化） | low |
+
+后五条都是**大数字才触发**的兜底规则（阈值见各自实现），干净的小书不会因为它们报一条。新增规则必须同时给 `consistencyCleanOk` 的夹具补数据，保证「干净数据 0 条」仍然成立。
 
 **`consistencyCleanOk` 是这一节最重要的断言**：干净数据必须算出 **0 条**。误报比漏报更能毁掉这个功能——一个总是喊着「这里有问题」的检查，用户第三次就会忽略它。
 
@@ -402,7 +468,9 @@ chapterVersions:{bookId}
 - **必经 Context Builder**，不自己拼 prompt。
 - **计费照常**（走 `record(..., 'review')` 写 `generationRuns`）：手动触发也必须是**可见花费**，否则「AI 深检」就成了唯一一处悄悄扣钱的地方。
 
-**报告不落库，这是有意为之，别当成漏做**：报告是针对**某一版正文**的意见，正文一改就过期，存下来只是过期噪音；它也不是规格书 05 意义上的「实体」（没有需要导入导出的持久对象）。要回看历史就去「生成历史」里找那条 review 记录。`consistencyReviewNoPersistOk` 钉着它。
+**完整报告不落库，但问题状态落库——这是 V3 对既有取舍的修订，别当成自相矛盾**：报告是针对**某一版正文**的意见，正文一改就过期，完整存下来只是过期噪音；但「用户接受了哪条、忽略哪条、修复了哪条」是作者的**决定**，换台设备继续处理时需要保留。故 `reviewIssueStates:{bookId}` 只存 `{ id, chapterId, contentHash, status }`，并在每次读取时比对 `contentHash`：不一致就显示「报告已过期」。生成历史里仍能找到那条 review 记录。`consistencyReviewNoPersistOk` 守的是「完整报告不落库」，`reviewIssueStates` 的存在不违反它。
+
+**定向修复（`fix` 阶段）绝不自动覆盖正文**：它返回 `{ revised, explanation }`，界面用 `diff.js` 预览；用户点接受后才 `captureChapterVersion(..., { source: 'review' })` 再写回。修复后可按需复核，但轮数有上限（默认 1，最大 2），不允许无限循环扣钱。
 
 ### 4. 局域网同步（`services/sync.js` + `electron/main.js`）
 
@@ -436,6 +504,19 @@ POST /sync   X-Pair-Code: <6位>
 
 **IPC 与事件中枢**：`sync:incoming`（主→渲染）＋ `sync:respond`（渲染→主）与既有 `llm:*` 同构；`ensureSyncHub()` **在模块加载时注册一次**，按 `requestId` 分发——CLAUDE.md 坑 #2 的铁律在同步通道上一模一样地成立，**不得**改回函数体内注册。主进程侧 `askRenderer` 有 20 秒超时，超时后迟到的应答拿到 `ESTALE`（不是错误，直接丢弃）。`handleSyncRequest` 之外的任何一处抛出都会让请求没有下文，所以那些回调里的 `try/catch` 是必需品，不是防御性冗余。
 
+**正文冲突：保留副本，绝不静默覆盖（`services/sync/conflicts.js`）**
+
+- 只对 `chapters` 做冲突检测。正文是唯一不可再生的内容；实体仍按 LWW + 墓碑合并。
+- 基线：根键 `syncPeers` 记录每个对端上次同步后各章的 `updatedAt`。**首次同步只建基线、不判冲突**，否则第一次握手就会因为两边时间戳不同造出一堆假副本。
+- 判定：同一章两端 `content` 不同，且双方 `updatedAt` 都**晚于基线** → 冲突。
+- 处理：本地版留在原章；远端版创建**确定性 id** 的副本章
+  `conflict_<fnv1a32(chapterId, remoteDeviceId, remoteUpdatedAt)>`，标题加「【冲突副本】」，`order = max+1`；
+  同时写 `syncConflicts:{bookId}` 记录，随合并结果传回对端。确定性 id 让重试与重复同步幂等。
+- 设置项 `syncConflictCopies` 默认 **true**；关掉后回到 LWW（不推荐，README 里已写明）。
+- `SyncPanel` 显示「待处理冲突 N」，可跳到两章对比并标记已解决。
+
+**版本门槛**：`/hello` 与 `normalizeSnapshot` 都校验 `schemaVersion`，不一致直接拒绝并提示两端升级到同一版本。快照头里的 `deviceId` 只用于冲突 id 与基线，不参与合并。
+
 **安全边界（README 与发版说明里写的口径，不要放松）**：
 
 - **快照里没有 `settings`** —— `collectSnapshot` 只读 books / chapters / outlines / 集合 / 墓碑，**API Key 永不出本机**。`snapshotNoApiKeyOk` 断言把它钉死。
@@ -450,6 +531,70 @@ POST /sync   X-Pair-Code: <6位>
 ### 5. 设置面板的同步节
 
 `SyncPanel.vue` **一个组件两副面孔**（按 `isDesktop()` 分），放在 `SettingsPanel.vue` 的 `v-if="desktop"` **之外**——同步在电脑与手机两端都要能配：电脑端配的是服务本身，手机端配的是「连哪台电脑」。做成一个组件而不是两个，是因为两副面孔共享同一块设置区与同一个「上次结果」版式，拆开的结果是两边各写一份渲染然后慢慢分叉。
+
+## V3（可靠性 / 规划 / 审校 / 文风 / 统计）
+
+V3 的目标是「先保证不丢稿，再谈写得更好」。这一节只写**改这些功能时会踩的约束**；数据与入口见上面各节。
+
+### 1. 自动保存与草稿恢复
+
+`autosave.js` 的状态是 `idle | dirty | saving | saved | failed`，`onState(state, meta)` 让编辑器如实显示。
+**失败必须可见、可重试**：重试只重跑同一个 `persist(id)`，不引入第二个写者；重试仍失败时保留 `failed`，绝不停在「保存中」。
+生命周期冲刷挂在 `visibilitychange(hidden)` / `pagehide` / `window.blur` 与 Capacitor `appStateChange(!isActive)`；
+Electron 关窗走 `app:before-close` → 渲染层 `flush()` → `app:close-ready`，主进程 2 秒超时兜底。**这条握手不能省**。
+
+`services/ai/taskStore.js` 负责流式草稿：开始写一条 `running`，`onDelta` 节流（1.5 秒或 800 字）落 `outputText`，
+结束时写 `done/aborted/error/truncated`。打开书时把本会话没有活跃流的 `running` 标成 `interrupted`，
+`AiPanel` 顶部显示恢复条。恢复**只恢复已收到的草稿**，文案必须写明「服务端请求不会恢复」；
+「重新生成」是新的调用、会再次计费。`running` 永不裁剪；每书保留最近 20 条已结束任务。
+
+### 2. 接口错误、重试与密钥
+
+错误分类在 `services/ai/errors.js`，重试策略在 `services/ai/request.js`，两者的契约见「LLM 客户端双路径」。
+**不要把重试写回 `chatStream`**：`chatStream` 只负责一次流，可靠封装在外层；否则编排器与界面各有一份互相打架的重试。
+`redactSecrets` 必须覆盖 `sk-…`、`Bearer …` 与 Authorization 值，主进程日志与渲染层错误都走它。
+
+桌面端 Key 走 `secret:*` + safeStorage；`settings.persist()` 在桌面端**不写 `apiKey`**，
+浏览器/Android 维持明文但 `secureKeyAvailable=false` 要如实显示。迁移顺序永远是「先写成功、再清明文」。
+
+### 3. Context Builder 的 V3 层与多模型
+
+层顺序（优先级从高到低）：写作规则 → 全书规划 → 当前卷 → 当前篇 → 章节施工卡 → 本章场景 → 人物状态 →
+地点 → 时间线 → 伏笔 → 文风 → 近期摘要 → 最近正文 → 临时要求。施工卡未确认时层文本要**明确写「临时计划（未确认）」**，
+确认后写版本号——否则模型会把草案当成硬约束。
+
+`buildContext` 的预算要扣掉输出预留（`outputReserve`，默认 `maxTokens`）与安全余量；
+`metadata` 如实标出预留、是否超预算与被丢弃的层。
+
+按任务分模型在 `models.js`：`modelForStage(settings, stage)` 空串回退 `settings.model`；
+`settingsForStage` 返回的临时对象**不得改到模块级 settings**（单测钉着）。编排器每阶段记录的模型必须是实际使用的那个。
+
+### 4. 规划与施工卡
+
+全书规划在 `books.plan`；施工卡字段定义在 `ENTITY_SCHEMAS.chapters` / `CHAPTER_PLAN_FIELDS`（只改 schema）。
+`planCheck.js` 是确定性检查（目标字数区间、mustEvents、forbidden、acceptance），**不产生费用**；
+它是提示而不是拦截——作者有权偏离自己的计划。
+
+锁定节拍在 `lockedBeats`。AI 生成的计划若没有保留全部锁定节点，`planning.js` 只生成 `planProposals` 待确认，
+**界面不得直接写进施工卡**。提案 id 由章节 + 草稿内容决定，重复点击不会堆出重复提案。
+
+### 5. 版本差异、检索与统计
+
+`diff.js` 是行/段落级 LCS，纯函数；长行再按句切分。版本面板用「两版对比」，**不要用第三方 diff 库**。
+「复制为草稿」创建新章节，**不覆盖当前章**。
+
+`retrieval.js` 的 `searchBook` 返回片段而非 HTML；渲染层用 `v-for + <mark>`，**禁止 `v-html`**。
+集合名 → 控制台标签键不是恒等映射（`events`→`timeline`，`scenes/volumes/arcs`→`story`），
+`SearchModal` 的 `TAB_FOR_COLLECTION` 必须同步维护——漏了的表现是「控制台打开了，但停在第一页」。
+
+`stats.js` 的每个数字都必须在界面上写清口径（平均只除已写章节、废弃伏笔仍在分母、密度按每 10 章）。
+**统计是描述不是评价**，文案里不许出现「写得好坏」的判断。
+
+### 6. 预算
+
+`budget.js` 的 `checkBudget` 只做「事先提示」；金额是估算，必须标「本机估算」。命中的是 `'*'` 兜底时
+`cost` 为 `null`、界面写「价格未知」；**绝不能显示 ¥0**。每日合计里若有未定价调用，
+`complete=false`——此时不能拿它去断言「还没超预算」。生成记录同时存 `priced/overBudget/budgetLevel`。
 
 ## Android
 
