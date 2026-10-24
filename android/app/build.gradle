@@ -1,5 +1,28 @@
 apply plugin: 'com.android.application'
 
+/**
+ * Release 签名材料从 `android/keystore.properties` 读取（该文件与 keystore
+ * 本身都不入库，见 android/.gitignore）。字段：
+ *
+ *   storeFile=keystore/release.jks
+ *   storePassword=...
+ *   keyAlias=novelstudio
+ *   keyPassword=...
+ *
+ * **丢失 keystore 后无法用同一包名覆盖升级**，只能卸载重装（本地数据会丢，
+ * 除非先做全量备份）。CI 通过 Secrets 在构建前还原这两个文件，见
+ * .github/workflows/release.yml。
+ */
+def keystorePropertiesFile = rootProject.file('keystore.properties')
+def keystoreProperties = new Properties()
+def hasReleaseSigning = false
+if (keystorePropertiesFile.exists()) {
+    keystorePropertiesFile.withInputStream { keystoreProperties.load(it) }
+    hasReleaseSigning = ['storeFile', 'storePassword', 'keyAlias', 'keyPassword'].every {
+        keystoreProperties[it] != null && !keystoreProperties[it].toString().trim().isEmpty()
+    }
+}
+
 android {
     namespace = "com.novelstudio.app"
     compileSdk = rootProject.ext.compileSdkVersion
@@ -9,8 +32,8 @@ android {
         targetSdkVersion rootProject.ext.targetSdkVersion
         // 与 package.json 的 version 手工保持一致（Capacitor 不会自动同步它）。
         // 改 package.json 发版时记得改这里，否则 APK 里显示的仍是旧版本号。
-        versionCode 4
-        versionName "3.0.0"
+        versionCode 5
+        versionName "4.0.0"
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         aaptOptions {
              // Files and dirs to omit from the packaged assets dir, modified to accommodate modern web apps.
@@ -18,11 +41,38 @@ android {
             ignoreAssetsPattern = '!.svn:!.git:!.ds_store:!*.scc:.*:!CVS:!thumbs.db:!picasa.ini:!*~'
         }
     }
+    signingConfigs {
+        if (hasReleaseSigning) {
+            release {
+                storeFile rootProject.file(keystoreProperties['storeFile'])
+                storePassword keystoreProperties['storePassword']
+                keyAlias keystoreProperties['keyAlias']
+                keyPassword keystoreProperties['keyPassword']
+            }
+        }
+    }
     buildTypes {
         release {
+            // 没有签名材料时**明确失败**，不静默产出 unsigned 包
+            // （unsigned 包装不上，而且 aapt/apksigner 的报错会晚很多）。
+            if (hasReleaseSigning) {
+                signingConfig signingConfigs.release
+            }
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
         }
+    }
+}
+
+// 提前到任务图阶段失败：比等到 apksigner 阶段才发现「这是 unsigned 包」清楚得多。
+gradle.taskGraph.whenReady { graph ->
+    if (graph.hasTask(':app:assembleRelease') && !hasReleaseSigning) {
+        throw new GradleException(
+            '缺少 release 签名材料：请在 android/keystore.properties 填写 ' +
+            'storeFile / storePassword / keyAlias / keyPassword，' +
+            '并确认 android/keystore/release.jks 存在。' +
+            '（CI 上应配置 ANDROID_KEYSTORE_BASE64 等 Secrets。）'
+        )
     }
 }
 

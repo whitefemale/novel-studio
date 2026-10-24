@@ -2,14 +2,17 @@
 import { ref, watch, onMounted, onBeforeUnmount } from 'vue'
 import { useBooks } from './store/books'
 import { useSettings } from './store/settings'
-import { toasts } from './store/toast'
+import { toasts, toast } from './store/toast'
 import { useCollections } from './store/novel'
 import { useGeneration } from './store/generation'
 import { initNativeUI, registerBackButton, registerAppStateChange } from './services/native'
 import { startAutoBackup, stopAutoBackup } from './services/backup'
 import { isDesktop } from './services/platform'
 import { setUiHooks, startSyncServer } from './services/sync'
+import { setQueueUiHooks } from './store/writingQueue'
+import { syncWithWebdav, webdavState } from './services/sync/webdav'
 import { ensureSchemaVersion } from './services/migration'
+import { usePlugins } from './store/plugins'
 import BookShelf from './components/BookShelf.vue'
 import WritingView from './components/WritingView.vue'
 import SettingsPanel from './components/SettingsPanel.vue'
@@ -21,6 +24,7 @@ const { store, init, openBook, closeBook } = useBooks()
 const { load, settings } = useSettings()
 const cols = useCollections()
 const gen = useGeneration()
+const plugins = usePlugins()
 
 const view = ref('shelf') // 'shelf' | 'writing'
 const showSettings = ref(false)
@@ -64,11 +68,68 @@ function onWindowBlur() {
   if (view.value === 'writing') flushEditor()
 }
 
+// ---------------------------------------------------------------------------
+// WebDAV 自动同步
+//
+// 三条约束，缺一条都会让「自动」变成打扰：
+//   1. 只在桌面端、且用户显式打开 enabled + autoSync 时运行；
+//   2. 生成中直接跳过（同步会整组回写章节，与流式写入抢同一个键）；
+//   3. 同一个错误只弹一次 toast —— 服务器挂掉时每 5 分钟弹一次，
+//      用户很快就会把整个提示都忽略掉。
+// ---------------------------------------------------------------------------
+let webdavTimer = null
+let webdavFirstTimer = null
+let webdavErrorShown = ''
+
+function stopWebdavAutoSync() {
+  if (webdavTimer) {
+    clearInterval(webdavTimer)
+    webdavTimer = null
+  }
+  if (webdavFirstTimer) {
+    clearTimeout(webdavFirstTimer)
+    webdavFirstTimer = null
+  }
+}
+
+async function runWebdavAutoSync() {
+  if (!isDesktop() || webdavState.working) return
+  if (!settings.webdav?.enabled || !settings.webdav?.autoSync) return
+  if (gen.store.running) return
+  const res = await syncWithWebdav()
+  if (res.skipped) return
+  if (!res.ok) {
+    const msg = res.message || '自动同步失败'
+    if (msg !== webdavErrorShown) {
+      webdavErrorShown = msg
+      toast(`WebDAV 自动同步失败：${msg}`, 'error')
+    }
+  } else {
+    webdavErrorShown = ''
+  }
+}
+
+function configureWebdavAutoSync() {
+  stopWebdavAutoSync()
+  if (!isDesktop() || !settings.webdav?.enabled || !settings.webdav?.autoSync) return
+  const secs = Math.max(60, Number(settings.webdav.intervalSec) || 300)
+  webdavTimer = setInterval(() => {
+    void runWebdavAutoSync()
+  }, secs * 1000)
+  // 启动后 10 秒补一次：否则刚打开软件时要等满一个间隔才看到另一台设备的改动
+  webdavFirstTimer = setTimeout(() => {
+    void runWebdavAutoSync()
+  }, 10 * 1000)
+}
+
 onMounted(async () => {
   await Promise.all([init(), load()])
   // 只记录版本标记，不改写任何笔记/设定（V1→V2 的内容迁移仍由用户手动触发）。
   // 冒烟测试与真实用户都会走到这里，meta 因此不再依赖某个功能被打开过。
   await ensureSchemaVersion()
+  // 插件清单不落库，真相是插件目录里的文件；启动读一次，改文件后可在设置里「重新读取」。
+  // 失败不阻断启动——插件用不了只是少一层能力，绝不该让书打不开。
+  if (isDesktop()) void plugins.load()
   initNativeUI()
   registerBackButton(handleBack)
   registerAppStateChange((active) => {
@@ -103,14 +164,23 @@ onMounted(async () => {
     flush: () => writingRef.value?.flush(),
     reloadEditor: () => writingRef.value?.reloadEditor()
   })
+  // 写作队列同样需要这两件事：每章开始前冲刷编辑器（生成要基于最新正文），
+  // 插入草稿后让编辑器重读。队列住在 store 里、跑在面板关掉之后，所以钩子必须
+  // 在 App 这一层注入 —— 面板卸载时再注入就晚了。
+  setQueueUiHooks({
+    flush: () => writingRef.value?.flush(),
+    reloadEditor: () => writingRef.value?.reloadEditor()
+  })
   // 同步服务默认关闭（见 settings.js 的 syncAutoStart）。用户主动打开过才会
   // 在这里自动监听，所以「本软件从不悄悄占用端口」这条依然成立。
   if (isDesktop() && settings.syncAutoStart) startSyncServer(settings.syncPort)
+  configureWebdavAutoSync()
 })
 
 // 定时器与生命周期监听只在 App 这一层启停；组件里裸跑 setInterval 会在热更新时叠层
 onBeforeUnmount(() => {
   stopAutoBackup()
+  stopWebdavAutoSync()
   document.removeEventListener('visibilitychange', onVisibilityChange)
   window.removeEventListener('pagehide', onPageHide)
   window.removeEventListener('beforeunload', onBeforeUnload)
@@ -223,6 +293,16 @@ watch(
 watch(
   () => [settings.autoBackup, settings.backupInterval, settings.saveDir, store.bookId],
   () => startAutoBackup()
+)
+
+// WebDAV 自动同步的开关/间隔改了立即生效，不必重启
+watch(
+  () => [
+    settings.webdav?.enabled,
+    settings.webdav?.autoSync,
+    settings.webdav?.intervalSec
+  ],
+  () => configureWebdavAutoSync()
 )
 </script>
 

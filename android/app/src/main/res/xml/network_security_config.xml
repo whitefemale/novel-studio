@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  release APK 允许明文 HTTP。
+
+  为什么需要它：这个软件的三种合法用法都可能是明文——
+    1. 局域网同步：手机直连电脑的 http://192.168.x.x:8787；
+    2. 本机 / 局域网模型服务（Ollama 等）：http://192.168.x.x:11434；
+    3. 用户自己部署的、只在内网提供的 OpenAI 兼容端点。
+
+  Android 9（API 28）起默认禁止明文流量，不开这一条时上述请求会直接失败，
+  而且报错通常只说「网络错误」，用户无从判断。debug 构建早就由
+  capacitor.config.ts 的 cleartext / allowMixedContent 放行；这里让 release
+  与 debug 行为一致。
+
+  **这是明确放宽的安全边界**：明文请求可能被同一网络上的其他人看到，
+  包括 API Key。请只在可信网络里使用 http:// 端点；公网服务一律用 https://。
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>

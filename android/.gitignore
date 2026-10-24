@@ -56,9 +56,12 @@ captures/
 .idea/navEditor.xml
 
 # Keystore files
-# 一旦以后要出签名版 APK，keystore 与密码绝不能进版本库。
+# release APK 的签名材料：keystore 与密码绝不能进版本库。
+# 丢失 release.jks 后无法用同一包名覆盖升级，只能卸载重装 —— 请自行备份。
 *.jks
 *.keystore
+keystore.properties
+keystore/
 
 # External native build folder generated in Android Studio 2.2 and later
 .externalNativeBuild

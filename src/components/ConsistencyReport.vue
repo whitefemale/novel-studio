@@ -5,6 +5,7 @@ import { useNovelMemory } from '../store/novelMemory'
 import { useStoryStructure } from '../store/storyStructure'
 import { useSettings } from '../store/settings'
 import { useGeneration } from '../store/generation'
+import { usePlugins } from '../store/plugins'
 import {
   runRuleChecks,
   CONSISTENCY_RULES,
@@ -51,6 +52,7 @@ const memory = useNovelMemory()
 const structure = useStoryStructure()
 const s = useSettings()
 const gen = useGeneration()
+const plugins = usePlugins()
 
 const openRule = ref('')
 const aiBusy = ref(false)
@@ -92,7 +94,10 @@ const report = computed(() =>
         chapters: store.chapters,
         memory: memory.store,
         structure: structure.store,
-        tombstones: tombstones.value
+        tombstones: tombstones.value,
+        // 插件规则也是「确定性、零成本」的那一半：只做正则匹配，不调用 AI。
+        // 关闭插件时这里恒为空数组，报告与未装插件时逐字一致。
+        pluginRules: plugins.issues(store.chapters)
       })
     : { issues: [], stats: { total: 0, bySeverity: {}, byRule: {}, chapters: 0, entities: 0 } }
 )
@@ -106,7 +111,24 @@ const groups = computed(() => {
   }
   const meta = new Map(CONSISTENCY_RULES.map((r, i) => [r.id, { r, i }]))
   return [...map.entries()]
-    .map(([rule, items]) => ({ rule, ...meta.get(rule), items }))
+    .map(([rule, items]) => {
+      const known = meta.get(rule)
+      if (known) return { rule, ...known, items }
+      // 插件规则不在内置清单里。用第一条问题自带的插件名与严重度补一个组头，
+      // 否则模板读 `g.r.severity` 会直接抛错（那一页就整页白掉）。
+      const first = items[0] || {}
+      return {
+        rule,
+        i: CONSISTENCY_RULES.length,
+        items,
+        r: {
+          id: rule,
+          label: first.pluginName ? `插件 · ${first.pluginName}` : '插件规则',
+          severity: first.severity || 'medium',
+          hint: '来自声明式插件的正则规则：只做字面匹配，不调用 AI，也不执行插件代码。'
+        }
+      }
+    })
     .sort((a, b) => severityRank(a.r.severity) - severityRank(b.r.severity) || a.i - b.i)
 })
 

@@ -3,6 +3,7 @@ import * as db from '../storage.js'
 import { SCHEMA_VERSION } from '../migration.js'
 import { genId } from '../ids.js'
 import { APP_VERSION } from '../../version.js'
+import { BOOK_POINTER_FIELDS, BOOK_POINTER_STAMP } from './pointers.js'
 
 /**
  * 全量快照：整库导出成一个 .json，以及从 .json 合并回来。
@@ -35,15 +36,28 @@ export const SNAPSHOT_FORMAT = 'novel-studio-snapshot'
 export const SNAPSHOT_VERSION = 1
 
 /**
- * 快照里逐书保存的集合。与 storage.COLLECTIONS 同源，排除两类：
+ * **设备本地态集合**：进 storage.COLLECTIONS（于是获得工厂保证与级联删除），
+ * 但绝不进快照。三者的共同点是「描述的是这台机器此刻的中间状态」：
  *
- * - `tombstones`：单独处理（删除语义与普通记录不同）；
- * - `generationTasks`：生成任务/流式草稿是**设备本地**状态。把「这台电脑上
- *   正在进行的一次调用」同步到手机上没有任何意义，草稿还可能带着几万字正文，
- *   白白撑大每次同步与备份。崩溃恢复只在本机做。
+ * - `generationTasks`：流式草稿/崩溃恢复。草稿带着几万字正文，且「这台电脑上
+ *   没跑完的调用」同步到手机上毫无意义；
+ * - `generationQueue`：排队等待生成的写作任务。同步过去会让同一批章节在两端
+ *   各生成一遍、各花一次钱；
+ * - `ragChunks`：检索分块与向量。向量由本机算法生成，换机后自动重建即可，
+ *   进快照只会膨胀体积。
+ *
+ * **新增本地态集合时同时改这里与 storage.js 的注释**：漏掉一处，它就会开始
+ * 随每次同步传播，而且没有任何报错。
+ */
+export const LOCAL_ONLY_COLLECTIONS = ['generationTasks', 'generationQueue', 'ragChunks']
+const LOCAL_ONLY = new Set(LOCAL_ONLY_COLLECTIONS)
+
+/**
+ * 快照里逐书保存的集合。与 storage.COLLECTIONS 同源，排除墓碑（单独处理）
+ * 与设备本地态（见上）。
  */
 const DATA_COLLECTIONS = db.COLLECTIONS.filter(
-  (n) => n !== 'tombstones' && n !== 'generationTasks'
+  (n) => n !== 'tombstones' && !LOCAL_ONLY.has(n)
 )
 
 /** 空快照。恢复的目标结构，也是合并的零元。 */
@@ -53,6 +67,11 @@ export function emptySnapshot(exportedAt = 0) {
     version: SNAPSHOT_VERSION,
     schemaVersion: SCHEMA_VERSION,
     exportedAt,
+    appVersion: '',
+    deviceId: '',
+    // 设备显示名：只用于界面上说「上次同步来自哪台设备」。它是**可选**头字段，
+    // 不参与校验和（校验和只覆盖 books / data / bookTombstones）。
+    deviceName: '',
     books: [],
     data: {},
     bookTombstones: []
@@ -148,6 +167,7 @@ export function finalizeSnapshot(snap) {
   // 设备标识是同步冲突检测的「谁改的」那一半。它是**可选头字段**：
   // 旧备份没有它照样能恢复；旧软件读到它直接忽略。校验和不覆盖头字段。
   out.deviceId = typeof snap?.deviceId === 'string' ? snap.deviceId : ''
+  out.deviceName = typeof snap?.deviceName === 'string' ? snap.deviceName : ''
   out.counts = snapshotCounts(out)
   out.checksum = snapshotChecksum(out)
   return out
@@ -155,19 +175,27 @@ export function finalizeSnapshot(snap) {
 
 /** 纯组装。I/O 由 collectSnapshot 负责，这里只为可确定性单测。 */
 export function buildSnapshot(
-  { books = [], data = {}, bookTombstones = [], appVersion = APP_VERSION, deviceId = '' } = {},
+  {
+    books = [],
+    data = {},
+    bookTombstones = [],
+    appVersion = APP_VERSION,
+    deviceId = '',
+    deviceName = ''
+  } = {},
   exportedAt = Date.now()
 ) {
   const out = emptySnapshot(exportedAt)
   out.appVersion = appVersion
   out.deviceId = deviceId
+  out.deviceName = deviceName
   out.books = [...books]
   out.data = {}
-  // 新集合自动进快照，但 generationTasks / tombstones 除外（见 DATA_COLLECTIONS）
+  // 新集合自动进快照，但墓碑与设备本地态除外（见 LOCAL_ONLY_COLLECTIONS）
   for (const [bookId, sets] of Object.entries(data)) {
     const clean = {}
     for (const [name, list] of Object.entries(sets || {})) {
-      if (name !== 'generationTasks') clean[name] = list
+      if (!LOCAL_ONLY.has(name)) clean[name] = list
     }
     out.data[bookId] = { tombstones: [], ...clean }
   }
@@ -191,6 +219,51 @@ export function mergeRecords(local = [], remote = []) {
     if (!r || !r.id) continue
     const cur = byId.get(r.id)
     if (!cur || tstamp(r) > tstamp(cur)) byId.set(r.id, r)
+  }
+  return [...byId.values()]
+}
+
+/**
+ * 书籍指针的字段与合并规则见 pointers.js；这里只消费它们。
+ *
+ * 指针写入频率远高于书的本体（每次切章都改），所以用独立的
+ * `currentPointerUpdatedAt` 合并，而不是跟着书的 `updatedAt` 走。
+ */
+export { BOOK_POINTER_FIELDS, BOOK_POINTER_STAMP }
+
+/**
+ * 合并书籍记录：书本体按 `updatedAt` 后写覆盖，指针按指针时间戳单独选择。
+ *
+ * 相等时保留本地（与 mergeRecords 同一护栏）：重复合并同一份文件不该让
+ * 本机指针来回抖动。两侧都没有指针时间戳（旧版本记录）时不写这个字段，
+ * 免得给老数据平白多出一个 0。
+ */
+export function mergeBookRecords(
+  local = [],
+  remote = [],
+  {
+    pointerFields = BOOK_POINTER_FIELDS,
+    pointerStamp = BOOK_POINTER_STAMP
+  } = {}
+) {
+  const byId = new Map()
+  for (const b of local || []) if (b && b.id) byId.set(b.id, b)
+  for (const b of remote || []) {
+    if (!b || !b.id) continue
+    const cur = byId.get(b.id)
+    if (!cur) {
+      byId.set(b.id, b)
+      continue
+    }
+    const base = tstamp(b) > tstamp(cur) ? { ...b } : { ...cur }
+    const localStamp = Number(cur?.[pointerStamp]) || 0
+    const remoteStamp = Number(b?.[pointerStamp]) || 0
+    if (localStamp || remoteStamp) {
+      const source = remoteStamp > localStamp ? b : cur
+      for (const f of pointerFields) base[f] = source?.[f] ?? null
+      base[pointerStamp] = Math.max(localStamp, remoteStamp)
+    }
+    byId.set(b.id, base)
   }
   return [...byId.values()]
 }
@@ -241,7 +314,8 @@ export function mergeSnapshot(local, remote) {
   const out = emptySnapshot(Math.max(Number(a.exportedAt) || 0, Number(b.exportedAt) || 0))
 
   const bookTombs = mergeTombstones(a.bookTombstones, b.bookTombstones)
-  const mergedBooks = mergeRecords(a.books, b.books)
+  // 书籍不能走 mergeRecords：当前章节/卷/篇指针需要按自己的时间戳合并。
+  const mergedBooks = mergeBookRecords(a.books, b.books)
   out.bookTombstones = bookTombs
   // 整书墓碑与逐书墓碑同一条规则：删得比书的最后修改晚，这本书才算没了
   out.books = applyTombstones(mergedBooks, bookTombs)
@@ -271,6 +345,7 @@ export function mergeSnapshot(local, remote) {
   // 合并结果代表「本机的数据」，所以它带上本机的 deviceId；对端拿到后
   // 就知道这条基线属于谁。
   out.deviceId = a.deviceId || b.deviceId || ''
+  out.deviceName = a.deviceName || b.deviceName || ''
   // 合并结果也补齐头字段：它会被同步响应原样发给对端，也会作为「恢复后」
   // 快照参与下一轮 diff。没有 checksum 的文件不能算一份合格的快照。
   return finalizeSnapshot(out)
@@ -378,6 +453,7 @@ export function normalizeSnapshot(obj) {
     exportedAt: Number(obj.exportedAt) || 0,
     appVersion: typeof obj.appVersion === 'string' ? obj.appVersion : '',
     deviceId: typeof obj.deviceId === 'string' ? obj.deviceId : '',
+    deviceName: typeof obj.deviceName === 'string' ? obj.deviceName : '',
     counts: obj.counts && typeof obj.counts === 'object' ? obj.counts : null,
     checksum: typeof obj.checksum === 'string' ? obj.checksum : '',
     books: Array.isArray(obj.books) ? obj.books : [],
@@ -496,6 +572,11 @@ export function cloneSnapshotAsNewBooks(snap, { newId = genId, now = Date.now() 
     bookCopy.title = `${book.title || '未命名小说'}（导入副本）`
     bookCopy.createdAt = now
     bookCopy.updatedAt = now
+    // 副本里的章节都换了新 id，指针必须跟着重映射，否则会指向原书的章节。
+    for (const f of BOOK_POINTER_FIELDS) {
+      bookCopy[f] = idMap.get(bookCopy[f]) || null
+    }
+    bookCopy[BOOK_POINTER_STAMP] = now
     out.books.push(bookCopy)
 
     const dataCopy = { tombstones: [] }
@@ -516,7 +597,7 @@ export function cloneSnapshotAsNewBooks(snap, { newId = genId, now = Date.now() 
  * 一台已经把某本书删掉的设备导出的快照里不会有这本书的墓碑，另一台就永远
  * 不知道它被删了，那本书会在同步时反复复活。
  */
-export async function collectSnapshot() {
+export async function collectSnapshot({ deviceName = '' } = {}) {
   const books = await db.getBooks()
   const bookTombstones = await db.getBookTombstones()
   const ids = new Set([...books.map((b) => b.id), ...bookTombstones.map((t) => t.id)])
@@ -530,7 +611,13 @@ export async function collectSnapshot() {
     for (const name of DATA_COLLECTIONS) sets[name] = await db.coll[name].getAll(bookId)
     data[bookId] = sets
   }
-  return buildSnapshot({ books, data, bookTombstones, deviceId: await db.getDeviceId() })
+  return buildSnapshot({
+    books,
+    data,
+    bookTombstones,
+    deviceId: await db.getDeviceId(),
+    deviceName
+  })
 }
 
 /**

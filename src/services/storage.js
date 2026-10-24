@@ -64,6 +64,27 @@ export async function upsertBook(book) {
   })
 }
 
+/**
+ * 只改书的**部分字段**。
+ *
+ * `upsertBook` 接收整本书记录，调用方手里那份书对象可能是几十秒前读出来的；
+ * 当前章节/卷/篇指针是高频写入（每次切章），用整对象回写会把期间由别处改掉的
+ * 书名、规划一起顶回去。指针只需要这四个字段，走这里。
+ *
+ * 返回值是写入后的整个书列表（与 upsertBook 一致），找不到书时原样返回。
+ */
+export async function patchBook(bookId, patch) {
+  if (!bookId) return warnNoBook()
+  return serialize(KEY_BOOKS, async () => {
+    const books = await getBooks()
+    const idx = books.findIndex((b) => b.id === bookId)
+    if (idx < 0) return books
+    books[idx] = { ...books[idx], ...toPlain(patch) }
+    await writeBooks(books)
+    return books
+  })
+}
+
 export async function deleteBook(bookId) {
   if (!bookId) return warnNoBook()
   // 先落整书墓碑，再删数据 —— 与 per-record 墓碑同一个理由（见 makeCollection）。
@@ -238,6 +259,14 @@ export const COLLECTIONS = [
   // 文风档案。它是跨章稳定的表达层，由作者手写而不是从正文里提取；
   // 随快照同步 —— 换台设备继续写，腔调应当还是同一套。
   'styleProfiles',
+  // 写作任务队列。**设备本地态**：它记录的是「这台机器上排队等生成的草稿」，
+  // 同步到另一台设备毫无意义（同一批章节会在两边各生成一遍），草稿正文还会
+  // 把每次快照撑大。snapshot.js 的 DATA_COLLECTIONS 会排除它。
+  'generationQueue',
+  // RAG 检索分块与 256 维哈希向量。同样是**设备本地态**：向量由本机算法与
+  // 内容哈希生成，另一台设备读进来也对不上自己的索引；进快照只会白白膨胀。
+  // 换机后第一次写作用到检索时会自动重建（见 rag/indexer.js）。
+  'ragChunks',
   'tombstones'
 ]
 
@@ -445,6 +474,28 @@ export async function saveSyncPeers(peers) {
   return serialize(KEY_SYNC_PEERS, async () => {
     await set(KEY_SYNC_PEERS, toPlain(peers || {}), store)
     return peers
+  })
+}
+
+// ---------- 写作队列的暂停标记 ----------
+// 全局键：暂停是「这台设备上的队列都先别跑」的开关，不属于某本书。
+// 与队列条目一样是**设备本地态**，不进快照。
+
+const KEY_QUEUE_STATE = 'generationQueueState'
+
+export async function getQueueState() {
+  const s = await get(KEY_QUEUE_STATE, store)
+  return s && typeof s === 'object' ? s : { paused: false, updatedAt: 0 }
+}
+
+export async function saveQueueState(state) {
+  return serialize(KEY_QUEUE_STATE, async () => {
+    const next = {
+      paused: !!state?.paused,
+      updatedAt: Number(state?.updatedAt) || Date.now()
+    }
+    await set(KEY_QUEUE_STATE, next, store)
+    return next
   })
 }
 

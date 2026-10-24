@@ -3,7 +3,17 @@ import * as db from '../services/storage'
 import { genId } from '../services/ids'
 import { countWords } from '../services/wordCount'
 import { captureVersion, sortVersions } from '../services/novel/versioning'
+import {
+  BOOK_POINTER_FIELDS,
+  BOOK_POINTER_STAMP,
+  derivePointers,
+  pointersEqual,
+  pickChapterAfterDelete,
+  pointerPatch,
+  resolvePointerChapter
+} from '../services/novel/pointers'
 import { settings } from './settings'
+import { deriveDeviceName } from '../services/settingsExtras'
 
 export const BOOK_COLORS = [
   'linear-gradient(135deg,#6d8bff,#4f6ef2)',
@@ -33,6 +43,70 @@ export const currentChapter = computed(() =>
   store.chapters.find((c) => c.id === store.chapterId) || null
 )
 
+// ---------------------------------------------------------------------------
+// 书籍指针（上次读到的章节 / 篇 / 卷）
+//
+// 切章是高频动作，直接每次写一遍 books 键会与自动保存的整组回写抢同一条队列。
+// 故：内存立即更新（界面与 Context Builder 马上看到），600ms 防抖后走
+// db.patchBook 只写四个字段；关闭书 / 同步重载前再强制 flush 一次收口。
+// `pointerArcs` 是打开书时顺带读出的篇列表，用于由章节的 arcId 推导所属卷。
+// ---------------------------------------------------------------------------
+const POINTER_WRITE_DELAY_MS = 600
+let pointerTimer = null
+let pointerArcs = []
+
+/**
+ * 把指针同步到内存里的 store.book。
+ * 返回是否发生了变化（只有变化才值得防抖写库）。
+ */
+function applyPointers(chapter, { previous = null } = {}) {
+  if (!store.book) return false
+  const next = derivePointers(chapter, { arcs: pointerArcs, previous })
+  const changed = !pointersEqual(store.book, next)
+  Object.assign(store.book, next)
+  if (changed) store.book[BOOK_POINTER_STAMP] = Date.now()
+  return changed
+}
+
+/**
+ * 重新读一遍篇列表。指针只需要「篇 → 卷」这一条映射，不为此引入 structureStore
+ * （它反过来 import 了 books，绕成循环依赖）。编辑卷/篇走控制台时不会通知这里，
+ * 所以凡是**给当前章归篇**的动作都要先刷一次，否则新篇的卷指针会算成空。
+ */
+async function refreshPointerArcs() {
+  pointerArcs = store.bookId ? await db.coll.arcs.getAll(store.bookId) : []
+  return pointerArcs
+}
+
+function schedulePointerWrite() {
+  if (pointerTimer) clearTimeout(pointerTimer)
+  pointerTimer = setTimeout(() => {
+    pointerTimer = null
+    flushCurrentPointers()
+  }, POINTER_WRITE_DELAY_MS)
+}
+
+/**
+ * 立即把指针落盘。调用方：防抖到期、关书、返回书架、同步重载前。
+ *
+ * 不 await 的调用也是安全的：函数体在第一个 await 之前已经把 patch 读完，
+ * 随后即使 store 被清空也不会影响这次写入。
+ */
+async function flushCurrentPointers() {
+  if (pointerTimer) {
+    clearTimeout(pointerTimer)
+    pointerTimer = null
+  }
+  const bookId = store.bookId
+  const book = store.book
+  if (!bookId || !book) return
+  // 从没碰过指针的旧书不写：免得给每条老记录平白加一个 0 时间戳。
+  if (!Number(book[BOOK_POINTER_STAMP])) return
+  const current = {}
+  for (const f of BOOK_POINTER_FIELDS) current[f] = book[f] ?? null
+  await db.patchBook(bookId, pointerPatch(current, book[BOOK_POINTER_STAMP]))
+}
+
 export function useBooks() {
   async function init() {
     if (store.loaded) return
@@ -46,16 +120,29 @@ export function useBooks() {
     store.chapters = await db.getChapters(id)
     store.outlines = await db.getOutlines(id)
     store.versions = sortVersions(await db.coll.chapterVersions.getAll(id))
-    store.chapterId = store.chapters.length ? store.chapters[0].id : null
+    // 篇列表只为推导「章 → 篇 → 卷」而读，界面上另有 storyStructure 的单例在管。
+    await refreshPointerArcs()
+    // 恢复上次读到的章节；它已经被删掉时落回第一章（旧书没有指针，也走这条）。
+    const remembered = resolvePointerChapter(store.chapters, store.book?.currentChapterId)
+    const target = remembered || store.chapters[0] || null
+    store.chapterId = target ? target.id : null
+    if (target) {
+      // previous 传书里记住的值：目标章还没归篇时不要把篇/卷指针抹掉。
+      if (applyPointers(target, { previous: store.book })) schedulePointerWrite()
+    }
   }
 
   function closeBook() {
+    // 先发起一次指针落盘再清内存：flushCurrentPointers 在第一个 await 之前就把
+    // bookId/book 读走了，所以不 await 也不会写到空书上。
+    flushCurrentPointers()
     store.bookId = null
     store.book = null
     store.chapters = []
     store.chapterId = null
     store.outlines = []
     store.versions = []
+    pointerArcs = []
   }
 
   // ---------- 书 ----------
@@ -102,8 +189,18 @@ export function useBooks() {
   }
 
   // ---------- 章节 ----------
-  function selectChapter(id) {
-    if (store.chapters.find((c) => c.id === id)) store.chapterId = id
+  async function selectChapter(id) {
+    const chapter = store.chapters.find((c) => c.id === id)
+    if (!chapter) return
+    store.chapterId = id
+    // 篇列表里没有这一章的篇：多半是本次会话里刚建的篇，补读一次再算。
+    // 读盘期间用户可能又点走了，回来时先确认指针还指着这一章。
+    if (chapter.arcId && !pointerArcs.some((a) => a.id === chapter.arcId)) {
+      await refreshPointerArcs()
+      if (store.chapterId !== id) return
+    }
+    // 用户主动切章：这一章没有归篇就清空篇/卷指针（残留的旧值会误导 Context Builder）。
+    if (applyPointers(chapter)) schedulePointerWrite()
   }
 
   /**
@@ -157,6 +254,8 @@ export function useBooks() {
     }
     store.chapters = await db.upsertChapter(store.bookId, chapter)
     store.chapterId = chapter.id
+    // 新章默认不归篇，所以显式切过去时篇/卷指针会清空——与用户手动选中它一致。
+    if (applyPointers(chapter)) schedulePointerWrite()
     return chapter
   }
 
@@ -179,6 +278,11 @@ export function useBooks() {
     for (const k of ['content', 'id', 'bookId', 'order']) delete patch[k]
     Object.assign(c, patch, { updatedAt: Date.now() })
     store.chapters = await db.upsertChapter(store.bookId, c)
+    // 给当前章重新归篇时，篇/卷指针要跟着走；改别的章不影响「我在哪儿」。
+    if (id === store.chapterId && Object.prototype.hasOwnProperty.call(patch, 'arcId')) {
+      await refreshPointerArcs()
+      if (applyPointers(c)) schedulePointerWrite()
+    }
     return c
   }
 
@@ -229,7 +333,15 @@ export function useBooks() {
   async function persistChapter(id) {
     const c = store.chapters.find((x) => x.id === id)
     if (!c) return
-    c.updatedAt = Date.now()
+    const now = Date.now()
+    c.updatedAt = now
+    // 设备署名：只在这里（以及真正改正文的其他显式动作）写。
+    // `saveAll` / `applySnapshot` 写的是整组回写，**绝不能**盖成「本机最后编辑」——
+    // 那会让从远端同步进来的正文全部显示成「这台设备刚改的」，署名就失去意义了。
+    const deviceId = await db.getDeviceId()
+    c.lastEditedAt = now
+    c.lastEditedBy = deviceId
+    c.lastEditedByName = deriveDeviceName(settings.deviceName, deviceId)
     // 字数与正文一起落盘。放在这里而不是编辑器里：编辑器的字数只是屏幕上的数字，
     // 落了库才能在书库/章节列表里排序与筛选，也让旧的章节在下次保存时补上这个字段。
     c.wordCount = countWords(c.content).total
@@ -307,10 +419,20 @@ export function useBooks() {
     // 删章前存一版。章节走的是硬删除（数组里直接没了），版本是**误删救回的唯一入口**；
     // 这条比 AI 覆盖那条更有价值 —— 覆盖至少还有个新版本，删除什么都不剩。
     await captureChapterVersion(id, { source: 'delete' })
+    // 删除前的列表要留着算「下一章选谁」：删除后按下标取会在删最后一章时越界，
+    // 表现是「删掉正在写的最后一章，光标莫名跳到第一章」。
+    const before = store.chapters
     store.chapters = await db.deleteChapter(store.bookId, id)
     if (store.chapterId === id) {
-      store.chapterId = store.chapters.length ? store.chapters[0].id : null
+      const next = pickChapterAfterDelete(before, id)
+      store.chapterId = next ? next.id : null
     }
+    await refreshPointerArcs()
+    if (applyPointers(store.chapters.find((c) => c.id === store.chapterId) || null)) {
+      schedulePointerWrite()
+    }
+    // 删章是个完整的用户动作，指针立即收口，不等防抖。
+    await flushCurrentPointers()
   }
 
   async function moveChapter(id, dir) {
@@ -355,6 +477,7 @@ export function useBooks() {
     init,
     openBook,
     closeBook,
+    flushCurrentPointers,
     createBook,
     updateBook,
     updateBookById,

@@ -125,7 +125,10 @@ async function persistLastSync(at) {
  * 响应时，它自己那份更新会赢，两台设备的主章就永远不一致了。副本已经保住了
  * 手机的内容，所以这里让电脑的主章成为两边共同的主章是安全的。
  */
-export async function handleIncomingSnapshot(remote, { remoteAddr = '' } = {}) {
+export async function handleIncomingSnapshot(
+  remote,
+  { remoteAddr = '', reload = true, conflictCopies } = {}
+) {
   const gen = useGeneration()
   if (gen.store.running) {
     // 409 由主进程翻译，这里只负责说清楚原因
@@ -144,6 +147,9 @@ export async function handleIncomingSnapshot(remote, { remoteAddr = '' } = {}) {
   syncState.merging = true
   try {
     await ui.flush()
+    // 「读到哪一章」只在内存里防抖 600ms。先收口再取快照，否则合并用的是库里的
+    // 旧指针，用户刚切到的那一章会被对端更旧的指针顶回去。
+    await useBooks().flushCurrentPointers()
     const before = await collectSnapshot()
     const remoteDeviceId = String(snap.deviceId || '').trim()
     const peers = await db.getSyncPeers()
@@ -164,7 +170,10 @@ export async function handleIncomingSnapshot(remote, { remoteAddr = '' } = {}) {
           remoteChapters,
           baseline,
           remoteDeviceId,
-          conflictCopies: settings.syncConflictCopies !== false
+          conflictCopies:
+            conflictCopies === undefined
+              ? settings.syncConflictCopies !== false
+              : conflictCopies !== false
         })
       )
     }
@@ -191,8 +200,12 @@ export async function handleIncomingSnapshot(remote, { remoteAddr = '' } = {}) {
     }
     await persistLastSync(now)
 
-    await reloadAfterSync()
-    ui.reloadEditor()
+    // reload=false 是给 WebDAV 用的：一次同步要合并多台设备的文件，
+    // 每合并一份就整库重载一次会让界面反复跳动。由调用方在最后统一刷新。
+    if (reload !== false) {
+      await reloadAfterSync()
+      ui.reloadEditor()
+    }
     syncState.lastIncoming = {
       diff: stats,
       at: now,
@@ -212,6 +225,18 @@ export async function handleIncomingSnapshot(remote, { remoteAddr = '' } = {}) {
   } finally {
     syncState.merging = false
   }
+}
+
+/**
+ * 合并完成后统一刷新界面。
+ *
+ * 局域网同步一次只合并一份，所以它可以直接在 `handleIncomingSnapshot` 里调；
+ * WebDAV 一次要合并多台设备的文件，每份都刷新会让界面反复跳动——它用
+ * `reload=false` 合并完全部，最后调这一个函数。
+ */
+export async function refreshUiAfterSync() {
+  await reloadAfterSync()
+  ui.reloadEditor()
 }
 
 /**
@@ -243,8 +268,11 @@ export async function reloadAfterSync() {
   }
 
   await b.openBook(openId)
+  // openBook 会恢复书里记住的指针（对端可能刚更新过它）。但同步前正看着的那一章
+  // 才是用户眼前的正文，它还在就以它为准；走 selectChapter 让篇/卷指针跟着它走，
+  // 否则指针会停在 openBook 恢复出来的另一章上。
   if (keepChapterId && b.store.chapters.some((c) => c.id === keepChapterId)) {
-    b.store.chapterId = keepChapterId
+    await b.selectChapter(keepChapterId)
   }
   await Promise.all([cols.loadForBook(openId), gen.loadForBook(openId)])
   return { bookId: openId }

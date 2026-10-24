@@ -82,7 +82,7 @@ async function save() {
     </div>
 
     <p class="bp-hint">
-      这里写的是整本书的方向，会作为**最高优先级**的设定层注入每一章的提示词。
+      这里写的是整本书的方向，会作为<strong>最高优先级</strong>的设定层注入每一章的提示词。
       不是填得越多越好——只写你真正不想被 AI 忘掉的那几句。
       <template v-if="emptyHint">留空也完全可以，不会影响任何既有功能。</template>
     </p>

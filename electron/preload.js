@@ -35,11 +35,23 @@ contextBridge.exposeInMainWorld('electronAPI', {
   syncRespond: (payload) => ipcRenderer.invoke('sync:respond', payload),
   // 主→渲染：有设备来同步了，把远端快照交下来处理
   onSyncIncoming: (cb) => ipcRenderer.on('sync:incoming', (_e, payload) => cb(payload)),
-  // ---- API Key 安全存储（safeStorage；密钥只在主进程加解密） ----
-  // 返回 { ok, value?, code?, message? }。code==='unsupported' 时渲染层回退明文。
-  secretGet: () => ipcRenderer.invoke('secret:get'),
-  secretSet: (value) => ipcRenderer.invoke('secret:set', { value }),
-  secretDelete: () => ipcRenderer.invoke('secret:delete'),
+  // ---- 秘密存储（safeStorage；密钥只在主进程加解密） ----
+  // slot: 'apiKey'（默认）| 'webdavPassword'。未知槽返回 EINVAL，绝不回退明文。
+  // 返回 { ok, value?, code?, message? }。code==='unsupported' 时渲染层如实提示。
+  secretGet: (slot = 'apiKey') => ipcRenderer.invoke('secret:get', { slot }),
+  secretSet: (value, slot = 'apiKey') => ipcRenderer.invoke('secret:set', { value, slot }),
+  secretDelete: (slot = 'apiKey') => ipcRenderer.invoke('secret:delete', { slot }),
+  // ---- WebDAV（仅桌面端） ----
+  // 只暴露「发一个受白名单约束的 DAV 请求」，不暴露通用 net/fs。
+  // 密码由主进程从 safeStorage 取；payload.password 只在「刚输入、还没保存」
+  // 的那一次测试连接里出现。
+  webdavRequest: (payload) => ipcRenderer.invoke('webdav:request', payload),
+  webdavEnsureDir: (payload) => ipcRenderer.invoke('webdav:ensureDir', payload),
+  // ---- 声明式插件（仅桌面端） ----
+  // 只暴露「列固定插件目录」与「打开该目录」。插件是纯 JSON，不执行代码；
+  // 渲染层也拿不到任意路径的读取能力。
+  pluginsList: () => ipcRenderer.invoke('plugins:list'),
+  pluginsOpenFolder: () => ipcRenderer.invoke('plugins:openFolder'),
   // ---- 关窗前的保存握手 ----
   // 主进程拦下第一个 close 事件，等渲染层把防抖窗口里的正文落库后再放行
   onBeforeClose: (cb) => ipcRenderer.on('app:before-close', () => cb()),

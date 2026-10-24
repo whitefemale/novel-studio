@@ -104,6 +104,16 @@ import {
 } from './services/ai/models'
 import { dayStart, spentOnDay, estimateCall, checkBudget } from './services/ai/budget'
 import {
+  PROVIDER_PRESETS,
+  getProviderPreset,
+  inferProviderId,
+  normalizeProviderId,
+  normalizeProviderSettings,
+  createProvider,
+  providerLabel,
+  isPresetApplied
+} from './services/ai/providers'
+import {
   activeStyleProfile,
   renderStyleProfile,
   styleProfileText,
@@ -197,6 +207,10 @@ import {
   applyTombstones,
   mergeTombstones,
   mergeRecords,
+  mergeBookRecords,
+  BOOK_POINTER_FIELDS,
+  BOOK_POINTER_STAMP,
+  LOCAL_ONLY_COLLECTIONS,
   snapshotStats,
   diffSnapshots,
   parseSnapshotJson,
@@ -246,6 +260,139 @@ import {
   DEFAULT_IDLE_TIMEOUT_SEC,
   DEFAULT_MAX_RETRIES
 } from './services/ai/request'
+import {
+  PLAN_VALIDATION_VERSION,
+  PLAN_ISSUE_CATEGORIES,
+  PLAN_ISSUE_LABELS,
+  DEFAULT_REPETITION_WINDOW,
+  REPETITION_THRESHOLD,
+  normalizePlanCandidate,
+  validatePlan,
+  shouldBlockPlan,
+  validationSummary,
+  bigramDice
+} from './services/novel/planValidate'
+import {
+  resolvePointerChapter,
+  derivePointers,
+  pickChapterAfterDelete,
+  pointersEqual,
+  pointerPatch
+} from './services/novel/pointers'
+import {
+  QUEUE_STATUSES,
+  QUEUE_STATUS_LABELS,
+  QUEUE_ACTIVE_STATUSES,
+  QUEUE_RETRYABLE_STATUSES,
+  MAX_RESULT_CHARS,
+  canTransition,
+  isTerminalStatus,
+  capResultText,
+  createQueueItem,
+  normalizeQueueItem,
+  sortQueueItems,
+  transitionQueueItem,
+  nextRunnable,
+  recoverQueueItems,
+  queueSummary,
+  queueItemTitle,
+  hasUsableResult,
+  queueBudgetExceeded
+} from './services/ai/queue'
+import { createQueueRunner } from './services/ai/queueRunner'
+import { useWritingQueue, queueStore } from './store/writingQueue'
+import {
+  EMBEDDING_VERSION,
+  EMBEDDING_DIM,
+  embeddingTokens,
+  embedTokens,
+  embedText,
+  buildIdf,
+  applyIdf,
+  cosineSimilarity
+} from './services/rag/hashEmbedding'
+import {
+  chunkChapter,
+  DEFAULT_CHUNK_CHARS,
+  DEFAULT_OVERLAP_CHARS,
+  DEFAULT_MAX_CHUNKS
+} from './services/rag/chunking'
+import { searchRag, RAG_TOP_K, RAG_MIN_SCORE, RAG_MAX_PER_CHAPTER } from './services/rag/search'
+import {
+  ensureBookIndex,
+  getRagIndexStatus,
+  clearBookIndex,
+  ragChunkId,
+  RAG_COLLECTION
+} from './services/rag/indexer'
+import {
+  buildRagQueryText,
+  ragExcludeChapterIds,
+  retrieveRagContext
+} from './services/rag/context'
+import {
+  GRAPH_NODE_KINDS,
+  GRAPH_EDGE_KINDS,
+  GRAPH_EDGE_KIND_MAP,
+  GRAPH_LIMITS,
+  normalizeGraphName,
+  parseRelationshipText,
+  buildRelationshipGraph,
+  layoutRelationshipGraph
+} from './services/novel/graph'
+import {
+  parseDavBase,
+  normalizeRemoteDir as normalizeDavRemoteDir,
+  snapshotPath as davSnapshotPath,
+  snapshotFilesFromHrefs,
+  parseDavHrefs,
+  describeDavStatus,
+  shouldRetryDavStatus,
+  describeWebdavState,
+  DAV_MAX_BYTES
+} from './services/sync/webdavConfig'
+import {
+  syncWithWebdav,
+  testWebdav,
+  webdavState,
+  webdavSupported
+} from './services/sync/webdav'
+import {
+  defaultPlanValidation,
+  normalizePlanValidation,
+  defaultRagSettings,
+  normalizeRagSettings,
+  defaultWebdavSettings,
+  normalizeWebdavSettings,
+  normalizeRemoteDirInput,
+  defaultPluginSettings,
+  normalizePluginSettings,
+  deriveDeviceName
+} from './services/settingsExtras'
+import {
+  PLUGIN_SCHEMA_VERSION,
+  PLUGIN_LIMITS,
+  HOOK_KEYS,
+  RULE_SEVERITIES,
+  RULE_FLAGS_ALLOWED,
+  TEMPLATE_PLACEHOLDERS,
+  validatePluginManifest,
+  normalizePluginList,
+  pluginDisplayName,
+  pluginHookCounts
+} from './services/plugins/manifest'
+import {
+  activePlugins,
+  pluginContextFragments,
+  runPluginRules,
+  collectKeywordHints,
+  renderTemplateChapters,
+  renderExportTemplate,
+  validateTemplatePlaceholders,
+  pluginTemplates,
+  describePluginHooks
+} from './services/plugins/hooks'
+import { usePlugins, pluginState } from './store/plugins'
 import { APP_VERSION } from './version'
 import {
   setUiHooks,
@@ -545,5 +692,147 @@ window.__ns = {
   stateMap,
   saveIssueStates,
   setIssueStatus,
-  listIssueStates
+  listIssueStates,
+
+  // ---- V4 阶段 1：服务商预设与 Provider ----
+  PROVIDER_PRESETS,
+  getProviderPreset,
+  inferProviderId,
+  normalizeProviderId,
+  normalizeProviderSettings,
+  createProvider,
+  providerLabel,
+  isPresetApplied,
+
+  // ---- V4 阶段 3：生成前计划校验 ----
+  PLAN_VALIDATION_VERSION,
+  PLAN_ISSUE_CATEGORIES,
+  PLAN_ISSUE_LABELS,
+  DEFAULT_REPETITION_WINDOW,
+  REPETITION_THRESHOLD,
+  normalizePlanCandidate,
+  validatePlan,
+  shouldBlockPlan,
+  validationSummary,
+  bigramDice,
+
+  // ---- V4 阶段 4：持久化写作队列 ----
+  QUEUE_STATUSES,
+  QUEUE_STATUS_LABELS,
+  QUEUE_ACTIVE_STATUSES,
+  QUEUE_RETRYABLE_STATUSES,
+  MAX_RESULT_CHARS,
+  canTransition,
+  isTerminalStatus,
+  capResultText,
+  createQueueItem,
+  normalizeQueueItem,
+  sortQueueItems,
+  transitionQueueItem,
+  nextRunnable,
+  recoverQueueItems,
+  queueSummary,
+  queueItemTitle,
+  hasUsableResult,
+  queueBudgetExceeded,
+  createQueueRunner,
+  useWritingQueue,
+  queueStore,
+
+  // ---- V4 阶段 5：本地哈希检索（RAG） ----
+  EMBEDDING_VERSION,
+  EMBEDDING_DIM,
+  embeddingTokens,
+  embedTokens,
+  embedText,
+  buildIdf,
+  applyIdf,
+  cosineSimilarity,
+  chunkChapter,
+  DEFAULT_CHUNK_CHARS,
+  DEFAULT_OVERLAP_CHARS,
+  DEFAULT_MAX_CHUNKS,
+  searchRag,
+  RAG_TOP_K,
+  RAG_MIN_SCORE,
+  RAG_MAX_PER_CHAPTER,
+  ensureBookIndex,
+  getRagIndexStatus,
+  clearBookIndex,
+  ragChunkId,
+  RAG_COLLECTION,
+  buildRagQueryText,
+  ragExcludeChapterIds,
+  retrieveRagContext,
+
+  // ---- V4 阶段 6：人物关系图（纯派生，不写库） ----
+  GRAPH_NODE_KINDS,
+  GRAPH_EDGE_KINDS,
+  GRAPH_EDGE_KIND_MAP,
+  GRAPH_LIMITS,
+  normalizeGraphName,
+  parseRelationshipText,
+  buildRelationshipGraph,
+  layoutRelationshipGraph,
+
+  // ---- V4 阶段 2：书籍指针 ----
+  resolvePointerChapter,
+  derivePointers,
+  pickChapterAfterDelete,
+  pointersEqual,
+  pointerPatch,
+
+  // ---- V4 阶段 0：快照指针与本地态集合 ----
+  mergeBookRecords,
+  BOOK_POINTER_FIELDS,
+  BOOK_POINTER_STAMP,
+  LOCAL_ONLY_COLLECTIONS,
+  defaultPlanValidation,
+  normalizePlanValidation,
+  defaultRagSettings,
+  normalizeRagSettings,
+  defaultWebdavSettings,
+  normalizeWebdavSettings,
+  normalizeRemoteDirInput,
+  defaultPluginSettings,
+  normalizePluginSettings,
+  deriveDeviceName,
+
+  // ---- V4 阶段 7：WebDAV 同步 ----
+  parseDavBase,
+  normalizeDavRemoteDir,
+  davSnapshotPath,
+  snapshotFilesFromHrefs,
+  parseDavHrefs,
+  describeDavStatus,
+  shouldRetryDavStatus,
+  describeWebdavState,
+  DAV_MAX_BYTES,
+  syncWithWebdav,
+  testWebdav,
+  webdavState,
+  webdavSupported,
+
+  // ---- V4 阶段 8：声明式插件（只读纯数据，绝不执行代码） ----
+  PLUGIN_SCHEMA_VERSION,
+  PLUGIN_LIMITS,
+  HOOK_KEYS,
+  RULE_SEVERITIES,
+  RULE_FLAGS_ALLOWED,
+  TEMPLATE_PLACEHOLDERS,
+  validatePluginManifest,
+  normalizePluginList,
+  pluginDisplayName,
+  pluginHookCounts,
+  activePlugins,
+  pluginContextFragments,
+  runPluginRules,
+  collectKeywordHints,
+  renderTemplateChapters,
+  renderExportTemplate,
+  validateTemplatePlaceholders,
+  pluginTemplates,
+  describePluginHooks,
+  usePlugins,
+  pluginState
 }

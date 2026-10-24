@@ -217,9 +217,19 @@ export function timeKey(text) {
  * @param {object}   opt.memory      记忆层各集合（characters / events / foreshadowing …）
  * @param {object}   opt.structure   剧情结构各集合（volumes / arcs）
  * @param {Array}    opt.tombstones  墓碑，用来在断链消息里补上「什么时候删的」
+ * @param {Array}    opt.pluginRules 声明式插件规则已经算好的问题（`source` 为 'plugin'）。
+ *                                   这些问题的判据来自用户自己的 JSON，仍然**只做
+ *                                   字面匹配**；把它们并入同一份报告，是为了让
+ *                                   「检查」只有一个入口、一个数字。
  * @returns {{issues: Array, stats: object}}
  */
-export function runRuleChecks({ chapters = [], memory = {}, structure = {}, tombstones = [] } = {}) {
+export function runRuleChecks({
+  chapters = [],
+  memory = {},
+  structure = {},
+  tombstones = [],
+  pluginRules = []
+} = {}) {
   const data = { chapters, ...memory, ...structure }
   const chaptersArr = chapters || []
   const events = data.events || []
@@ -523,18 +533,37 @@ export function runRuleChecks({ chapters = [], memory = {}, structure = {}, tomb
   }
   flushRun()
 
-  // 高严重度的排前面，同级别内保持规则清单的顺序（稳定，不会两次渲染两个样）
+  // 插件规则的问题由 hooks.js 算好（它知道正则与来源），这里只负责并入。
+  // 严重度再校验一次：runRuleChecks 也可能被别人直接调用，不能假定入参干净。
+  for (const it of Array.isArray(pluginRules) ? pluginRules : []) {
+    if (!it || typeof it !== 'object' || !it.id || !it.title) continue
+    issues.push({
+      ...it,
+      severity: ['low', 'medium', 'high'].includes(it.severity) ? it.severity : 'medium',
+      source: 'plugin'
+    })
+  }
+
+  // 高严重度的排前面，同级别内保持规则清单的顺序（稳定，不会两次渲染两个样）。
+  // 插件规则不在内置清单里，按它们第一次出现的顺序排在后面；缺了兜底值会让
+  // 比较函数返回 NaN，排序结果变成引擎实现细节。
   const ruleIndex = new Map(CONSISTENCY_RULES.map((r, i) => [r.id, i]))
+  for (const it of issues) {
+    if (it.rule && !ruleIndex.has(it.rule)) ruleIndex.set(it.rule, ruleIndex.size)
+  }
+  const orderOfRule = (rule) => ruleIndex.get(rule) ?? Number.MAX_SAFE_INTEGER
   issues.sort(
-    (a, b) => severityRank(a.severity) - severityRank(b.severity) || ruleIndex.get(a.rule) - ruleIndex.get(b.rule)
+    (a, b) => severityRank(a.severity) - severityRank(b.severity) || orderOfRule(a.rule) - orderOfRule(b.rule)
   )
 
   const bySeverity = { high: 0, medium: 0, low: 0 }
   const byRule = {}
   for (const r of CONSISTENCY_RULES) byRule[r.id] = 0
+  let pluginCount = 0
   for (const it of issues) {
     bySeverity[it.severity]++
-    byRule[it.rule]++
+    byRule[it.rule] = (byRule[it.rule] || 0) + 1
+    if (it.source === 'plugin') pluginCount++
   }
 
   return {
@@ -543,6 +572,7 @@ export function runRuleChecks({ chapters = [], memory = {}, structure = {}, tomb
       total: issues.length,
       bySeverity,
       byRule,
+      plugin: pluginCount,
       chapters: chaptersArr.length,
       entities: Object.keys(ENTITY_SCHEMAS).reduce((n, k) => n + (data[k] || []).length, 0)
     }

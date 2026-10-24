@@ -4,6 +4,7 @@ const fs = require('fs')
 const http = require('http')
 const os = require('os')
 const crypto = require('crypto')
+const { davRequest, ensureCollection } = require('./webdav')
 
 let mainWindow = null
 // 活跃请求表：requestId -> AbortController
@@ -94,6 +95,8 @@ function createWindow() {
   // 冒烟测试模式：SMOKE_TEST=1 npx electron . → 加载完成后打印挂载状态并退出
   if (process.env.SMOKE_TEST) {
     startSseMockServer()
+    const { startSmokeWebdav } = require('./smokeWebdav')
+    smokeWebdav = null
     mainWindow.webContents.on('console-message', (_e, level, message) => {
       if (level >= 1) console.log('RENDERER_CONSOLE', message)
     })
@@ -113,8 +116,74 @@ function createWindow() {
         await mainWindow.webContents.executeJavaScript(
           `window.__nsSmokeDir = ${JSON.stringify(SMOKE_DIR)}; true`
         )
+        // 冒烟用的插件目录：一个合法插件 + 一个坏 JSON + 一个清单不合法的文件。
+        // 只有在这一段里才用临时目录，正常启动读的是 userData/plugins。
+        const smokePlugins = path.join(SMOKE_DIR, 'plugins')
+        fs.mkdirSync(smokePlugins, { recursive: true })
+        fs.writeFileSync(
+          path.join(smokePlugins, 'smoke-plugin.json'),
+          JSON.stringify(
+            {
+              schemaVersion: 1,
+              id: 'smoke-plugin',
+              name: '冒烟插件',
+              version: '1.0.0',
+              description: '只用于自动化测试的声明式插件',
+              hooks: {
+                contextFragments: [
+                  { title: '冒烟上下文', text: '这是一段来自声明式插件的写作要求：每章至少出现一次雨声。' }
+                ],
+                rules: [
+                  {
+                    id: 'taboo-word',
+                    title: '禁用词',
+                    severity: 'medium',
+                    pattern: '禁词',
+                    message: '正文里出现了禁用词。'
+                  }
+                ],
+                exportTemplates: [
+                  {
+                    id: 'simple',
+                    name: '极简模板',
+                    ext: 'txt',
+                    template: '《{{bookTitle}}》\n共 {{chapterCount}} 章\n\n{{chapters}}\n\n导出于 {{date}}'
+                  }
+                ],
+                keywordHints: [{ keywords: ['雨声'], hint: '别忘了让雨声贯穿本章。' }]
+              }
+            },
+            null,
+            2
+          ),
+          'utf8'
+        )
+        fs.writeFileSync(path.join(smokePlugins, 'broken.json'), '{ this is not json', 'utf8')
+        fs.writeFileSync(
+          path.join(smokePlugins, 'bad-manifest.json'),
+          JSON.stringify({ schemaVersion: 1, id: 'Bad ID!', hooks: {} }),
+          'utf8'
+        )
+        await mainWindow.webContents.executeJavaScript(
+          `window.__nsSmokePluginsDir = ${JSON.stringify(smokePlugins)}; true`
+        )
       } catch (err) {
         console.error('SMOKE_DIR_ERROR', err && err.message)
+      }
+      // WebDAV mock：真实 HTTP 服务，走完整 IPC → net.fetch 链路。
+      // 只把 baseUrl 注入渲染层，凭据不注入（测试用固定假密码）。
+      try {
+        smokeWebdav = await startSmokeWebdav({ root: '/dav' })
+        const baseUrl = `http://127.0.0.1:${smokeWebdav.port}/dav`
+        await mainWindow.webContents.executeJavaScript(
+          `window.__nsSmokeWebdav = ${JSON.stringify({ baseUrl, port: smokeWebdav.port })}; true`
+        )
+      } catch (err) {
+        smokeWebdav = null
+        console.error('SMOKE_WEBDAV_ERROR', err && err.message)
+        await mainWindow.webContents.executeJavaScript(
+          `window.__nsSmokeWebdav = null; true`
+        ).catch(() => {})
       }
       // 运行功能级自动化测试
       try {
@@ -139,6 +208,14 @@ function createWindow() {
       // 测试若中途失败，同步服务可能还挂着监听。app.exit 不会走 before-quit，
       // 所以这里显式关一次——留着就等于本机多一个没人在管的端口。
       stopSyncServer()
+      if (smokeWebdav) {
+        try {
+          await smokeWebdav.close()
+        } catch {
+          // 关不掉也不影响结论
+        }
+        smokeWebdav = null
+      }
       app.exit(0)
     })
     mainWindow.webContents.on('did-fail-load', (_e, code, desc) => {
@@ -163,6 +240,8 @@ app.on('window-all-closed', () => {
 const SSE_MOCK_PORT = 18765
 // 冒烟测试用于验证「写入保存地址」的临时目录（仅 SMOKE_TEST 模式使用）
 const SMOKE_DIR = path.join(app.getPath('temp'), 'novel-studio-smoke')
+// 冒烟用的内存 WebDAV 服务器（仅 SMOKE_TEST 模式启动，退出前显式关闭）
+let smokeWebdav = null
 function startSseMockServer() {
   // /flaky 的计数器：第一次 500、之后成功。每次启动 mock 都从 0 开始，
   // 否则同一进程里重跑第二轮测试会看到「第一次就成功」，重试路径形同虚设。
@@ -428,23 +507,33 @@ ipcMain.on('llm:abort', (_event, requestId) => {
 // 3. **本文件的任何日志都不含密钥、不含密文、不含解密错误正文**。IPC 返回的
 //    message 也只是一句通用描述。
 // ---------------------------------------------------------------------------
-function secureKeyFile() {
-  // 冒烟测试用临时目录：测试会写入/删除一个假 Key，绝不能碰开发者真实账户下
+// 命名槽：每个槽一个密文文件。**未知槽一律 EINVAL**，不悄悄落到 apiKey 上——
+// 那会把用户的 WebDAV 密码写进 API Key 的文件里，且双方都会以为自己是对的。
+const SECRET_FILES = {
+  apiKey: 'api-key.bin',
+  webdavPassword: 'webdav-password.bin'
+}
+
+function secureKeyFile(slot) {
+  // 冒烟测试用临时目录：测试会写入/删除假密钥，绝不能碰开发者真实账户下
   // 的那份密文（那会把用户自己的 API Key 覆盖掉）。
   const base = process.env.SMOKE_TEST
     ? path.join(os.tmpdir(), 'novel-studio-smoke-secure')
     : path.join(app.getPath('userData'), 'secure')
-  return path.join(base, 'api-key.bin')
+  return path.join(base, SECRET_FILES[slot])
 }
 
-ipcMain.handle('secret:set', async (_event, { value } = {}) => {
+const isSecretSlot = (slot) => Object.prototype.hasOwnProperty.call(SECRET_FILES, slot)
+
+ipcMain.handle('secret:set', async (_event, { value, slot = 'apiKey' } = {}) => {
+  if (!isSecretSlot(slot)) return { ok: false, code: 'EINVAL', message: '未知的密钥槽' }
   const key = typeof value === 'string' ? value : ''
   if (!key) return { ok: false, code: 'EINVAL', message: '密钥为空' }
   if (!safeStorage.isEncryptionAvailable()) {
     return { ok: false, code: 'unsupported', message: '系统安全存储不可用' }
   }
   try {
-    const file = secureKeyFile()
+    const file = secureKeyFile(slot)
     fs.mkdirSync(path.dirname(file), { recursive: true })
     fs.writeFileSync(file, safeStorage.encryptString(key), { mode: 0o600 })
     return { ok: true }
@@ -454,27 +543,162 @@ ipcMain.handle('secret:set', async (_event, { value } = {}) => {
   }
 })
 
-ipcMain.handle('secret:get', async () => {
+/** 读取一个槽的明文。只给 `secret:get` 与 `webdav:request` 用。 */
+function readSecretValue(slot) {
+  if (!isSecretSlot(slot)) return { ok: false, code: 'EINVAL', message: '未知的密钥槽' }
   if (!safeStorage.isEncryptionAvailable()) {
     return { ok: false, code: 'unsupported', message: '系统安全存储不可用' }
   }
-  const file = secureKeyFile()
+  const file = secureKeyFile(slot)
   try {
     if (!fs.existsSync(file)) return { ok: true, value: '' }
     const buf = fs.readFileSync(file)
     return { ok: true, value: safeStorage.decryptString(buf) }
   } catch {
-    return { ok: false, code: 'EDECRYPT', message: '无法解密已保存的 API Key（可能换了系统账户）' }
+    return { ok: false, code: 'EDECRYPT', message: '无法解密已保存的密钥（可能换了系统账户）' }
   }
-})
+}
 
-ipcMain.handle('secret:delete', async () => {
+ipcMain.handle('secret:get', async (_event, { slot = 'apiKey' } = {}) => readSecretValue(slot))
+
+ipcMain.handle('secret:delete', async (_event, { slot = 'apiKey' } = {}) => {
+  if (!isSecretSlot(slot)) return { ok: false, code: 'EINVAL', message: '未知的密钥槽' }
   try {
-    const file = secureKeyFile()
+    const file = secureKeyFile(slot)
     if (fs.existsSync(file)) fs.unlinkSync(file)
     return { ok: true }
   } catch {
     return { ok: false, code: 'EDELETE', message: '删除安全存储失败' }
+  }
+})
+
+// ---------------------------------------------------------------------------
+// WebDAV 请求代理（仅桌面端）
+//
+// 渲染层发起的每一个请求都从这里出去，原因有三个：
+//   1. CORS：多数 WebDAV 服务器不给浏览器的预检发头，直接从渲染层发必然失败；
+//   2. 凭据：Basic 认证的密码只能从 safeStorage 读，不能长期留在渲染层内存；
+//   3. 边界：方法白名单、路径穿越、同源、重定向、体积上限统一在
+//      `electron/webdav.js` 里把关，渲染层的校验只算提示。
+//
+// **不在任何日志里打印密码、Authorization 头或响应正文。** 返回给渲染层的
+// 错误只有一句能照着做的话与一个错误码。
+// ---------------------------------------------------------------------------
+async function resolveWebdavPassword(payload) {
+  // 允许一次性传入（用户刚在输入框里敲了密码、还没点保存就点了「测试连接」）。
+  // 它只在这一次调用的参数里出现，不写任何地方。
+  if (typeof payload?.password === 'string' && payload.password) {
+    return { ok: true, password: payload.password }
+  }
+  const res = readSecretValue('webdavPassword')
+  if (!res.ok) return { ok: false, code: 'ESECRET', message: res.message }
+  return { ok: true, password: res.value }
+}
+
+ipcMain.handle('webdav:request', async (_event, payload = {}) => {
+  const secret = await resolveWebdavPassword(payload)
+  if (!secret.ok) return secret
+  return davRequest(
+    {
+      baseUrl: payload.baseUrl,
+      path: payload.path,
+      method: payload.method,
+      headers: payload.headers,
+      body: payload.body,
+      username: payload.username,
+      password: secret.password,
+      timeoutSec: payload.timeoutSec
+    },
+    { netFetch: net.fetch }
+  )
+})
+
+ipcMain.handle('webdav:ensureDir', async (_event, payload = {}) => {
+  const secret = await resolveWebdavPassword(payload)
+  if (!secret.ok) return secret
+  return ensureCollection(
+    {
+      baseUrl: payload.baseUrl,
+      remoteDir: payload.remoteDir,
+      username: payload.username,
+      password: secret.password,
+      timeoutSec: payload.timeoutSec
+    },
+    { netFetch: net.fetch }
+  )
+})
+
+// ---------------------------------------------------------------------------
+// 声明式插件（仅桌面端）
+//
+// 插件是 `userData/plugins/*.json` 里的**纯数据**。主进程只做三件事：
+// 列目录、按上限读文件、打开目录。**不执行任何插件代码**，也不把插件目录
+// 之外的任何路径交给渲染层。
+//
+// 冒烟测试用 `%TEMP%\novel-studio-smoke\plugins`，绝不去读开发机上真实的
+// userData，否则测试结果会取决于开发者恰好装了什么插件。
+// ---------------------------------------------------------------------------
+const PLUGIN_MAX_FILES = 100
+const PLUGIN_MAX_BYTES = 256 * 1024
+
+function pluginsDirPath() {
+  if (process.env.SMOKE_TEST) return path.join(SMOKE_DIR, 'plugins')
+  return path.join(app.getPath('userData'), 'plugins')
+}
+
+ipcMain.handle('plugins:list', async () => {
+  const dir = pluginsDirPath()
+  try {
+    fs.mkdirSync(dir, { recursive: true })
+  } catch {
+    return { ok: false, code: 'EDIR', message: '无法创建插件目录', dir }
+  }
+  let names = []
+  try {
+    names = fs
+      .readdirSync(dir)
+      .filter((n) => String(n).toLowerCase().endsWith('.json'))
+      .sort()
+  } catch {
+    return { ok: false, code: 'EDIR', message: '无法读取插件目录', dir }
+  }
+  const skipped = Math.max(0, names.length - PLUGIN_MAX_FILES)
+  const files = []
+  for (const name of names.slice(0, PLUGIN_MAX_FILES)) {
+    const full = path.join(dir, name)
+    try {
+      const st = fs.statSync(full)
+      if (!st.isFile()) continue
+      if (st.size > PLUGIN_MAX_BYTES) {
+        files.push({ name, error: `文件超过 ${Math.round(PLUGIN_MAX_BYTES / 1024)}KB` })
+        continue
+      }
+      const text = fs.readFileSync(full, 'utf8')
+      let json
+      try {
+        json = JSON.parse(text)
+      } catch {
+        // 不把解析器的原始报错带出去：它可能包含文件片段
+        files.push({ name, error: '不是有效的 JSON' })
+        continue
+      }
+      files.push({ name, json })
+    } catch {
+      files.push({ name, error: '读取失败' })
+    }
+  }
+  return { ok: true, dir, files, skipped }
+})
+
+ipcMain.handle('plugins:openFolder', async () => {
+  const dir = pluginsDirPath()
+  try {
+    fs.mkdirSync(dir, { recursive: true })
+    const err = await shell.openPath(dir)
+    if (err) return { ok: false, code: 'EOPEN', message: '无法打开插件目录', dir }
+    return { ok: true, dir }
+  } catch {
+    return { ok: false, code: 'EOPEN', message: '无法打开插件目录', dir }
   }
 })
 

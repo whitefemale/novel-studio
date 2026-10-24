@@ -29,7 +29,9 @@ import {
 import { settingsForStage, modelForStage } from '../services/ai/models'
 import { estimateCall, checkBudget, spentOnDay } from '../services/ai/budget'
 import { buildContext } from '../services/novel/contextBuilder'
+import { retrieveRagContext } from '../services/rag/context'
 import { copyToClipboard } from '../services/native'
+import { usePlugins } from '../store/plugins'
 import { toast } from '../store/toast'
 
 const props = defineProps({
@@ -43,6 +45,7 @@ const gen = useGeneration()
 const { recordRun } = gen
 const memory = useNovelMemory()
 const structure = useStoryStructure()
+const plugins = usePlugins()
 
 const MODES = ACTIONS
 
@@ -312,6 +315,14 @@ const hints = computed(() => {
   }
 })
 
+/**
+ * 插件关键词提示：扫「本次产出」，没有产出时扫当前章正文。
+ * 它只是提醒，不是上下文 —— 生成时只注入 `plugins.fragments()`。
+ */
+const keywordHints = computed(() =>
+  plugins.hints(output.value || currentChapter.value?.content || '')
+)
+
 const needTarget = computed(() => mode.value === 'expand' || mode.value === 'rewrite')
 
 const canGenerate = computed(() => {
@@ -408,6 +419,9 @@ async function preflightBudget() {
     if (useWorkflow.value) {
       await ensureContextLoaded(bookId)
       inputTokens = buildContext(workflowInput('')).metadata.totalTokens
+      // 检索层是生成前才拼进去的，预检这里没有那些片段。按它的**上限**加进去，
+      // 估算宁可略高：低估会让人以为没过预算，实际一跑就超。
+      if (settings.rag?.enabled) inputTokens += Number(settings.rag.budget) || 0
     } else {
       const messages = buildMessages(mode.value, {
         book: store.book,
@@ -627,8 +641,14 @@ async function generateViaWorkflow(taskId) {
   // 文风档案也随 storyStructure 一起载入（见 STRUCTURE_COLLECTIONS）。
   await ensureContextLoaded(bookId)
 
+  // 本地字面检索（默认关）。开关关着时 retrieveRagContext 直接返回 []，
+  // 不建索引、不读库；开着时也是「异常一律返回空」——检索不该阻断写作。
+  const ragPassages = await retrieveRagContext(workflowInput(taskId), settings)
+
   const wf = await runChapterWorkflow({
-    input: workflowInput(taskId),
+    // 插件片段与检索片段一样，是**调用方先算好**再交给 Context Builder 的：
+    // 后者保持纯函数、不碰插件目录，提示词才仍然可被确定性验证。
+    input: { ...workflowInput(taskId), ragPassages, pluginFragments: plugins.fragments() },
     settings,
     // 「写 + 提取」是默认档。关掉自动提取后这条链只剩写正文一次调用，
     // 用户仍可随时在控制台里手动触发提取。
@@ -877,6 +897,18 @@ function clearOutput() {
       <div v-if="stageLabel" class="stage-line">正在{{ stageLabel }}…</div>
 
       <div v-if="memoryNote" class="memory-note">{{ memoryNote }}</div>
+
+      <!--
+        插件关键词提示：只给人看，**不自动进提示词**。写成一行条而不是弹窗，
+        是因为它属于「顺手提醒」，不该打断写作。
+      -->
+      <div v-if="keywordHints.length" class="plugin-hints">
+        <div v-for="h in keywordHints" :key="h.pluginId + ':' + h.hint" class="plugin-hint">
+          <b>{{ h.title }}</b> · {{ h.hint }}
+          <span class="plugin-hint-match">（出现：{{ h.matched.join('、') }}）</span>
+        </div>
+        <div class="plugin-hint-note">以上提示来自插件，只在这里显示，不会自动写进提示词。</div>
+      </div>
 
       <div v-if="output" class="result-ops">
         <button class="btn sm primary" @click="insertToChapter">＋ 插入正文</button>
@@ -1153,6 +1185,25 @@ function clearOutput() {
   padding: 7px 10px;
   border-radius: var(--radius-sm);
   line-height: 1.6;
+}
+.plugin-hints {
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--text-2);
+}
+.plugin-hint b {
+  color: var(--accent);
+}
+.plugin-hint-match {
+  color: var(--text-3);
+}
+.plugin-hint-note {
+  margin-top: 4px;
+  color: var(--text-3);
+  font-size: 11px;
 }
 .api-state {
   margin: 0;

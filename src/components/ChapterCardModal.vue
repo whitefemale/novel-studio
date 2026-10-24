@@ -4,6 +4,7 @@ import { useBooks } from '../store/books'
 import { useCollections } from '../store/novel'
 import { useSettings } from '../store/settings'
 import { useGeneration } from '../store/generation'
+import { usePlugins } from '../store/plugins'
 import {
   ALL_CHAPTER_PLAN_FIELDS,
   CHAPTER_PLAN_STATUS,
@@ -18,7 +19,14 @@ import {
   proposalPatch
 } from '../services/novel/planning'
 import { checkChapterPlan } from '../services/novel/planCheck'
+import {
+  validatePlan,
+  shouldBlockPlan,
+  validationSummary,
+  PLAN_ISSUE_LABELS
+} from '../services/novel/planValidate'
 import { runChapterWorkflow } from '../services/ai/orchestrator'
+import { retrieveRagContext } from '../services/rag/context'
 import * as db from '../services/storage'
 import { toast } from '../store/toast'
 
@@ -38,6 +46,7 @@ const { store, saveChapterPlan } = useBooks()
 const cols = useCollections()
 const { settings } = useSettings()
 const gen = useGeneration()
+const plugins = usePlugins()
 
 const chapter = computed(() => store.chapters.find((c) => c.id === props.chapterId) || null)
 
@@ -63,6 +72,42 @@ const planCheck = computed(() => {
   )
 })
 
+/**
+ * 生成前校验：跟着表单实时重算。
+ *
+ * 与 AI 阶段里的那次校验用的是同一个纯函数；这里再算一遍是为了让用户改完
+ * 一行字就能看到问题消失，而不是必须重新生成一次计划（那是要花钱的）。
+ */
+const validation = computed(() => {
+  const c = chapter.value
+  if (!c) return null
+  return validatePlan({
+    plan: normalizePlanDraft(form.value),
+    chapter: c,
+    book: store.book,
+    chapters: store.chapters,
+    memory: cols.memory.store,
+    structure: cols.structure.store,
+    options: settings.planValidation || {}
+  })
+})
+
+const blocking = computed(() =>
+  shouldBlockPlan(validation.value, { blockHigh: settings.planValidation?.blockHigh !== false })
+)
+
+/** 高风险问题被用户显式放行。任何一次输入都会把它复位。 */
+const override = ref(false)
+
+function severityLabel(s) {
+  return { high: '高', medium: '中', low: '低' }[s] || s
+}
+
+function adoptAnyway() {
+  override.value = true
+  toast('已选择「仍然采用」，保存时会记下这次放行', 'info')
+}
+
 const characterOptions = computed(() => cols.list('characters'))
 
 function blank() {
@@ -83,19 +128,32 @@ function loadForm() {
   form.value = o
   dirty.value = false
   confirmArmed.value = false
+  override.value = false
 }
 
 function onInput() {
   dirty.value = true
   confirmArmed.value = false
+  // 改了任何一行都可能让问题消失：放行是一次性的，不跟着表单走。
+  override.value = false
 }
 
 async function save(confirm = false) {
   const id = props.chapterId
   if (!id || saving.value) return null
+  if (blocking.value && !override.value) {
+    toast('生成前校验发现高风险问题，请先处理，或点「仍然采用」再保存', 'error')
+    return null
+  }
   saving.value = true
   try {
-    const res = await saveChapterPlan(id, normalizeDraftForSave(), { confirm })
+    const patch = normalizeDraftForSave()
+    // 只存摘要（版本号 + 时间 + 是否放行 + 问题 id）。完整报告随正文变化而
+    // 失效，存下来只会变成过期噪音；「我放行过」这件事则值得留痕。
+    patch.planValidation = validationSummary(validation.value, Date.now(), {
+      overridden: override.value
+    })
+    const res = await saveChapterPlan(id, patch, { confirm })
     if (!res) {
       toast('这本书已经关了，无法保存施工卡', 'error')
       return null
@@ -161,20 +219,26 @@ async function generatePlan() {
     // 把表单里的**当前草稿**交给 Context Builder：用户可能刚补了两条硬约束，
     // 生成计划时应当看到它们，而不是库里那份旧的。
     const draftChapter = { ...c, ...normalizePlanDraft(form.value) }
+    const input = {
+      book: store.book,
+      bookId: store.bookId,
+      chapter: draftChapter,
+      chapters: store.chapters,
+      outlines: store.outlines,
+      memory: cols.memory.store,
+      structure: cols.structure.store,
+      styleProfiles: cols.structure.store.styleProfiles || [],
+      settings: settings,
+      action: 'plan',
+      text: c.content || ''
+    }
+    // 检索到的历史片段对「生成施工卡」同样有用：作者要写的这一章与几十章前
+    // 埋的伏笔有关时，计划草案里才可能提到它。失败返回空数组，不影响生成。
+    input.ragPassages = await retrieveRagContext(input, settings)
+    // 插件片段与手动续写、队列共用同一条装配路径，模板/规则在各入口一致。
+    input.pluginFragments = plugins.fragments()
     const wf = await runChapterWorkflow({
-      input: {
-        book: store.book,
-        bookId: store.bookId,
-        chapter: draftChapter,
-        chapters: store.chapters,
-        outlines: store.outlines,
-        memory: cols.memory.store,
-        structure: cols.structure.store,
-        styleProfiles: cols.structure.store.styleProfiles || [],
-        settings: settings,
-        action: 'plan',
-        text: c.content || ''
-      },
+      input,
       settings,
       stages: ['plan'],
       recordRun: gen.recordRun
@@ -211,7 +275,13 @@ async function generatePlan() {
           }
         }
         dirty.value = true
-        toast('AI 计划草案已填入，检查后请手动保存', 'success')
+        override.value = false
+        toast(
+          wf.planBlocked
+            ? `AI 计划草案已填入，但有 ${wf.planValidation?.stats?.high ?? 0} 条高风险问题，保存前需确认`
+            : 'AI 计划草案已填入，检查后请手动保存',
+          wf.planBlocked ? 'error' : 'success'
+        )
       }
     }
   } catch (e) {
@@ -321,6 +391,34 @@ onMounted(async () => {
           </span>
         </div>
 
+        <div
+          v-if="validation && validation.issues.length"
+          class="cc-validate"
+          :class="{ bad: blocking }"
+        >
+          <div class="cc-validate-head">
+            <b>生成前校验：</b>
+            <span v-if="blocking" class="cc-strong">
+              发现 {{ validation.stats.high }} 条高风险问题
+            </span>
+            <span v-else>发现 {{ validation.stats.total }} 条提醒</span>
+            <span class="cc-small">只做字面匹配，宁可漏报</span>
+          </div>
+          <ul>
+            <li v-for="it in validation.issues" :key="it.id">
+              <span class="cc-sev" :class="it.severity">{{ severityLabel(it.severity) }}</span>
+              <span class="cc-cat">{{ PLAN_ISSUE_LABELS[it.category] || it.category }}</span>
+              {{ it.message }}
+              <div v-if="it.evidence" class="cc-evidence">证据：{{ it.evidence }}</div>
+            </li>
+          </ul>
+          <div v-if="blocking" class="cc-override">
+            <span v-if="!override">高风险问题不会被静默忽略；你可以作主：</span>
+            <span v-else>已选择「仍然采用」，保存时会记下这次放行。</span>
+            <button v-if="!override" class="btn sm" @click="adoptAnyway">仍然采用</button>
+          </div>
+        </div>
+
         <div class="cc-ai">
           <div class="cc-ai-head">
             <b>AI 生成本章计划</b>
@@ -410,6 +508,74 @@ onMounted(async () => {
 .cc-missing {
   display: block;
   color: var(--danger);
+}
+.cc-validate {
+  margin-top: 12px;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  line-height: 1.8;
+  color: var(--text-2);
+}
+.cc-validate.bad {
+  border-color: #d5a021;
+  background: #fffbf0;
+}
+.cc-validate-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.cc-strong {
+  color: var(--danger);
+  font-weight: 600;
+}
+.cc-validate ul {
+  margin: 6px 0 0;
+  padding-left: 18px;
+}
+.cc-validate li + li {
+  margin-top: 4px;
+}
+.cc-sev {
+  display: inline-block;
+  min-width: 28px;
+  margin-right: 4px;
+  padding: 0 4px;
+  border-radius: 3px;
+  text-align: center;
+  font-size: 11px;
+  color: #fff;
+  background: var(--text-3);
+}
+.cc-sev.high {
+  background: var(--danger);
+}
+.cc-sev.medium {
+  background: #d5a021;
+}
+.cc-sev.low {
+  background: #8a949f;
+}
+.cc-cat {
+  margin-right: 4px;
+  color: var(--text-3);
+}
+.cc-evidence {
+  color: var(--text-3);
+  font-size: 11px;
+  word-break: break-all;
+}
+.cc-override {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px dashed var(--border);
 }
 .cc-ai {
   margin-top: 14px;

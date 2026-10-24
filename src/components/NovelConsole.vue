@@ -3,6 +3,7 @@ import { ref, computed, onMounted } from 'vue'
 import { useBooks } from '../store/books'
 import { useCollections } from '../store/novel'
 import { useGeneration } from '../store/generation'
+import { usePlugins } from '../store/plugins'
 import { ENTITY_SCHEMAS } from '../services/novel/schemas'
 import { groupVersions } from '../services/novel/versioning'
 import {
@@ -22,6 +23,8 @@ import TimelineView from './TimelineView.vue'
 import ConsistencyReport from './ConsistencyReport.vue'
 import BookPlanPanel from './BookPlanPanel.vue'
 import StatsPanel from './StatsPanel.vue'
+import RagPanel from './RagPanel.vue'
+import RelationshipGraph from './RelationshipGraph.vue'
 import { runRuleChecks } from '../services/novel/consistency'
 
 /**
@@ -50,6 +53,7 @@ const props = defineProps({
 const { store } = useBooks()
 const cols = useCollections()
 const gen = useGeneration()
+const plugins = usePlugins()
 
 const TABS = [
   { key: 'story', label: '剧情' },
@@ -59,11 +63,13 @@ const TABS = [
   { key: 'worldRules', label: '世界规则' },
   { key: 'styleProfiles', label: '文风' },
   { key: 'timeline', label: '时间线' },
+  { key: 'relationships', label: '关系图' },
   { key: 'foreshadowing', label: '伏笔' },
   { key: 'review', label: '记忆审阅' },
   { key: 'consistency', label: '一致性' },
   { key: 'versions', label: '版本' },
   { key: 'stats', label: '统计' },
+  { key: 'rag', label: '检索' },
   { key: 'workflow', label: '上下文与迁移' },
   { key: 'history', label: '生成历史' }
 ]
@@ -90,7 +96,8 @@ const consistencyCount = computed(() =>
     ? runRuleChecks({
         chapters: store.chapters,
         memory: cols.memory.store,
-        structure: cols.structure.store
+        structure: cols.structure.store,
+        pluginRules: plugins.issues(store.chapters)
       }).stats.total
     : 0
 )
@@ -105,7 +112,16 @@ function badgeOf(key) {
   // 同理：标签键叫 'timeline'，而集合叫 'events'。不显式映射的话这个徽标
   // 恒为 0 —— 它会一直安静地错着，没人看得出（时间轴面板里另有一份真实计数）。
   if (key === 'timeline') return cols.list('events').length
+  // 'relationships' 同样不是集合名：关系图完全派生自人物/势力/事件。
+  // 徽标报节点数（人物 + 势力），与面板里那句「节点 N」同源；带上地点会让
+  // 数字随开关变化，而徽标不该依赖用户还没点过的开关。
+  if (key === 'relationships') {
+    return cols.list('characters').length + cols.list('factions').length
+  }
   if (key === 'consistency') return consistencyCount.value
+  // 'rag' 也不是集合名：ragChunks 是设备本地态，不在 useCollections 载入的那两族里。
+  // 索引数量在面板里实时读库展示（那里才是真相），这里不编造一个恒 0 的徽标。
+  if (key === 'rag') return 0
   const n = cols.list(key).length
   return n || 0
 }
@@ -239,6 +255,7 @@ onMounted(async () => {
 
           <!-- 时间线：轴用来看，表格用来录。表格那一份就是原来那行 EntityTable -->
           <TimelineView v-else-if="tab === 'timeline'" />
+          <RelationshipGraph v-else-if="tab === 'relationships'" @goto="tab = $event" />
 
           <!-- 其余标签的 key 与集合名一一对应，一个组件按 schema 通吃 -->
           <EntityTable v-else-if="ENTITY_SCHEMAS[tab]" :key="tab" :collection="tab" />
@@ -259,6 +276,7 @@ onMounted(async () => {
             @content-changed="emit('content-changed')"
           />
           <StatsPanel v-else-if="tab === 'stats'" />
+          <RagPanel v-else-if="tab === 'rag'" />
           <ContextPreview v-else-if="tab === 'workflow'" />
           <GenerationHistory v-else-if="tab === 'history'" />
         </div>

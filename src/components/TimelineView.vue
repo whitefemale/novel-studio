@@ -234,6 +234,9 @@ function jumpTo(n) {
   align-items: center;
   gap: 6px;
   margin-left: auto;
+  /* 不加这两条时，「排序」两个字会被挤成竖排；下拉框也不该被压窄。 */
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 .tl-select {
   padding: 3px 8px;

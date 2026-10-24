@@ -11,7 +11,8 @@ import {
   finalizeSnapshot,
   cloneSnapshotAsNewBooks,
   emptySnapshot,
-  SNAPSHOT_FORMAT
+  SNAPSHOT_FORMAT,
+  LOCAL_ONLY_COLLECTIONS
 } from '../../src/services/novel/snapshot.js'
 
 function sample() {
@@ -185,4 +186,95 @@ test('emptySnapshot 是合法的空快照并被 finalize 补齐', () => {
   assert.equal(e.counts.books, 0)
   assert.equal(typeof e.checksum, 'string')
   assert.doesNotThrow(() => normalizeSnapshot(e))
+})
+
+// ---------------- V4：本地态集合与书籍指针 ----------------
+
+test('设备本地态集合不进快照（队列、RAG 分块、生成任务）', () => {
+  const snap = buildSnapshot({
+    books: [{ id: 'b1', title: '书', createdAt: 1, updatedAt: 1 }],
+    data: {
+      b1: {
+        chapters: [],
+        outlines: [],
+        generationTasks: [{ id: 't1', updatedAt: 1 }],
+        generationQueue: [{ id: 'q1', updatedAt: 1 }],
+        ragChunks: [{ id: 'r1', updatedAt: 1 }],
+        characters: [{ id: 'p1', updatedAt: 1 }]
+      }
+    }
+  })
+  const sets = snap.data.b1
+  assert.equal(sets.generationTasks, undefined)
+  assert.equal(sets.generationQueue, undefined)
+  assert.equal(sets.ragChunks, undefined)
+  assert.equal(sets.characters.length, 1)
+  // 计数也不能把它们算进去
+  assert.equal(snapshotCounts(snap).records, 1)
+})
+
+test('快照头透传设备名，且设备名不进校验和', () => {
+  const a = buildSnapshot({ books: [], deviceId: 'd1', deviceName: '书房电脑' })
+  assert.equal(a.deviceName, '书房电脑')
+  const b = { ...a, deviceName: '另一台' }
+  assert.equal(snapshotChecksum(a), snapshotChecksum(b))
+  assert.equal(normalizeSnapshot(a).deviceName, '书房电脑')
+})
+
+test('书籍指针按自己的时间戳合并，不跟着 updatedAt 走', () => {
+  const local = [
+    {
+      id: 'b1',
+      title: '书名',
+      updatedAt: 100, // 书本体更旧
+      currentChapterId: 'c-local',
+      currentPointerUpdatedAt: 900 // 但指针更新
+    }
+  ]
+  const remote = [
+    {
+      id: 'b1',
+      title: '新书名',
+      updatedAt: 500, // 书本体更新
+      currentChapterId: 'c-remote',
+      currentPointerUpdatedAt: 200
+    }
+  ]
+  const merged = mergeSnapshot(buildSnapshot({ books: local }), buildSnapshot({ books: remote }))
+  assert.equal(merged.books.length, 1)
+  assert.equal(merged.books[0].title, '新书名', '书本体按 updatedAt 取远端')
+  assert.equal(merged.books[0].currentChapterId, 'c-local', '指针按指针时间戳取本地')
+  assert.equal(merged.books[0].currentPointerUpdatedAt, 900)
+})
+
+test('指针时间戳相等时保留本地；两侧都没有时不凭空加字段', () => {
+  const local = [{ id: 'b1', updatedAt: 100, currentChapterId: 'c1', currentPointerUpdatedAt: 50 }]
+  const remote = [{ id: 'b1', updatedAt: 100, currentChapterId: 'c2', currentPointerUpdatedAt: 50 }]
+  const merged = mergeSnapshot(buildSnapshot({ books: local }), buildSnapshot({ books: remote }))
+  assert.equal(merged.books[0].currentChapterId, 'c1')
+
+  const oldLocal = [{ id: 'b2', title: '旧记录', updatedAt: 10 }]
+  const bumped = mergeSnapshot(buildSnapshot({ books: oldLocal }), buildSnapshot({ books: [] }))
+  assert.equal('currentPointerUpdatedAt' in bumped.books[0], false)
+})
+
+test('作为副本导入时指针重映射到新章节', () => {
+  const src = buildSnapshot({
+    books: [
+      {
+        id: 'b1',
+        title: '书',
+        updatedAt: 1,
+        currentChapterId: 'c1',
+        currentPointerUpdatedAt: 1
+      }
+    ],
+    data: { b1: { chapters: [{ id: 'c1', bookId: 'b1', order: 1, content: 'x', updatedAt: 1 }] } }
+  })
+  let i = 0
+  const clone = cloneSnapshotAsNewBooks(src, { newId: () => `n${++i}`, now: 2 })
+  const book = clone.books[0]
+  const chap = clone.data[book.id].chapters[0]
+  assert.equal(book.currentChapterId, chap.id)
+  assert.notEqual(book.currentChapterId, 'c1')
 })

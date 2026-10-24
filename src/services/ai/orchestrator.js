@@ -1,5 +1,5 @@
 import { chatStream } from '../llm.js'
-import { chatStreamReliable } from './request.js'
+import { createProvider } from './providers.js'
 import { describeError } from './errors.js'
 import { messagesFromContext } from '../prompts.js'
 import { buildContext, PROMPT_VERSION } from '../novel/contextBuilder.js'
@@ -12,11 +12,12 @@ import {
   CREATE_DEFAULTS,
   CHAPTER_PLAN_FIELDS
 } from '../novel/schemas.js'
+import { validatePlan, shouldBlockPlan } from '../novel/planValidate.js'
 import { normalizeTitle } from '../migration.js'
 import { coll } from '../storage.js'
 import { genId } from '../ids.js'
 import { providerFromUrl } from './tokenUsage.js'
-import { settingsForStage, modelForStage } from './models.js'
+import { modelForStage } from './models.js'
 
 /**
  * AI 编排器：把「写一章」拆成可独立中止、可单独重试的阶段。
@@ -836,6 +837,8 @@ export async function runChapterWorkflow({
   let reviewReport = null
   let planRaw = ''
   let planDraft = null
+  let planValidation = null
+  let planBlocked = false
   let fixRaw = ''
   let fixDraft = null
   let chapterMeta = null
@@ -894,7 +897,10 @@ export async function runChapterWorkflow({
     // 每个阶段各自取模型：写正文可以配一个文笔好的，提取记忆配一个严格输出 JSON
     // 的，审校配一个长上下文强的。留空时 `settingsForStage` 原样返回 settings，
     // 所以未配置的用户行为与旧版逐字一致。
-    const stageSettings = settingsForStage(settings, stageId)
+    //
+    // 统一经 Provider 发出请求：预设与展示在 providers.js，重试/超时/截断在
+    // request.js —— 这里只剩阶段状态机。注入的 `chat` 继续透传（测试依赖它）。
+    const provider = createProvider({ settings, stage: stageId, ...(chat ? { chat } : {}) })
     return new Promise((resolve) => {
       let text = ''
       let usage = null
@@ -905,10 +911,8 @@ export async function runChapterWorkflow({
         run.abort = null
         resolve({ text, usage, ...o })
       }
-      const handle = chatStreamReliable({
-        settings: stageSettings,
+      const handle = provider.chatStream({
         messages,
-        chat,
         maxRetries: settings?.maxRetries,
         idleTimeoutSec: settings?.requestIdleTimeoutSec,
         callbacks: {
@@ -1170,6 +1174,8 @@ export async function runChapterWorkflow({
   async function stagePlan() {
     const st = stageOf('plan')
     st.status = 'running'
+    planValidation = null
+    planBlocked = false
     callbacks.onStage?.({ stage: 'plan', status: 'start' })
     const startedAt = Date.now()
     const planCtx = buildContext({ ...input, action: 'plan' })
@@ -1194,6 +1200,34 @@ export async function runChapterWorkflow({
     st.error = res.error || (planDraft ? '' : res.truncated ? '输出被截断' : '未能从返回内容中解析出 JSON')
     if (st.status === 'error') error = st.error
     if (res.aborted) aborted = true
+
+    // 生成前校验：确定性、零成本、**失败不拖垮本阶段**。
+    // 它的结论只用于「界面上要不要拦一下自动采用」，被校验的计划本身仍然
+    // 原样交给用户看 —— 模型给了一份踩设定的计划，用户有权决定照用。
+    const pv = settings?.planValidation || {}
+    if (planDraft && pv.enabled !== false) {
+      try {
+        planValidation = validatePlan({
+          plan: planDraft,
+          chapter,
+          book: input?.book,
+          chapters: input?.chapters || [],
+          memory: input?.memory || {},
+          structure: input?.structure || {},
+          options: pv
+        })
+        planBlocked = shouldBlockPlan(planValidation, { blockHigh: pv.blockHigh !== false })
+        st.validation = planValidation
+        st.blocked = planBlocked
+      } catch (e) {
+        // 校验器自己出错时退化成「没有校验」，绝不能因此让一份可用的草案失败。
+        planValidation = null
+        planBlocked = false
+        st.validation = null
+        st.blocked = false
+        console.error('[orchestrator] 计划校验失败', e)
+      }
+    }
     if (res.truncated) {
       truncated = true
       truncatedMessage = '计划生成达到输出上限被截断，草案不完整'
@@ -1348,6 +1382,8 @@ export async function runChapterWorkflow({
     reviewReport,
     planRaw,
     planDraft,
+    planValidation,
+    planBlocked,
     fixRaw,
     fixDraft,
     context: ctx,
@@ -1379,6 +1415,8 @@ export async function runChapterWorkflow({
         output,
         reviewReport,
         planDraft,
+        planValidation,
+        planBlocked,
         fixDraft,
         chapterMeta,
         changes,

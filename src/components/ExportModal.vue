@@ -12,17 +12,34 @@ import {
   saveToDisk
 } from '../services/export'
 import { isDesktop, isNative } from '../services/platform'
+import { renderExportTemplate } from '../services/plugins/hooks'
+import { usePlugins } from '../store/plugins'
 import { toast } from '../store/toast'
 
 const emit = defineEmits(['close'])
 const { store, currentChapter } = useBooks()
 const { settings } = useSettings()
+const plugins = usePlugins()
 
 const format = ref('txt') // 'txt' | 'md'
 const scope = ref('whole') // 'whole' | 'chapter'
 const busy = ref(false)
 // 局部状态：某一次导出的选择不应该写回全局设置
 const reveal = ref(false)
+
+/**
+ * 插件提供的导出模板。**只是字符串替换**：`{{bookTitle}}` 这类占位符由
+ * `renderExportTemplate` 换掉，没有模板引擎、没有代码执行、没有文件访问。
+ * 选中的模板决定扩展名；不选时行为与旧版完全一致。
+ */
+const templates = computed(() => plugins.templates())
+const templateKey = ref('')
+const activeTemplate = computed(
+  () => templates.value.find((t) => t.key === templateKey.value) || null
+)
+// 占位符字面量不能直接写进模板插值：`{{ '{{x}}' }}` 里的 `}}` 会被编译器
+// 当成插值提前结束。放成常量，模板里只写一个标识符。
+const PH_EXAMPLE = '{{bookTitle}}、{{chapters}}'
 
 const canExport = computed(() => {
   if (scope.value === 'chapter') return !!currentChapter.value
@@ -55,12 +72,26 @@ async function doExport(forceDialog = false) {
     return
   }
   const book = store.book
-  const ext = format.value === 'md' ? 'md' : 'txt'
+  const tpl = activeTemplate.value
+  const ext = tpl ? tpl.ext : format.value === 'md' ? 'md' : 'txt'
   const bookName = sanitizeFileName(book.title || '小说')
   let content = ''
   let fileName = ''
 
-  if (scope.value === 'whole') {
+  if (tpl) {
+    const chapters = scope.value === 'whole' ? store.chapters : [currentChapter.value]
+    content = renderExportTemplate(tpl.template, { book, chapters, date: new Date() })
+    if (!content.trim()) {
+      toast('模板渲染结果为空，请检查插件模板', 'error')
+      return
+    }
+    fileName =
+      scope.value === 'whole'
+        ? `${bookName}.${ext}`
+        : `${bookName}-第${currentChapter.value.order}章-${sanitizeFileName(
+            currentChapter.value.title || '未命名'
+          )}.${ext}`
+  } else if (scope.value === 'whole') {
     content =
       format.value === 'md' ? buildMarkdown(book, store.chapters) : buildTxt(book, store.chapters)
     fileName = `${bookName}.${ext}`
@@ -121,6 +152,21 @@ async function doExport(forceDialog = false) {
             Markdown
           </button>
         </div>
+
+        <!-- 插件模板：字符串占位符替换，不执行任何插件代码 -->
+        <template v-if="templates.length">
+          <div style="height: 14px"></div>
+          <label class="label">导出模板（来自插件）</label>
+          <select v-model="templateKey" class="select">
+            <option value="">不使用模板（标准格式）</option>
+            <option v-for="t in templates" :key="t.key" :value="t.key">
+              {{ t.name }}（.{{ t.ext }}）
+            </option>
+          </select>
+          <p v-if="activeTemplate" class="hint">
+            模板只替换 {{ PH_EXAMPLE }} 等占位符，不执行任何插件代码；未知占位符会原样保留。
+          </p>
+        </template>
 
         <div style="height: 14px"></div>
         <label class="label">范围</label>

@@ -117,8 +117,44 @@
       saveIssueStates,
       setIssueStatus,
       DEFAULT_STAGES,
+      // V4 阶段 3：生成前计划校验
+      validatePlan,
+      shouldBlockPlan,
+      validationSummary,
       SNAPSHOT_VERSION,
+      // V4 阶段 4：持久化写作队列
+      useWritingQueue,
+      queueStore,
+      recoverQueueItems,
+      LOCAL_ONLY_COLLECTIONS,
       buildSnapshot,
+      // V4 阶段 5：本地哈希检索
+      ensureBookIndex,
+      getRagIndexStatus,
+      clearBookIndex,
+      searchRag,
+      retrieveRagContext,
+      EMBEDDING_DIM,
+      // V4 阶段 6：人物关系图
+      buildRelationshipGraph,
+      layoutRelationshipGraph,
+      parseRelationshipText,
+      GRAPH_EDGE_KINDS,
+      // V4 阶段 7：WebDAV 同步
+      syncWithWebdav,
+      testWebdav,
+      describeWebdavState,
+      parseDavBase,
+      // V4 阶段 8：声明式插件
+      validatePluginManifest,
+      normalizePluginList,
+      pluginContextFragments,
+      runPluginRules,
+      collectKeywordHints,
+      renderExportTemplate,
+      pluginTemplates,
+      pluginState,
+      usePlugins,
       // V2 第二阶段：局域网同步（渲染层这一半；主进程那一半走 window.electronAPI）
       pushSnapshot,
       syncState,
@@ -157,13 +193,25 @@
       'syncConflictCopies',
       // V3 阶段 2：请求稳定性
       'requestIdleTimeoutSec',
-      'maxRetries'
+      'maxRetries',
+      // V4：服务商 / 设备 / 计划校验 / RAG / WebDAV / 插件
+      'providerId',
+      'deviceName',
+      'planValidation',
+      'rag',
+      'webdav',
+      'plugins'
     ]
     const resetSettings = async () => {
       // API Key 也复位：冒烟测试会写入假 Key，而且（桌面端）会走 safeStorage。
       // 主进程在 SMOKE_TEST 下把安全存储指向临时目录，所以这里删的是测试自己的码。
       await s.clearApiKey()
-      for (const k of NEW_KEYS) s.settings[k] = defaultSettings[k]
+      for (const k of NEW_KEYS) {
+        // 对象/数组型设置必须拷一份：直接赋默认值的引用，会让测试里对
+        // settings 的临时改动污染 defaultSettings，进而让「恢复默认」失效。
+        const v = defaultSettings[k]
+        s.settings[k] = v && typeof v === 'object' ? JSON.parse(JSON.stringify(v)) : v
+      }
       await s.persist()
     }
     await resetSettings()
@@ -566,6 +614,61 @@
       (await db.rawGet('outlines:null')) === undefined
     out.closeBookCleared =
       b.store.bookId === null && b.store.book === null && b.store.chapters.length === 0
+
+    // ------------------------------------------------------------------
+    // F2) V4 指针：打开书回到上次那一章 / 删当前章不跳回第一章 / 不碰 updatedAt
+    // ------------------------------------------------------------------
+    const pBook = await b.createBook({ title: '测试小说', intro: 'V4 指针' })
+    const p1 = await b.addChapterWithContent('第一章正文', '第一章')
+    const p2 = await b.addChapterWithContent('第二章正文', '第二章')
+    const p3 = await b.addChapterWithContent('第三章正文', '第三章')
+    await db.coll.volumes.upsert(pBook.id, { id: 'vol-ptr', title: '测试卷' })
+    await db.coll.arcs.upsert(pBook.id, { id: 'arc-ptr', title: '测试篇', volumeId: 'vol-ptr' })
+    await b.updateChapter(p2.id, { arcId: 'arc-ptr' })
+    const bookBefore = (await db.getBooks()).find((x) => x.id === pBook.id)
+
+    await b.selectChapter(p2.id)
+    out.pointerDeriveOk =
+      b.store.book.currentChapterId === p2.id &&
+      b.store.book.currentArcId === 'arc-ptr' &&
+      b.store.book.currentVolumeId === 'vol-ptr'
+    await b.flushCurrentPointers()
+    const bookAfter = (await db.getBooks()).find((x) => x.id === pBook.id)
+    out.pointerPersistOk =
+      bookAfter.currentChapterId === p2.id &&
+      bookAfter.currentArcId === 'arc-ptr' &&
+      bookAfter.currentVolumeId === 'vol-ptr' &&
+      bookAfter.currentPointerUpdatedAt > 0
+    // 指针写的是 books 记录，但**不能**刷新 book.updatedAt：同步按它合并书本体，
+    // 每次切章都刷新会让「另一台设备改书名」永远输给「这台设备翻了一页」。
+    out.pointerKeepsBookUpdatedAtOk = bookAfter.updatedAt === bookBefore.updatedAt
+
+    // 模拟重启：内存里只剩库里那一份，openBook 必须回到上次那一章
+    b.closeBook()
+    b.store.books = await db.getBooks()
+    await b.openBook(pBook.id)
+    out.pointerRestoreOnOpenOk =
+      b.store.chapterId === p2.id &&
+      b.store.book.currentChapterId === p2.id &&
+      b.store.book.currentArcId === 'arc-ptr'
+
+    // 同步重载：库里记住的是 p1（上次 flush），但同步前正看着 p2 —— 以 p2 为准
+    await b.selectChapter(p1.id)
+    await b.flushCurrentPointers()
+    await b.selectChapter(p2.id)
+    const reloaded = await window.__ns.reloadAfterSync()
+    out.pointerSurvivesSyncReloadOk =
+      reloaded.bookId === pBook.id &&
+      b.store.chapterId === p2.id &&
+      b.store.book.currentChapterId === p2.id
+
+    // 删掉当前章：落到原位置的下一章，而不是跳回第一章
+    await b.removeChapter(p2.id)
+    out.pointerFallbackAfterDeleteOk =
+      b.store.chapterId === p3.id &&
+      b.store.book.currentChapterId === p3.id &&
+      b.store.book.currentArcId === null
+    await b.removeBook(pBook.id)
 
     // ------------------------------------------------------------------
     // I) V2 存储地基：集合工厂 / 墓碑 / bookId 守卫 / 写队列串行化 / 价目与成本
@@ -1719,6 +1822,429 @@
       // 草案没有进章节：coreConflict 仍是作者确认过的那一份
       b.store.chapters.find((c) => c.id === rChapter.id).coreConflict === '夺回灵石'
 
+    // V4 阶段 3：生成前计划校验接进 plan 阶段。
+    // 这份草案安排记忆里已死亡的「苏九」出场：校验必须报 high、标 blocked，
+    // 但**草案本身照常返回** —— 校验不是阶段失败，用户仍能看到并决定要不要用。
+    const pvChat = (text) => (opts) => {
+      setTimeout(() => {
+        opts.callbacks.onDelta?.(text)
+        opts.callbacks.onUsage?.({ inputTokens: 300, outputTokens: 60 })
+        opts.callbacks.onDone?.()
+      }, 0)
+      return { abort: () => {} }
+    }
+    const pvWf = await runChapterWorkflow({
+      input: {
+        book: rBook,
+        bookId: rBook.id,
+        chapter: { ...confirmedCard, order: 3 },
+        chapters: [confirmedCard],
+        outlines: [],
+        memory: {
+          characters: [{ id: 'pv-dead', name: '苏九', status: 'dead' }],
+          locations: [],
+          factions: [],
+          worldRules: [],
+          events: [],
+          foreshadowing: []
+        },
+        structure: { volumes: [], arcs: [] },
+        settings: s.settings,
+        action: 'plan'
+      },
+      settings: s.settings,
+      stages: ['plan'],
+      chat: pvChat(
+        JSON.stringify({ coreConflict: '苏九回到药庐', mustEvents: '苏九推开木窗' })
+      ),
+      recordRun: genS.recordRun
+    })
+    const pvDeadIssue = (pvWf.planValidation?.issues || []).find(
+      (i) => i.category === 'dead-character'
+    )
+    out.planValidateWiredIntoStagePlanOk =
+      pvWf.run.status === 'done' &&
+      pvWf.planDraft?.coreConflict === '苏九回到药庐' &&
+      pvWf.planBlocked === true &&
+      pvWf.run.stages[0].blocked === true &&
+      pvWf.run.stages[0].validation?.blocking === true &&
+      pvDeadIssue?.severity === 'high' &&
+      pvDeadIssue?.field === 'coreConflict' &&
+      (pvDeadIssue?.evidence || '').includes('苏九')
+
+    // 阻断的语义：只拦「自动采用 / 队列自动继续」，作者永远可以显式放行。
+    out.planValidateBlockSaveOk =
+      shouldBlockPlan(pvWf.planValidation, { blockHigh: true }) === true &&
+      shouldBlockPlan(pvWf.planValidation, { blockHigh: false }) === false &&
+      validationSummary(pvWf.planValidation, 1000, {}).overridden === false
+
+    // 放行后保存：字段落库，摘要留下「这次是作者作主」。摘要只存判断与问题 id，
+    // 完整报告不落库（正文一改就过期）。
+    const pvSaveRes = await b.saveChapterPlan(rChapter.id, {
+      ...pvWf.planDraft,
+      planValidation: validationSummary(pvWf.planValidation, 1000, { overridden: true })
+    })
+    const pvStored = (await db.getChapters(rBook.id)).find((c) => c.id === rChapter.id)
+    out.planValidateOverrideSavesOk =
+      !!pvSaveRes &&
+      pvSaveRes.coreConflict === '苏九回到药庐' &&
+      pvStored.coreConflict === '苏九回到药庐' &&
+      pvStored.planValidation?.overridden === true &&
+      pvStored.planValidation?.high === 1 &&
+      // 放行只影响这一次保存，不改变「校验确实拦过」的事实
+      pvStored.planValidation?.blocking === true &&
+      !('issues' in (pvStored.planValidation || {}))
+
+    // ------------------------------------------------------------------
+    // V4 阶段 4：持久化写作队列
+    //
+    // 这一节不打网络：runItem 是注入的。要验证的是队列自己的账 ——
+    // 串行、失败即停并保留已收到的文本、**不自动改正文**、生成中挡住同步。
+    // ------------------------------------------------------------------
+    const queue = useWritingQueue()
+    await db.saveQueueState({ paused: false })
+    await queue.loadForBook(rBook.id)
+    const contentBeforeQueue = b.store.chapters.find((c) => c.id === rChapter.id).content
+    const chaptersBeforeQueue = b.store.chapters.length
+
+    const enq1 = await queue.enqueue({ chapterId: rChapter.id })
+    const enqDup = await queue.enqueue({ chapterId: rChapter.id })
+    const storedQueue = await db.coll.generationQueue.getAll(rBook.id)
+    const snapHasQueue = JSON.stringify(await collectSnapshot()).includes('generationQueue')
+    out.queueEnqueuePersistOk =
+      enq1.ok &&
+      enq1.item?.status === 'queued' &&
+      // 同一章重复入队会让同一次调用花两遍钱，必须挡住
+      enqDup.ok === false &&
+      enqDup.existing === true &&
+      storedQueue.length === 1 &&
+      storedQueue[0].chapterId === rChapter.id &&
+      // 队列是设备本地态：绝不进全量备份 / 设备同步
+      LOCAL_ONLY_COLLECTIONS.includes('generationQueue') &&
+      snapHasQueue === false
+
+    // 第二章用于验证「一次只跑一项」
+    const qc2 = await b.addChapterWithContent('第二章原有的正文。', '第二章')
+    await queue.enqueue({ chapterId: qc2.id })
+
+    const runOrder = []
+    let releaseGate
+    const queueGate = new Promise((r) => {
+      releaseGate = r
+    })
+    const startRes = await queue.start({
+      runItem: async (it) => {
+        runOrder.push(it.chapterId)
+        if (runOrder.length === 1) await queueGate
+        return {
+          status: 'done',
+          result: {
+            text: '队列草稿-' + it.chapterId,
+            runId: 'qrun-' + it.chapterId,
+            usage: { inputTokens: 10, outputTokens: 20, cost: 0 }
+          }
+        }
+      }
+    })
+    const waitQueue = async (fn, ms = 4000) => {
+      const t0 = performance.now()
+      while (performance.now() - t0 < ms) {
+        if (fn()) return true
+        await new Promise((r) => setTimeout(r, 25))
+      }
+      return false
+    }
+    await waitQueue(() => queueStore.running && queueStore.activeId === enq1.item.id)
+    // 队列运行期间，局域网同步必须被挡在合并之前：整组回写会覆盖正在写的正文。
+    const busyWhileQueue = await handleIncomingSnapshot({}, {})
+    out.queueBlocksSyncOk =
+      busyWhileQueue.ok === false &&
+      busyWhileQueue.busy === true &&
+      busyWhileQueue.message.includes('正在生成')
+    releaseGate()
+    await waitQueue(() => !queueStore.running)
+
+    const qDone = queueStore.items.filter((x) => x.status === 'done')
+    out.queueSerialRunOk =
+      startRes.ok === true &&
+      runOrder.length === 2 &&
+      runOrder[0] === rChapter.id &&
+      runOrder[1] === qc2.id &&
+      qDone.length === 2 &&
+      qDone.every((x) => x.result?.text && !x.result.appliedAt) &&
+      queueStore.paused === false
+
+    // 关键断言：跑完两章，正文与章节数一个字都没动。
+    const ch1AfterQueue = (await db.getChapters(rBook.id)).find((c) => c.id === rChapter.id)
+    const ch2AfterQueue = (await db.getChapters(rBook.id)).find((c) => c.id === qc2.id)
+    out.queueNoAutoWriteOk =
+      ch1AfterQueue.content === contentBeforeQueue &&
+      ch2AfterQueue.content === '第二章原有的正文。' &&
+      b.store.chapters.length === chaptersBeforeQueue + 1
+
+    // 应用草稿：先存版本、再追加正文；队列里的正文副本要清掉。
+    const qItem1 = queueStore.items.find((x) => x.chapterId === rChapter.id)
+    const prevAutoExtract = s.settings.autoExtractMemory
+    s.settings.autoExtractMemory = false
+    const applyRes = await queue.applyResult(qItem1.id, { mode: 'insert' })
+    s.settings.autoExtractMemory = prevAutoExtract
+    const afterInsert = (await db.getChapters(rBook.id)).find((c) => c.id === rChapter.id)
+    const qVersions = await b.loadVersions()
+    const appliedItem = queueStore.items.find((x) => x.id === qItem1.id)
+    out.queueResultInsertOk =
+      applyRes.ok === true &&
+      applyRes.chapterId === rChapter.id &&
+      afterInsert.content.startsWith(contentBeforeQueue) &&
+      afterInsert.content.includes('队列草稿-' + rChapter.id) &&
+      // 插入前先存了版本，所以这一步可回滚
+      qVersions.some(
+        (v) => v.source === 'ai' && v.chapterId === rChapter.id && v.content === contentBeforeQueue
+      ) &&
+      appliedItem.result?.appliedMode === 'insert' &&
+      appliedItem.result?.text === ''
+
+    // 失败即停：保留已收到的半章，后续条目不跑，队列自动暂停。
+    const qc3 = await b.addChapterWithContent('第三章原有的正文。', '第三章')
+    const qc4 = await b.addChapterWithContent('第四章原有的正文。', '第四章')
+    await queue.enqueue({ chapterId: qc3.id })
+    await queue.enqueue({ chapterId: qc4.id })
+    const failOrder = []
+    await queue.start({
+      runItem: async (it) => {
+        failOrder.push(it.chapterId)
+        if (it.chapterId === qc3.id) {
+          return { status: 'failed', error: '模拟失败：Key 无效', result: { text: '已经收到的一半草稿' } }
+        }
+        return { status: 'done', result: { text: '不该跑到这里' } }
+      }
+    })
+    await waitQueue(() => failOrder.length > 0 && !queueStore.running)
+    const failedItem = queueStore.items.find((x) => x.chapterId === qc3.id)
+    const skippedItem = queueStore.items.find((x) => x.chapterId === qc4.id)
+    const qc3After = (await db.getChapters(rBook.id)).find((c) => c.id === qc3.id)
+    out.queueFailureKeepsTextOk =
+      failOrder.length === 1 &&
+      failOrder[0] === qc3.id &&
+      failedItem?.status === 'failed' &&
+      failedItem.error.includes('Key 无效') &&
+      // 已收到的文本不丢：用户可能就想要这半章
+      failedItem.result?.text === '已经收到的一半草稿' &&
+      skippedItem?.status === 'queued' &&
+      queueStore.paused === true &&
+      qc3After.content === '第三章原有的正文。'
+
+    // 重启恢复：running → interrupted，不自动重跑（重跑=再花一次钱）。
+    const queueRec = recoverQueueItems(
+      [{ id: 'recover-1', bookId: rBook.id, chapterId: rChapter.id, status: 'running' }],
+      { now: 12345 }
+    )
+    out.queueRecoveryOk =
+      queueRec.changed === true &&
+      queueRec.items[0].status === 'interrupted' &&
+      queueRec.items[0].error.includes('未自动重跑') &&
+      queueRec.items[0].updatedAt === 12345
+
+    // 收尾：不要在真实库里留下「暂停」这个全局标记
+    await db.saveQueueState({ paused: false })
+    queueStore.paused = false
+
+    // ------------------------------------------------------------------
+    // V4 阶段 5：本地哈希检索（RAG）
+    //
+    // 索引是设备本地派生数据：这里验证「建得起来、内容改了只重建那一章、
+    // 章删了块也清掉、永不进快照」，以及上下文层只在有片段时出现。
+    // ------------------------------------------------------------------
+    const ragSettings = {
+      rag: { enabled: true, topK: 6, minScore: 0.01, budget: 800, chunkChars: 200, overlapChars: 40 }
+    }
+    const ragCh1 = await b.addChapterWithContent(
+      '林昭在药庐与苏九对峙，剑拔弩张。药庐外雨声渐急。',
+      '检索一'
+    )
+    const ragCh2 = await b.addChapterWithContent(
+      '飞船引擎过载，警报响彻舱室。没有人知道还能撑多久。',
+      '检索二'
+    )
+    const ragFirst = await ensureBookIndex(rBook.id, b.store.chapters, ragSettings, {
+      force: true,
+      now: 5000
+    })
+    const ragRecs = await db.coll.ragChunks.getAll(rBook.id)
+    const ragSnap = JSON.stringify(await collectSnapshot())
+    out.ragIndexChapterOk =
+      ragFirst.changed === true &&
+      ragFirst.builtChapters >= 2 &&
+      ragFirst.chunkCount === ragRecs.length &&
+      ragFirst.chunkCount > 0 &&
+      ragRecs.some((r) => r.chapterId === ragCh1.id) &&
+      ragRecs.some((r) => r.chapterId === ragCh2.id) &&
+      ragRecs.every((r) => r.vector?.dims === EMBEDDING_DIM && Object.keys(r.vector.counts).length > 0) &&
+      // 设备本地态：绝不出现在全量备份 / 设备同步里
+      LOCAL_ONLY_COLLECTIONS.includes('ragChunks') &&
+      !ragSnap.includes('ragChunks')
+
+    // 只改一章的正文：状态要如实报「过期」，重建只动这一章，另一章的块原样保留。
+    const ragCh2Before = ragRecs.find((r) => r.chapterId === ragCh2.id)
+    b.setChapterContent(ragCh1.id, '林昭在龙脊玉前停下脚步，苏九的名字被刻在背面。')
+    await b.persistChapter(ragCh1.id)
+    const ragStale = await getRagIndexStatus(rBook.id, b.store.chapters)
+    const ragSecond = await ensureBookIndex(rBook.id, b.store.chapters, ragSettings, { now: 7777 })
+    const ragRecs2 = await db.coll.ragChunks.getAll(rBook.id)
+    const ragCh2After = ragRecs2.find((r) => r.chapterId === ragCh2.id)
+    const ragCh1Recs = ragRecs2.filter((r) => r.chapterId === ragCh1.id)
+    out.ragIncrementalReplaceOk =
+      ragStale.staleChapters >= 1 &&
+      ragSecond.changed === true &&
+      ragSecond.builtChapters === 1 &&
+      JSON.stringify(ragCh2Before) === JSON.stringify(ragCh2After) &&
+      ragCh1Recs.length > 0 &&
+      ragCh1Recs.every((r) => r.updatedAt === 7777) &&
+      ragCh1Recs.some((r) => r.text.includes('龙脊玉'))
+
+    // 删章之后，它的块必须一起消失 —— 否则检索会把「已删除章节」的原文
+    // 当成历史片段注入，作者会在提示词里看到自己已经删掉的内容。
+    await b.removeChapter(ragCh2.id)
+    const ragThird = await ensureBookIndex(rBook.id, b.store.chapters, ragSettings, { now: 8888 })
+    const ragRecs3 = await db.coll.ragChunks.getAll(rBook.id)
+    out.ragDeleteChapterCleanupOk =
+      ragThird.removedChapters >= 1 &&
+      !ragRecs3.some((r) => r.chapterId === ragCh2.id) &&
+      ragRecs3.some((r) => r.chapterId === ragCh1.id)
+
+    // 上下文层：有片段才出现，且预算确实截断在 rag.budget 上。
+    const ragCtx = buildContext(
+      {
+        book: { title: '测试' },
+        chapter: { id: 'rag-now', order: 9, title: '当前章' },
+        chapters: [{ id: 'rag-now', order: 9, title: '当前章' }],
+        settings: { contextBudget: 4000, rag: { enabled: true, budget: 80 } },
+        ragPassages: [
+          {
+            id: 'p1',
+            chapterId: 'rag-old',
+            chapterTitle: '旧事',
+            chapterOrder: 2,
+            text: '很久以前，林昭在药庐埋下了一枚铜钱，这件事没人记得。',
+            score: 0.5
+          }
+        ]
+      },
+      2000
+    )
+    const ragLayer = ragCtx.metadata.layers.find((l) => l.id === 'ragPassages')
+    // 极小预算：层必须被这一层的预算截断，而不是按全局预算一路吃下去
+    const ragTinyCtx = buildContext(
+      {
+        book: { title: '测试' },
+        chapter: { id: 'rag-now', order: 9, title: '当前章' },
+        chapters: [{ id: 'rag-now', order: 9, title: '当前章' }],
+        settings: { contextBudget: 4000, rag: { enabled: true, budget: 8 } },
+        ragPassages: [
+          {
+            id: 'p1',
+            chapterId: 'rag-old',
+            chapterTitle: '旧事',
+            chapterOrder: 2,
+            text: '很久以前，林昭在药庐埋下了一枚铜钱，这件事没人记得。',
+            score: 0.5
+          }
+        ]
+      },
+      2000
+    )
+    const ragTinyLayer = ragTinyCtx.metadata.layers.find((l) => l.id === 'ragPassages')
+    out.ragLayerInContextOk =
+      !!ragLayer &&
+      ragLayer.label === '相关历史片段' &&
+      ragLayer.tokens > 0 &&
+      ragLayer.tokens <= 80 &&
+      ragCtx.context.includes('相关历史片段') &&
+      ragCtx.context.includes('铜钱') &&
+      !!ragTinyLayer &&
+      ragTinyLayer.tokens <= 8
+
+    // 开关关着：retrieve 直接返回空数组（不读库、不建索引），上下文也不产生该层。
+    const ragOffPassages = await retrieveRagContext(
+      { bookId: rBook.id, chapter: b.store.chapters[0], chapters: b.store.chapters },
+      { rag: { enabled: false } }
+    )
+    const ragOffCtx = buildContext(
+      {
+        book: { title: '测试' },
+        chapter: { id: 'x', order: 1 },
+        chapters: [{ id: 'x', order: 1 }],
+        settings: { rag: { enabled: false, budget: 800 } }
+      },
+      2000
+    )
+    out.ragDisabledNoLayerOk =
+      Array.isArray(ragOffPassages) &&
+      ragOffPassages.length === 0 &&
+      !ragOffCtx.metadata.layers.some((l) => l.id === 'ragPassages') &&
+      !ragOffCtx.context.includes('相关历史片段')
+
+    // 收尾：不把测试索引留在真实库里
+    await clearBookIndex(rBook.id)
+
+    // ---- V4 阶段 6：人物关系图（纯函数部分） ----
+    // 组件那一段在控制台里用真实点击验证；这里验证派生的规则本身，
+    // 尤其是「悬空引用丢弃」与「自由文本只认明确分隔符」——它们出错时
+    // 界面上仍然画得出一张好看的图，只有断言能发现。
+    {
+      const gChars = [
+        { id: 'g1', name: '林昭', currentFactionId: 'gf1' },
+        { id: 'g2', name: '苏九', relationships: '林昭与苏九是同门' },
+        { id: 'g3', name: '周野' }
+      ]
+      const gFactions = [{ id: 'gf1', name: '青云门', leaders: ['g1'] }]
+      const g = buildRelationshipGraph({
+        characters: gChars,
+        factions: gFactions,
+        events: [
+          { id: 'ge1', characterIds: ['g1', 'g2', 'g3'] },
+          { id: 'ge2', characterIds: ['g2', 'g1'] }
+        ]
+      })
+      const edgeOf = (kind, a, b) =>
+        g.edges.find(
+          (e) =>
+            e.kind === kind &&
+            [e.source, e.target].sort().join('|') ===
+              [`character:${a}`, `character:${b}`].sort().join('|')
+        )
+      out.graphCharacterNodesOk =
+        g.stats.characters === 3 && g.stats.factions === 1 && g.stats.locations === 0
+      out.graphFactionLeaderEdgeOk =
+        !!g.edges.find(
+          (e) => e.kind === 'leader' && e.source === 'faction:gf1' && e.target === 'character:g1'
+        ) &&
+        !!g.edges.find(
+          (e) => e.kind === 'member' && e.source === 'character:g1' && e.target === 'faction:gf1'
+        )
+      out.graphEventCooccurrenceOk =
+        edgeOf('cooccur', 'g1', 'g2')?.weight === 2 &&
+        edgeOf('cooccur', 'g1', 'g3')?.weight === 1 &&
+        edgeOf('cooccur', 'g2', 'g3')?.weight === 1
+      out.graphTextRelationshipConservativeOk =
+        parseRelationshipText('林昭与苏九是同门', gChars).length === 1 &&
+        parseRelationshipText('林昭想起苏九曾说过的话', gChars).length === 0 &&
+        parseRelationshipText('林昭独自离开', gChars).length === 0 &&
+        !!edgeOf('relation', 'g1', 'g2')
+      const dangling = buildRelationshipGraph({
+        characters: [{ id: 'd1', name: '甲', currentFactionId: 'gone' }],
+        factions: [{ id: 'df1', name: '乙门', leaders: ['ghost'], allies: ['不存在'] }],
+        events: [{ id: 'de1', characterIds: ['d1', 'nobody'] }]
+      })
+      out.graphNoDanglingEdgesOk =
+        dangling.nodes.length === 2 && dangling.edges.length === 0
+      const l1 = layoutRelationshipGraph(g, { width: 600, height: 400 })
+      const l2 = layoutRelationshipGraph(g, { width: 600, height: 400 })
+      out.graphLayoutDeterministicOk =
+        JSON.stringify(l1) === JSON.stringify(l2) &&
+        l1.nodes.length === g.nodes.length &&
+        l1.nodes.every((n) => n.x >= 0 && n.x <= 600 && n.y >= 0 && n.y <= 400)
+    }
+
     // AI 修复：返回修订稿与差异预览，正文保持原样
     const fixMsgs = []
     const fixChat = (text) => (opts) => {
@@ -1809,6 +2335,10 @@
     const uiCh2 = await b.addChapter()
     await b.setChapterContent(uiCh2.id, '另一章独有的正文。')
     await b.persistChapter(uiCh2.id)
+    // V4 起 openBook 会回到「上次读到的那一章」，而本节后面的断言都假设点开书卡
+    // 落在第一章。建 uiCh2 时当前章已经跟过去了，这里显式切回第一章并落盘指针。
+    await b.selectChapter(uiCh.id)
+    await b.flushCurrentPointers()
     await new Promise((r) => setTimeout(r, 80))
 
     // 造一条「上次生成到一半就退出」的任务：status 仍是 running，草稿有内容。
@@ -1842,6 +2372,22 @@
         !!document.querySelector('.editor-ta') &&
         !!document.querySelector('.sidebar') &&
         !!document.querySelector('.ai-panel')
+
+      // 写作队列面板：从侧栏入口真点一次。setup 期抛错不会白屏（见坑 #14），
+      // 所以必须断言它真的渲染出说明文案，而不是只断言按钮存在。
+      const queueBtn = [...document.querySelectorAll('.sidebar .head-ops .btn')].find((el) =>
+        el.textContent.includes('队列')
+      )
+      queueBtn?.click()
+      await new Promise((r) => setTimeout(r, 250))
+      const qModal = document.querySelector('.queue-modal')
+      out.queuePanelMountOk =
+        !!queueBtn &&
+        !!qModal &&
+        qModal.textContent.includes('只生成草稿，不会自动改正文') &&
+        qModal.textContent.includes('开始队列')
+      qModal?.querySelector('.modal-header .btn')?.click()
+      await new Promise((r) => setTimeout(r, 120))
 
       // 草稿恢复条：等 settleOnOpen 的异步读写跑完
       await new Promise((r) => setTimeout(r, 250))
@@ -1889,7 +2435,31 @@
       await useNovelMemory().upsert('events', {
         title: '挂载事件',
         chapterId: uiCh.id,
-        time: '2月'
+        time: '2月',
+        // 关系图与「事件同场」都要靠这两个 id；没有它们，关系图那一段
+        // 只能在空图上断言「组件挂载了」，那等于什么都没验。
+        characterIds: ['uiC1', 'uiC2']
+      })
+      // 关系图的夹具：两个人 + 一个势力（首领 + 所属 + 自由文本关系）
+      await useNovelMemory().upsert('characters', {
+        id: 'uiC1',
+        name: '林昭',
+        status: 'alive',
+        currentFactionId: 'uiF1',
+        currentLocationId: 'uiL1',
+        relationships: '苏九——林昭的同门师姐'
+      })
+      await useNovelMemory().upsert('locations', { id: 'uiL1', name: '药庐' })
+      await useNovelMemory().upsert('characters', {
+        id: 'uiC2',
+        name: '苏九',
+        status: 'alive'
+      })
+      await useNovelMemory().upsert('factions', {
+        id: 'uiF1',
+        name: '青云门',
+        status: 'active',
+        leaders: ['uiC1']
       })
 
       // 查找栏：Editor 的查找/替换状态正是在 setup 期被 watcher 碰过的那批
@@ -2041,7 +2611,10 @@
       const storyTables = document.querySelectorAll('.console-pane .entity-table')
       out.consoleMountOk =
         !!document.querySelector('.modal.console') &&
-        tabs.length === 14 &&
+        // 16 个标签：阶段 5 新增「检索」、阶段 6 新增「关系图」。这个数字
+        // **不是**随手写死的常量，它同时验证「TABS 与标签栏渲染一致」——
+        // 改了 TABS 忘改这里会立刻红。
+        tabs.length === 16 &&
         !!document.querySelector('.console-pane .bp') &&
         document.querySelectorAll('.console-pane .bp-field').length === 7 &&
         storyTables.length === 3 &&
@@ -2150,6 +2723,59 @@
         document.querySelectorAll('.console-pane .stats .block').length >= 5
       out.consoleStyleStatsOk = styleOk && statsOk
 
+      // 检索（RAG）：面板挂载本身就覆盖了「setup 期抛错」这一大类缺陷
+      // （见 CLAUDE.md 坑 #14）。这里只读状态、不点重建 —— 重建会往真实库
+      // 的这本书里写 ragChunks，而这一步的目标只是确认组件渲染正常。
+      pickTab('检索')?.click()
+      await new Promise((r) => setTimeout(r, 150))
+      const ragPane = document.querySelector('.console-pane .rag')
+      out.consoleRagPanelOk =
+        !!ragPane &&
+        (ragPane.querySelector('h4')?.textContent || '').includes('本地检索') &&
+        ragPane.textContent.includes('字面相似度') &&
+        !!ragPane.querySelector('input[type="checkbox"]')
+
+      // 关系图：夹具是 2 人物 + 1 势力（+ 1 地点，默认不显示），
+      // 边有首领 / 所属 / 同场 / 自由文本关系。断言的是**真实画出来的东西**：
+      // 圆点数量、节点计数文案、图例、过滤开关与点击详情。
+      const relTab = pickTab('关系图')
+      const relBadge = relTab?.querySelector('.ctab-badge')?.textContent.trim()
+      out.graphTabBadgeOk = relTab?.querySelector('span')?.textContent.trim() === '关系图' && relBadge === '3'
+      relTab?.click()
+      await new Promise((r) => setTimeout(r, 200))
+      const relPane = document.querySelector('.console-pane .rel')
+      const relStatsText = relPane?.querySelector('.stat')?.textContent || ''
+      out.graphRenderOk =
+        !!relPane &&
+        relStatsText.includes('节点 3') &&
+        relStatsText.includes('人物 2') &&
+        relStatsText.includes('势力 1') &&
+        relPane.querySelectorAll('.rel-svg .node circle').length === 3 &&
+        relPane.querySelectorAll('.rel-svg .edges line').length === 4 &&
+        relPane.querySelectorAll('.legend .chip').length === 8
+
+      // 过滤：打开「显示地点」→ 节点变 4、出现「所在」边
+      const locToggle = relPane?.querySelectorAll('.rel-bar input[type="checkbox"]')?.[0]
+      locToggle?.click()
+      await new Promise((r) => setTimeout(r, 150))
+      out.graphFilterOk =
+        (document.querySelector('.console-pane .rel .stat')?.textContent || '').includes('节点 4') &&
+        document.querySelectorAll('.console-pane .rel .rel-svg .node circle').length === 4 &&
+        document.querySelectorAll('.console-pane .rel .rel-svg .edges line').length === 5
+
+      // 点击节点 → 右侧详情必须列出它的关系（空面板会让图看起来能点但没用）
+      // 点「林昭」这个节点（度数最高）：随便点第一个的话，布局顺序可能先给
+      // 到一个只有两条边的节点，断言就变成在考验节点排序而不是详情面板。
+      ;[...document.querySelectorAll('.console-pane .rel .rel-svg .node')]
+        .find((el) => el.textContent.includes('林昭'))
+        ?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+      await new Promise((r) => setTimeout(r, 120))
+      const detailText = document.querySelector('.console-pane .rel .rel-detail')?.textContent || ''
+      out.graphClickDetailOk =
+        !!document.querySelector('.console-pane .rel .rel-detail h5') &&
+        detailText.includes('连接') &&
+        document.querySelectorAll('.console-pane .rel .rel-detail .rels li').length >= 3
+
       out.consoleTabsOk = peopleOk && ctxOk
 
       // 关闭：点右上角按钮，确认整层弹窗被移除（遮罩没被卡住）
@@ -2198,6 +2824,24 @@
       out.versionKeepPanelOk = modalText.includes(
         `每章最多保留：${defaultSettings.versionKeep} 版`
       )
+
+      // WebDAV 面板：与局域网同步同时存在，且必须把「谁的服务器、密码存哪」写清楚
+      const wdPanel = document.querySelector('.modal .webdav-panel')
+      out.webdavPanelOk =
+        !!wdPanel &&
+        wdPanel.textContent.includes('自己的 WebDAV 服务器') &&
+        wdPanel.textContent.includes('不经过本项目的任何服务') &&
+        wdPanel.textContent.includes('不写入数据库') &&
+        !!wdPanel.querySelector('input[type="password"]')
+
+      // 插件面板：必须真的在设置里渲染出来，并把「不执行插件代码」写明。
+      // 这里只读不点 —— 「打开插件目录」会拉起资源管理器（冒烟纪律第 2 条）。
+      const pluginPanel = document.querySelector('.modal .plugins-panel')
+      out.pluginPanelOk =
+        !!pluginPanel &&
+        pluginPanel.textContent.includes('绝不执行插件代码') &&
+        pluginPanel.textContent.includes('重新读取') &&
+        !!pluginPanel.querySelector('input[type="checkbox"]')
 
       const syncPanel = document.querySelector('.modal .sync-panel')
       out.syncPanelOk =
@@ -3268,6 +3912,289 @@
     out.snapshotNoApiKeyOk = !snapText.includes(SECRET) && !snapText.includes('apiKey')
 
     await syncApi.syncStop()
+
+    // ------------------------------------------------------------------
+    // O) WebDAV 同步：走完整的 IPC → 主进程 davRequest → net.fetch → 内存
+    //    WebDAV 服务器。不直接调主进程函数，理由与上面局域网同步那段一样：
+    //    认证头、路径拼装、ETag 条件请求都是「只有真发一次才验证得到」的。
+    // ------------------------------------------------------------------
+    {
+      const wd = window.__nsSmokeWebdav
+      const wdBase = wd?.baseUrl || ''
+      out.webdavMockAvailableOk =
+        !!wdBase && (await window.electronAPI.webdavRequest({
+          baseUrl: 'not-a-url',
+          path: '/x',
+          method: 'GET'
+        })).code === 'EINVAL'
+
+      const peersBeforeWd = await db.getSyncPeers()
+      const wdPassword = 'smoke-webdav-pass-123'
+      s.settings.webdav = {
+        enabled: true,
+        url: wdBase,
+        username: 'smoke',
+        remoteDir: 'smoke',
+        autoSync: false,
+        intervalSec: 300,
+        conflictCopies: true,
+        timeoutSec: 10,
+        lastSyncAt: 0,
+        lastStatus: 'idle',
+        lastError: '',
+        lastEtag: ''
+      }
+
+      // 1) 测试连接：目录不存在 → 自动创建 → 再探一次成功
+      const wdTest = await testWebdav({ password: wdPassword })
+      out.webdavMockConnectOk = wdTest.ok === true && wdTest.created === true
+
+      // 2) 第一次同步：没有对端，只有自己的文件被上传
+      const wd1 = await syncWithWebdav({ password: wdPassword, flush: async () => {} })
+      const deviceId = await db.getDeviceId()
+      out.webdavMockUploadOk =
+        wd1.ok === true &&
+        wd1.stats.added >= 0 &&
+        s.settings.webdav.lastStatus === 'ok' &&
+        !!s.settings.webdav.lastEtag &&
+        !!deviceId &&
+        !('password' in s.settings.webdav)
+
+      // 3) 模拟另一台设备已上传自己的快照（新书 + 一章），再同步应当合并进来
+      const peerBook = {
+        id: 'webdav-peer-book',
+        title: '测试小说', // 与清理规则一致，收尾时会被 removeBook 一并处理
+        intro: '来自 WebDAV 对端',
+        coverColor: '#4a90d9',
+        plan: {},
+        createdAt: Date.now() - 1000,
+        updatedAt: Date.now() - 1000
+      }
+      const peerSnap = buildSnapshot({
+        books: [peerBook],
+        deviceId: 'smoke-webdav-peer',
+        deviceName: '测试对端设备',
+        data: {
+          [peerBook.id]: {
+            chapters: [
+              {
+                id: 'webdav-peer-ch1',
+                bookId: peerBook.id,
+                title: '对端第一章',
+                content: '这段正文只存在于 WebDAV 对端。',
+                order: 1,
+                updatedAt: Date.now() - 1000
+              }
+            ]
+          }
+        }
+      })
+      const peerPut = await window.electronAPI.webdavRequest({
+        baseUrl: wdBase,
+        path: '/smoke/smoke-webdav-peer.json',
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(peerSnap),
+        username: 'smoke',
+        password: wdPassword,
+        timeoutSec: 10
+      })
+      const wd2 = await syncWithWebdav({ password: wdPassword, flush: async () => {} })
+      const peerBookInDb = (await db.getBooks()).find((x) => x.id === peerBook.id)
+      const peerChapterInDb = (await db.getChapters(peerBook.id)).find(
+        (c) => c.id === 'webdav-peer-ch1'
+      )
+      out.webdavMockPullMergeOk =
+        peerPut.ok === true &&
+        wd2.ok === true &&
+        wd2.stats.added >= 2 &&
+        !!peerBookInDb &&
+        !!peerChapterInDb &&
+        wd2.peers.includes('测试对端设备') &&
+        b.store.books.some((x) => x.id === peerBook.id)
+
+      // 4) ETag 冲突：本机上传后，别人的进程改了「本机那个文件」。
+      //    下一次上传带着旧 ETag 必然 412；必须重新拉取合并、取新 ETag 再传，
+      //    而不是把 412 当成一次失败就结束。
+      const ownPath = '/smoke/' + encodeURIComponent(deviceId) + '.json'
+      const overwrite = await window.electronAPI.webdavRequest({
+        baseUrl: wdBase,
+        path: ownPath,
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(peerSnap),
+        username: 'smoke',
+        password: wdPassword,
+        timeoutSec: 10
+      })
+      const wd3 = await syncWithWebdav({ password: wdPassword, flush: async () => {} })
+      out.webdavMockEtagConflictRetryOk =
+        overwrite.ok === true &&
+        wd3.ok === true &&
+        wd3.retries === 1 &&
+        wd3.warnings.some((x) => x.includes('重新合并'))
+
+      // 5) 生成中拒绝同步（与局域网同步同一条边界），但不算失败
+      const genWd = useGeneration()
+      genWd.store.running = true
+      const wdBusy = await syncWithWebdav({ password: wdPassword, flush: async () => {} })
+      genWd.store.running = false
+      out.webdavBusyRejectedOk =
+        wdBusy.ok === true && wdBusy.skipped === 'busy' && wdBusy.stats === undefined
+
+      // 6) 密码与 API Key 都不许出现在远端快照里
+      const own = await window.electronAPI.webdavRequest({
+        baseUrl: wdBase,
+        path: ownPath,
+        method: 'GET',
+        username: 'smoke',
+        password: wdPassword,
+        timeoutSec: 10
+      })
+      const SECRET_WD = 'sk-webdav-must-never-leave'
+      const savedKeyWd = s.settings.apiKey
+      s.settings.apiKey = SECRET_WD
+      const localSnapText = toSnapshotJson(await collectSnapshot())
+      s.settings.apiKey = savedKeyWd
+      out.webdavSecretNotInSnapshotOk =
+        own.ok === true &&
+        own.status === 200 &&
+        !own.body.includes(wdPassword) &&
+        !own.body.includes('webdavPassword') &&
+        !own.body.includes(SECRET_WD) &&
+        !localSnapText.includes(SECRET_WD) &&
+        !localSnapText.includes('webdavPassword')
+
+      // 7) 状态文案能按 lastStatus 说人话
+      const wdState = describeWebdavState(s.settings.webdav, Date.now())
+      out.webdavStateLabelOk =
+        wdState.status === 'ok' && wdState.label === '同步成功' && wdState.when === '刚刚'
+
+      // 收尾：还原 peer 基线（WebDAV 的对端基线会写进真实库）
+      await db.saveSyncPeers(peersBeforeWd)
+      await b.removeBook(peerBook.id)
+    }
+
+    // ------------------------------------------------------------------
+    // P) 声明式插件：目录隔离 + 四个 hook 的接入点
+    //    主进程在 SMOKE_TEST 下把插件目录指向 %TEMP%\novel-studio-smoke\plugins，
+    //    里面有三种文件：一个合法清单、一个坏 JSON、一个坏清单。
+    //    「坏文件只影响它自己」这条纪律只有真的放三个文件才验得到。
+    // ------------------------------------------------------------------
+    {
+      const plugDir = window.__nsSmokePluginsDir || ''
+      const listed = await window.electronAPI.pluginsList()
+      const norm = listed?.ok ? normalizePluginList(listed.files) : { manifests: [], errors: [] }
+
+      out.pluginListIsolationOk =
+        !!plugDir &&
+        listed?.ok === true &&
+        listed.dir === plugDir &&
+        /novel-studio-smoke/.test(listed.dir) &&
+        // 合法 1 个 + 坏 JSON + 坏清单各报一条错误，互不影响
+        norm.manifests.length === 1 &&
+        norm.errors.length === 2 &&
+        norm.manifests[0].id === 'smoke-plugin' &&
+        norm.manifests[0].hooks.contextFragments.length === 1 &&
+        norm.manifests[0].hooks.rules.length === 1 &&
+        norm.manifests[0].hooks.exportTemplates.length === 1 &&
+        norm.manifests[0].hooks.keywordHints.length === 1
+
+      // store 只读插件目录，不落库：load() 成功后 pluginState 就是它读到的东西
+      const plugins = usePlugins()
+      const loadRes = await plugins.load()
+      out.pluginStoreLoadOk =
+        loadRes.ok === true &&
+        pluginState.manifests.length === 1 &&
+        pluginState.errors.length === 2 &&
+        pluginState.unsupported === false
+
+      // 1) Context Builder：启用片段时出现 pluginContext 层，关掉时不出现。
+      //    与其它层共用同一套预算与排序，所以这里验的是「层真的进了上下文」。
+      const pFrags = plugins.fragments()
+      const pCtx = buildContext(kInput({ pluginFragments: pFrags }), 6000)
+      const pLayer = pCtx.metadata.layers.find((l) => l.id === 'pluginContext')
+      out.pluginContextLayerOk =
+        pFrags.length === 1 &&
+        !!pLayer &&
+        pLayer.tokens > 0 &&
+        !pLayer.dropped &&
+        pCtx.context.includes('每章至少出现一次雨声') &&
+        pLayer.items === 1 &&
+        pLayer.itemsDetail.some((i) => i.source.includes('冒烟插件'))
+
+      s.settings.plugins.enabled = false
+      const pFragsOff = plugins.fragments()
+      const pCtxOff = buildContext(kInput({ pluginFragments: pFragsOff }), 6000)
+      s.settings.plugins.enabled = true
+      out.pluginDisabledNoLayerOk =
+        pFragsOff.length === 0 &&
+        !pCtxOff.metadata.layers.some((l) => l.id === 'pluginContext')
+
+      // 2) 一致性：插件问题并入同一份报告，source 标成 plugin；
+      //    没有插件规则时，干净数据仍然 0 条（consistencyCleanOk 的同一口径）。
+      const pChapters = [
+        { id: 'plugin-ch-1', order: 1, title: '雨夜', content: '院墙外传来雨声，这里有个禁词。' }
+      ]
+      const pIssues = plugins.issues(pChapters)
+      const pReport = runRuleChecks({ chapters: pChapters, pluginRules: pIssues })
+      const pClean = runRuleChecks({ chapters: pChapters, pluginRules: [] })
+      out.pluginRuleIssueOk =
+        pIssues.length === 1 &&
+        pIssues[0].source === 'plugin' &&
+        pIssues[0].severity === 'medium' &&
+        pIssues[0].rule === 'plugin:smoke-plugin:taboo-word' &&
+        pReport.issues.some((i) => i.source === 'plugin') &&
+        pReport.stats.plugin === 1 &&
+        pClean.stats.plugin === 0 &&
+        !pClean.issues.some((i) => i.source === 'plugin')
+
+      // 3) 导出模板：只做占位符替换，未知占位符原样保留，输出必须是纯文本
+      const pTpls = plugins.templates()
+      const pRendered = pTpls.length
+        ? renderExportTemplate(pTpls[0].template, {
+            book: { title: '测试小说' },
+            chapters: [{ order: 1, title: '雨夜', content: '雨声落在瓦上。' }],
+            date: new Date(2026, 9, 24)
+          })
+        : ''
+      out.pluginTemplateExportOk =
+        pTpls.length === 1 &&
+        pTpls[0].key === 'smoke-plugin:simple' &&
+        pTpls[0].ext === 'txt' &&
+        pRendered.includes('《测试小说》') &&
+        pRendered.includes('共 1 章') &&
+        pRendered.includes('第1章 雨夜') &&
+        pRendered.includes('2026-10-24') &&
+        renderExportTemplate('{{titel}}', {}) === '{{titel}}'
+
+      // 4) 关键词提示只显示、不自动进提示词；关掉插件后什么都不给
+      const pHints = plugins.hints('雨声淅沥')
+      s.settings.plugins.disabledIds = ['smoke-plugin']
+      const pOff = {
+        fragments: plugins.fragments().length,
+        issues: plugins.issues(pChapters).length,
+        templates: plugins.templates().length,
+        hints: plugins.hints('雨声淅沥').length
+      }
+      s.settings.plugins.disabledIds = []
+      out.pluginKeywordHintOk =
+        pHints.length === 1 &&
+        pHints[0].hint.includes('雨声') &&
+        pHints[0].matched.includes('雨声')
+      out.pluginDisabledOk =
+        pOff.fragments === 0 && pOff.issues === 0 && pOff.templates === 0 && pOff.hints === 0
+
+      // 5) 插件设置不进快照（与 API Key 同一条边界）：
+      //    快照里既没有 settings，也不该出现插件目录/黑名单这类本机配置。
+      const pSnapText = toSnapshotJson(await collectSnapshot())
+      out.pluginSettingsNotInSnapshotOk =
+        !pSnapText.includes('"plugins"') &&
+        !pSnapText.includes('contextBudget') &&
+        !pSnapText.includes('disabledIds') &&
+        !pSnapText.includes(plugDir)
+    }
+
     await b.removeBook(syncBook.id)
 
     // 收尾：把新增的设置键复位，别把开发者留在一个会被静默改写的配置上
@@ -3318,6 +4245,12 @@
       out.cleaned &&
       out.closeBookGuard &&
       out.closeBookCleared &&
+      out.pointerDeriveOk &&
+      out.pointerPersistOk &&
+      out.pointerKeepsBookUpdatedAtOk &&
+      out.pointerRestoreOnOpenOk &&
+      out.pointerSurvivesSyncReloadOk &&
+      out.pointerFallbackAfterDeleteOk &&
       out.collCrudOk &&
       out.collTimestampsOk &&
       out.collTombstoneOk &&
@@ -3371,10 +4304,32 @@
       out.planProposalOk &&
       out.diffOk &&
       out.planAiDraftOk &&
+      out.planValidateWiredIntoStagePlanOk &&
+      out.planValidateBlockSaveOk &&
+      out.planValidateOverrideSavesOk &&
+      out.queueEnqueuePersistOk &&
+      out.queueBlocksSyncOk &&
+      out.queueSerialRunOk &&
+      out.queueNoAutoWriteOk &&
+      out.queueResultInsertOk &&
+      out.queueFailureKeepsTextOk &&
+      out.queueRecoveryOk &&
+      out.ragIndexChapterOk &&
+      out.ragIncrementalReplaceOk &&
+      out.ragDeleteChapterCleanupOk &&
+      out.ragLayerInContextOk &&
+      out.ragDisabledNoLayerOk &&
+      out.graphCharacterNodesOk &&
+      out.graphFactionLeaderEdgeOk &&
+      out.graphEventCooccurrenceOk &&
+      out.graphTextRelationshipConservativeOk &&
+      out.graphNoDanglingEdgesOk &&
+      out.graphLayoutDeterministicOk &&
       out.fixDraftOk &&
       out.fixAcceptOk &&
       out.uiCardFound &&
       out.uiWritingMounted &&
+      out.queuePanelMountOk &&
       out.draftRecoveryOk &&
       out.draftLoadOk &&
       out.pagehideFlushOk &&
@@ -3393,6 +4348,11 @@
       out.consoleMountOk &&
       out.consoleTabsOk &&
       out.consoleStyleStatsOk &&
+      out.consoleRagPanelOk &&
+      out.graphTabBadgeOk &&
+      out.graphRenderOk &&
+      out.graphFilterOk &&
+      out.graphClickDetailOk &&
       out.consoleHistoryOk &&
       out.consoleVersionsOk &&
       out.versionCompareUiOk &&
@@ -3404,6 +4364,17 @@
       out.backupModalOk &&
       out.backupModalClosed &&
       out.versionKeepPanelOk &&
+      out.webdavPanelOk &&
+      out.pluginPanelOk &&
+      out.pluginListIsolationOk &&
+      out.pluginStoreLoadOk &&
+      out.pluginContextLayerOk &&
+      out.pluginDisabledNoLayerOk &&
+      out.pluginRuleIssueOk &&
+      out.pluginTemplateExportOk &&
+      out.pluginKeywordHintOk &&
+      out.pluginDisabledOk &&
+      out.pluginSettingsNotInSnapshotOk &&
       out.syncPanelOk &&
       out.syncPanelToggleOk &&
       out.syncPanelOffOk &&
@@ -3455,7 +4426,15 @@
       out.syncConflictIdempotentOk &&
       out.syncSchemaRejectOk &&
       out.syncBusyOk &&
-      out.snapshotNoApiKeyOk
+      out.snapshotNoApiKeyOk &&
+      out.webdavMockAvailableOk &&
+      out.webdavMockConnectOk &&
+      out.webdavMockUploadOk &&
+      out.webdavMockPullMergeOk &&
+      out.webdavMockEtagConflictRetryOk &&
+      out.webdavBusyRejectedOk &&
+      out.webdavSecretNotInSnapshotOk &&
+      out.webdavStateLabelOk
 
     // 断言计数：以 out 上的具名断言为准。pass / error / 本字段与诊断项不算。
     // 这样 README / CLAUDE.md 里的数字可以直接引用真实值，不必手工维护。

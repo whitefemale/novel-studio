@@ -21,7 +21,7 @@ import { styleProfileText } from './style.js'
  * 它会随每一条生成记录落库。没有它，「同样的输入这次怎么写得不一样」
  * 就分不清是提示词改了、参数改了，还是模型自己漂了。
  */
-export const PROMPT_VERSION = 'v3.5'
+export const PROMPT_VERSION = 'v3.7'
 
 /**
  * Context Builder：把「写这一章需要知道的一切」按相关性分层组装成提示词。
@@ -227,6 +227,73 @@ function chapterLabel(c) {
   return c.title ? `第${c.order}章 ${c.title}` : `第${c.order}章`
 }
 
+/**
+ * 检索片段 → 层条目，并在这里就把 `settings.rag.budget` 用掉。
+ *
+ * 预算必须在**建层时**扣，不能只写在层上：`allocate` 只认全局预算，
+ * 不会为某一层单独设上限（见那里的实现）。若这里不裁，检索层会按全局
+ * 预算一路吃下去，把「最近正文」这种更重要的层挤掉。
+ */
+function ragPassageItems(passages, budgetTokens) {
+  const limit = Math.max(0, Number(budgetTokens) || 0)
+  if (!limit || !Array.isArray(passages)) return []
+  const items = []
+  let left = limit
+  for (const p of passages) {
+    const text = String(p?.text ?? '').trim()
+    if (!text) continue
+    const title = p.chapterTitle
+      ? `第${Number(p.chapterOrder) || '?'}章 ${p.chapterTitle}`
+      : `第${Number(p.chapterOrder) || '?'}章`
+    const full = `【${title}】\n${text}`
+    const tokens = estimateTokens(full)
+    if (tokens <= left) {
+      items.push({
+        name: title,
+        text: full,
+        source: `检索·${title}`,
+        reason: 'rag'
+      })
+      left -= tokens
+      continue
+    }
+    const cut = cutToTokens(full, left, KEEP.head)
+    if (cut) {
+      items.push({ name: title, text: cut, source: `检索·${title}`, reason: 'rag' })
+    }
+    break
+  }
+  return items
+}
+
+/**
+ * 插件提供的固定片段 → 层条目。
+ *
+ * 与检索片段一样，预算在**建层时**就扣掉：`allocate` 只认全局预算，不会为
+ * 单层设上限。放不下的整条跳过（`hooks.js` 已经做过一次同样的裁剪，
+ * 这里再裁一次是因为调用方可能直接传入未裁剪的数组）。
+ */
+function pluginFragmentItems(fragments, budgetTokens) {
+  const limit = Math.max(0, Number(budgetTokens) || 0)
+  if (!limit || !Array.isArray(fragments)) return []
+  let left = limit
+  const items = []
+  for (const f of fragments) {
+    const text = String(f?.text ?? '').trim()
+    if (!text) continue
+    const tokens = estimateTokens(text)
+    if (tokens > left) continue
+    items.push({
+      name: f.name || '插件',
+      text,
+      source: f.source || '插件',
+      reason: 'plugin'
+    })
+    left -= tokens
+  }
+  return items
+}
+
 function makeResolvers(input) {
   const maps = {
     characters: new Map((input.memory?.characters || []).map((e) => [e.id, e.name || ''])),
@@ -297,7 +364,10 @@ export function buildLayers(input = {}) {
   const arcs = structure.arcs || []
   const volumes = structure.volumes || []
   const curChapter = input.chapter
-  const curArc = arcs.find((a) => a.id === curChapter?.arcId) || null
+  // 章节没归篇时退到书里记住的当前篇（V4 指针）。这与 currentVolumeId 的回退是
+  // 同一套口径：旧数据没有 arcId 时，至少还能带上「上次所在的篇」。
+  const curArc =
+    arcs.find((a) => a.id === (curChapter?.arcId || input.book?.currentArcId)) || null
   const curVolume =
     volumes.find((v) => v.id === (curArc?.volumeId || input.book?.currentVolumeId)) || null
 
@@ -414,6 +484,22 @@ export function buildLayers(input = {}) {
       layer('style', '文风档案', { priority: 9, keep: KEEP.head, minTokens: 60 }, [
         { name: 'style', text: styleText, source: '文风档案', reason: 'required' }
       ])
+    )
+  }
+
+  // 9.5) 声明式插件提供的固定片段（V4）。
+  //      只包含用户自己放进去的 JSON 文本，**不执行任何插件代码**。
+  //      预算来自 settings.plugins.contextBudget；默认 400 token，且整条跳过
+  //      而不是截断 —— 半句写作要求比没有更糟。没有片段时不产生层，
+  //      提示词与未装插件时逐字相同。
+  const pluginBudget = Math.max(0, Number(settings.plugins?.contextBudget ?? 0) || 0)
+  const pluginItems =
+    settings.plugins?.enabled === false
+      ? []
+      : pluginFragmentItems(input.pluginFragments, pluginBudget)
+  if (pluginItems.length) {
+    layers.push(
+      layer('pluginContext', '插件上下文', { priority: 5, keep: KEEP.head, minTokens: 60 }, pluginItems)
     )
   }
 
@@ -539,6 +625,21 @@ export function buildLayers(input = {}) {
         { priority: 11, keep: KEEP.head, minTokens: 60 },
         older
       )
+    )
+  }
+
+  // 11.5) 检索到的历史片段（V4）。放在「相关历史事件」之后、「近期摘要」之前：
+  //    它是按字面相似度召回的正文原文，属于补充材料；摘要与最近正文更接近
+  //    「这一章正在发生什么」，不该被它挤到后面。
+  //
+  //    `input.ragPassages` 由调用方在生成前检索好（AiPanel / ChapterCardModal）。
+  //    Context Builder 本身保持纯函数、不碰 IndexedDB —— 这是它能被单测逐字
+  //    钉死的前提。没有片段时不产生层，提示词与旧版完全一致。
+  const ragBudget = Math.max(0, Number(settings.rag?.budget ?? 0) || 0)
+  const ragItems = ragPassageItems(input.ragPassages, ragBudget)
+  if (ragItems.length) {
+    layers.push(
+      layer('ragPassages', '相关历史片段', { priority: 11, keep: KEEP.head, minTokens: 60 }, ragItems)
     )
   }
 

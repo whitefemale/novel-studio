@@ -2,12 +2,26 @@ import { reactive } from 'vue'
 import { getSettings, saveSettings } from '../services/storage.js'
 import { DEFAULT_PRICING, normalizePricing } from '../services/ai/tokenUsage.js'
 import { defaultTaskModels, normalizeTaskModels } from '../services/ai/models.js'
+import { normalizeProviderSettings } from '../services/ai/providers.js'
 import { isDesktop } from '../services/platform.js'
+import {
+  defaultPlanValidation,
+  normalizePlanValidation,
+  defaultRagSettings,
+  normalizeRagSettings,
+  defaultWebdavSettings,
+  normalizeWebdavSettings,
+  defaultPluginSettings,
+  normalizePluginSettings
+} from '../services/settingsExtras.js'
 import {
   secureStorageAvailable,
   readSecureApiKey,
   writeSecureApiKey,
-  deleteSecureApiKey
+  deleteSecureApiKey,
+  readSecureWebdavPassword,
+  writeSecureWebdavPassword,
+  deleteSecureWebdavPassword
 } from '../services/secret.js'
 
 export { DEFAULT_PRICING }
@@ -76,7 +90,30 @@ export const defaultSettings = {
   syncCode: '', // 手机端：电脑上显示的 6 位配对码
   // 同一章在两台设备上都被改过时，为远端版本保留一份「冲突副本」。
   // 默认开：正文是唯一不可再生的内容，覆盖掉就永远回不来。
-  syncConflictCopies: true
+  syncConflictCopies: true,
+
+  // ---- V4：服务商与设备 ----
+  // providerId 只用于预设填充与界面展示；**真正的凭据永远是 baseUrl + model**，
+  // 所以它缺失或不认识预设都不影响请求。见 services/ai/providers.js。
+  providerId: 'deepseek',
+  // 设备显示名（同步面板、快照头、章节「最后修改人」用）。
+  // 空串时由 deviceId 派生「设备 xxxx」——每台设备都得有个可辨认的称呼。
+  deviceName: '',
+
+  // ---- V4：生成前计划校验 ----
+  planValidation: defaultPlanValidation(),
+
+  // ---- V4：本地检索（RAG，默认关） ----
+  rag: defaultRagSettings(),
+
+  // ---- V4：WebDAV 同步（密码不在设置里，只在主进程 safeStorage） ----
+  webdav: defaultWebdavSettings(),
+
+  // ---- V4：声明式插件（仅桌面端读取 userData/plugins/*.json） ----
+  plugins: defaultPluginSettings(),
+
+  // 运行时状态：WebDAV 密码是否已存在于安全存储。**不持久化**
+  webdavPasswordSet: false
 }
 
 export const settings = reactive({
@@ -100,6 +137,17 @@ export function useSettings() {
     // 以后新增一个阶段键时老用户那边就缺字段。恒返回新对象，也避免编辑
     // settings.models 时改到模块级的 defaultSettings。
     settings.models = normalizeTaskModels(s ? s.models : null)
+    // 同一类浅合并坑：下面四个都是对象/数组，旧记录里的值会整体顶掉默认值，
+    // 以后给默认条目加字段时老用户就缺字段。恒返回新对象。
+    settings.planValidation = normalizePlanValidation(s ? s.planValidation : null)
+    settings.rag = normalizeRagSettings(s ? s.rag : null)
+    settings.webdav = normalizeWebdavSettings(s ? s.webdav : null)
+    settings.plugins = normalizePluginSettings(s ? s.plugins : null)
+    // providerId 只影响展示与「填入预设」；baseUrl/model 原样保留（见 providers.js）。
+    settings.providerId = normalizeProviderSettings({
+      providerId: s?.providerId,
+      baseUrl: s?.baseUrl
+    }).providerId
 
     // 桌面端优先读 safeStorage。旧版本把 apiKey 明文存在 IndexedDB 里，
     // 这里的迁移顺序是**先写成功、再清明文**：反过来一旦加密写失败，
@@ -136,6 +184,15 @@ export function useSettings() {
         settings.apiKey = String(s?.apiKey || '')
       }
     }
+    // WebDAV 密码只问「有没有」、绝不读进 settings：
+    // 读进来就等于在内存里多一份长期留存的明文，而密码的唯一用途是
+    // 主进程发请求时自己从 safeStorage 取。桌面端之外恒为 false。
+    settings.webdavPasswordSet = false
+    if (secureStorageAvailable()) {
+      const res = await readSecureWebdavPassword()
+      settings.webdavPasswordSet = !!(res.ok && String(res.value || ''))
+    }
+
     settings.loaded = true
   }
 
@@ -147,7 +204,9 @@ export function useSettings() {
    * 这是平台能力差异，不是遗漏。
    */
   async function persist() {
-    const { loaded, secureKeyAvailable, secureKeyError, ...rest } = settings
+    // loaded / secureKey* / webdavPasswordSet 都是运行时状态，不进 IndexedDB。
+    // WebDAV 密码本身从不放在 settings 上：它只在输入框与主进程 safeStorage 里。
+    const { loaded, secureKeyAvailable, secureKeyError, webdavPasswordSet, ...rest } = settings
     const payload = { ...rest }
     if (isDesktop() && settings.secureKeyAvailable) delete payload.apiKey
     await saveSettings(payload)
@@ -184,5 +243,40 @@ export function useSettings() {
     return { ok: true }
   }
 
-  return { settings, load, persist, persistApiKey, clearApiKey }
+  /**
+   * 保存 WebDAV 密码（仅安全存储；**没有明文回退**）。
+   * 返回 `{ ok, code?, message? }`。空串等同删除。
+   */
+  async function persistWebdavPassword(password) {
+    if (!isDesktop() || !settings.secureKeyAvailable) {
+      return {
+        ok: false,
+        code: 'unsupported',
+        message: '当前平台没有系统安全存储，WebDAV 同步仅在桌面端可用'
+      }
+    }
+    const res = password
+      ? await writeSecureWebdavPassword(String(password))
+      : await deleteSecureWebdavPassword()
+    if (!res.ok) return res
+    settings.webdavPasswordSet = !!password
+    return { ok: true }
+  }
+
+  /** 清除 WebDAV 密码（safeStorage 与内存标记两侧都清）。 */
+  async function clearWebdavPassword() {
+    if (isDesktop() && settings.secureKeyAvailable) await deleteSecureWebdavPassword()
+    settings.webdavPasswordSet = false
+    return { ok: true }
+  }
+
+  return {
+    settings,
+    load,
+    persist,
+    persistApiKey,
+    clearApiKey,
+    persistWebdavPassword,
+    clearWebdavPassword
+  }
 }

@@ -6,7 +6,14 @@ import { describeError } from '../services/ai/errors'
 import { isDesktop } from '../services/platform'
 import { toast } from '../store/toast'
 import { TASK_MODEL_KEYS, TASK_MODEL_LABELS } from '../services/ai/models'
+import {
+  PROVIDER_PRESETS,
+  getProviderPreset,
+  isPresetApplied
+} from '../services/ai/providers'
 import SyncPanel from './SyncPanel.vue'
+import WebDavPanel from './WebDavPanel.vue'
+import PluginsPanel from './PluginsPanel.vue'
 
 const emit = defineEmits(['close'])
 const { settings, persist, persistApiKey, clearApiKey } = useSettings()
@@ -15,6 +22,26 @@ const showKey = ref(false)
 const testing = ref(false)
 const pickingDir = ref(false)
 const confirmDeleteKey = ref(false)
+const presets = PROVIDER_PRESETS
+
+function presetOf(id) {
+  return getProviderPreset(id)
+}
+
+/**
+ * 把预设的地址与建议模型填进表单。
+ *
+ * 只在用户**主动点按钮**时执行：切换下拉框本身不动 baseUrl，因为那会让
+ * 「我只是想看看有哪些服务商」变成一次静默的地址改写。
+ * API Key 永远不动 —— 它属于当前服务商，换预设不该顺手清掉。
+ */
+function applyPreset() {
+  const p = presetOf(settings.providerId)
+  if (!p || !p.baseUrl) return
+  settings.baseUrl = p.baseUrl
+  if (p.models.length && !p.models.includes(settings.model)) settings.model = p.models[0]
+  toast(`已填入 ${p.label} 的预设地址`, 'success')
+}
 // 「保存与导出」整节只在桌面端有意义：移动端导出走系统分享面板，没有可配置的目录
 const desktop = isDesktop()
 
@@ -111,9 +138,28 @@ async function testConnection() {
       <div class="modal-body">
         <h4 class="section-title">AI 接口</h4>
 
+        <label class="label">服务商</label>
+        <div class="key-row">
+          <select v-model="settings.providerId" class="input">
+            <option v-for="p in presets" :key="p.id" :value="p.id">{{ p.label }}</option>
+          </select>
+          <button
+            class="btn sm"
+            :disabled="!presetOf(settings.providerId) || !presetOf(settings.providerId).baseUrl"
+            @click="applyPreset"
+          >填入预设地址</button>
+        </div>
+        <p class="hint">
+          切换服务商不会改动已填的 API Key。所有服务商都走 OpenAI 兼容接口，
+          下面两栏始终是真正生效的配置。
+        </p>
+
         <label class="label">接口地址 Base URL（OpenAI 兼容）</label>
         <input v-model="settings.baseUrl" class="input" placeholder="https://api.deepseek.com" />
         <p class="hint">支持 DeepSeek、Kimi、通义千问、GLM、OpenAI 等任何 OpenAI 兼容接口，填厂商文档中的 base_url 即可。</p>
+        <p v-if="!isPresetApplied(settings)" class="hint">
+          当前地址与所选服务商的预设不同，将以你填写的地址为准。
+        </p>
 
         <div style="height: 14px"></div>
         <label class="label">API Key</label>
@@ -236,6 +282,19 @@ async function testConnection() {
           每条变更都会记录原文依据，并可在「最近变更」里撤销。
         </p>
 
+        <div class="checks" style="margin-top: 10px">
+          <label class="check">
+            <input v-model="settings.rag.enabled" type="checkbox" />
+            生成时检索相关历史片段（本地字面检索）
+          </label>
+        </div>
+        <p class="hint">
+          默认关闭。开启后会在生成前从已写正文里按**字面相似度**（单字 + 双字 + 英文词）
+          召回少量片段，注入提示词；它不是语义模型，同义词与代词指代召回不到。
+          索引只保存在本机，不进全量备份与设备同步。片段数与 token 预算可在
+          控制台「检索」标签里调整与试跑。
+        </p>
+
         <div class="divider"></div>
         <h4 class="section-title">预算（可选）</h4>
         <div class="budget-grid">
@@ -281,6 +340,19 @@ async function testConnection() {
         </p>
 
         <SyncPanel />
+
+        <!--
+          WebDAV 是「用户自建服务器」这条路线，与上面的局域网直连不是同一件事。
+          组件在非桌面端只显示一句说明，所以这里不包 v-if：
+          SettingsPanel 的保存按钮按同一份 settings 落盘，藏起来反而让人以为没保存。
+        -->
+        <WebDavPanel />
+
+        <!--
+          插件同样不包 v-if：组件自己会在非桌面端显示「仅桌面端可用」，
+          这样手机用户知道有这回事，而不是以为软件没有这个功能。
+        -->
+        <PluginsPanel />
 
         <!-- 保存与导出（仅桌面端） -->
         <template v-if="desktop">

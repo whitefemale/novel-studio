@@ -3,6 +3,7 @@ import { ref, watch } from 'vue'
 import Sidebar from './Sidebar.vue'
 import Editor from './Editor.vue'
 import AiPanel from './AiPanel.vue'
+import QueuePanel from './QueuePanel.vue'
 import { useBooks } from '../store/books'
 import { isNarrowLayout } from '../services/platform'
 
@@ -10,6 +11,7 @@ const { store, addChapterWithContent } = useBooks()
 
 const editorRef = ref(null)
 const selectionText = ref('')
+const showQueue = ref(false)
 // 窄屏下三栏改成「同一时刻只显示一栏」，底部标签切换。
 // 选标签栏而不是抽屉/手势：无需引入组件库，不与 textarea 的选中手势冲突，
 // 而且能和 Android 返回键天然配合（见 handleBack）。
@@ -94,7 +96,7 @@ defineExpose({ flush, handleBack, reloadEditor })
 
 <template>
   <div class="writing" :data-pane="mobilePane">
-    <Sidebar class="pane pane-sidebar" />
+    <Sidebar class="pane pane-sidebar" @open-queue="showQueue = true" />
     <div class="editor-wrap pane pane-editor">
       <Editor ref="editorRef" @selection-change="onSelectionChange" />
     </div>
@@ -105,6 +107,8 @@ defineExpose({ flush, handleBack, reloadEditor })
       @replace="handleReplace"
       @save-as-new="handleSaveAsNew"
     />
+
+    <QueuePanel v-if="showQueue" @close="showQueue = false" />
 
     <nav class="mobile-tabs">
       <button class="mtab" :class="{ active: mobilePane === 'sidebar' }" @click="mobilePane = 'sidebar'">

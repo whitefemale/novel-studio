@@ -3,8 +3,12 @@ import { ref, computed, watch } from 'vue'
 import { useBooks } from '../store/books'
 import { toast } from '../store/toast'
 import { usePagedList } from '../composables/usePagedList'
+import { useWritingQueue } from '../store/writingQueue'
 import OutlinePanel from './OutlinePanel.vue'
 import ChapterCardModal from './ChapterCardModal.vue'
+
+const emit = defineEmits(['open-queue'])
+const queue = useWritingQueue()
 
 const {
   store,
@@ -121,7 +125,17 @@ async function doConfirmDelete() {
     <div v-if="tab === 'chapters'" class="tab-body">
       <div class="list-head">
         <span class="muted small">共 {{ totalChapters }} 章</span>
-        <button class="btn sm primary" @click="openNewChapter">＋ 新章节</button>
+        <div class="head-ops">
+          <button
+            class="btn ghost sm"
+            :title="queue.store.running ? '写作队列正在生成' : '批量生成草稿'"
+            @click="emit('open-queue')"
+          >
+            <span v-if="queue.store.running" class="queue-dot" aria-hidden="true"></span>
+            队列
+          </button>
+          <button class="btn sm primary" @click="openNewChapter">＋ 新章节</button>
+        </div>
       </div>
 
       <div class="chapter-list">
@@ -292,6 +306,25 @@ async function doConfirmDelete() {
   align-items: center;
   justify-content: space-between;
   margin-bottom: 10px;
+}
+.head-ops {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+/* 队列在后台跑时给入口一个呼吸点：面板关掉后生成仍在继续，用户需要知道。 */
+.queue-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-right: 5px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: queuePulse 1.2s ease-in-out infinite;
+}
+@keyframes queuePulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.25; }
 }
 .chapter-list {
   display: flex;
